@@ -4,6 +4,7 @@
 
 pub mod decode;
 pub mod dsp;
+pub mod engine;
 pub mod exec;
 pub mod fpu;
 

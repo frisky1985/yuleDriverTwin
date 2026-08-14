@@ -191,15 +191,27 @@ impl Decoder {
     /// 解码 16-bit Thumb 指令
     pub fn decode_halfword(&mut self, bits: u16, pc: u32) -> Instruction {
         self.decoded_count += 1;
-        // Phase 1 起点：先支持最常见的 16-bit 指令子集
-        let op = bits >> 13; // bits[15:13]
-        match op {
-            0b000 => self.decode_shift_imm(bits),
-            0b001 => self.decode_add_sub_imm(bits),
-            0b010 => self.decode_mov_cmp_add_sub_reg(bits),
-            0b011 => self.decode_alu_reg(bits),
-            0b101 => self.decode_branch_cond(bits, pc),
-            0b111 => self.decode_branch_uncond(bits, pc),
+        let op5 = bits >> 11; // bits[15:11]
+        match op5 {
+            // 00000-00010: 移位立即数 LSL/LSR/ASR（00011 是 ADD/SUB #imm3，见下）
+            0b00000 | 0b00001 | 0b00010 => self.decode_shift_imm(bits),
+            // 00011: ADD/SUB #imm3
+            0b00011 => self.decode_add_sub_imm(bits),
+            // 001xx: MOVS/CMP/ADDS/SUBS #imm8
+            0b00100 | 0b00101 | 0b00110 | 0b00111 => self.decode_mov_cmp_add_sub_imm8(bits),
+            // 010xx: MOV/CMP/ADD/SUB 寄存器
+            0b01000 | 0b01001 | 0b01010 | 0b01011 => self.decode_mov_cmp_add_sub_reg(bits),
+            // 011xx: ALU 寄存器
+            0b01100 | 0b01101 | 0b01110 | 0b01111 => self.decode_alu_reg(bits),
+            // 100xx: LDR/STR halfword/byte — decode 未接，留 Unimplemented
+            0b10000 | 0b10001 | 0b10010 | 0b10011 => Instruction::Unimplemented { bits: bits as u32 },
+            // 101xx: 条件分支
+            0b10101 => self.decode_branch_cond(bits, pc),
+            // 110xx: LDR/STR word — decode 未接，留 Unimplemented
+            0b11000 | 0b11001 | 0b11010 | 0b11011 => Instruction::Unimplemented { bits: bits as u32 },
+            // 11100: 无条件分支
+            0b11100 => self.decode_branch_uncond(bits, pc),
+            // 其他 111xx: BL/BLX 等 32-bit 前缀或系统指令
             _ => Instruction::Unimplemented { bits: bits as u32 },
         }
     }
@@ -296,6 +308,20 @@ impl Decoder {
             13 => Instruction::Mul { rd, rn, rm, flags: false },
             14 => Instruction::Bic { rd, rn, rm, flags: true },
             _ => Instruction::Unimplemented { bits: bits as u32 },
+        }
+    }
+
+    /// MOVS/CMP/ADD/SUB #imm8: 100 x op rd imm8
+    fn decode_mov_cmp_add_sub_imm8(&self, bits: u16) -> Instruction {
+        let rd = ((bits >> 8) & 0x7) as u8;
+        let rn = rd;
+        let imm = (bits & 0xFF) as u32;
+        let op = (bits >> 11) & 0x3;
+        match op {
+            0 => Instruction::Mov { rd, rm: 0, imm: Some(imm) },
+            1 => Instruction::Cmp { rn, rm: None, imm: Some(imm) },
+            2 => Instruction::Add { rd, rn, rm: None, imm: Some(imm), flags: true },
+            _ => Instruction::Sub { rd, rn, rm: None, imm: Some(imm), flags: true },
         }
     }
 
