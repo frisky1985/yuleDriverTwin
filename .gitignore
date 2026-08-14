@@ -1,0 +1,35 @@
+# Build outputs
+output/build/
+output/reports/
+*.o
+*.elf
+*.axf
+*.bin
+*.hex
+*.out
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Rust
+target/
+Cargo.lock
+
+# Node
+node_modules/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Local config
+.env
+*.local
