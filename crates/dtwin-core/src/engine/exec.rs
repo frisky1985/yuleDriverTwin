@@ -4,6 +4,7 @@
 //! Phase 1: 核心整数指令（数据传送/算术逻辑/移位/分支/压栈）
 
 use super::decode::{AccessWidth, Cond, Instruction, LoadStoreOffset, ShiftAmount, ShiftKind, SpecialReg};
+use crate::memory::Memory;
 use crate::CpuState;
 
 /// 执行结果
@@ -34,7 +35,12 @@ impl Executor {
     }
 
     /// 执行一条指令，返回下一步行为
-    pub fn execute(&mut self, cpu: &mut CpuState, instr: &Instruction) -> ExecOutcome {
+    pub fn execute(
+        &mut self,
+        cpu: &mut CpuState,
+        memory: &mut Memory,
+        instr: &Instruction,
+    ) -> ExecOutcome {
         self.executed_count += 1;
         self.cycle_count += 1;
         match instr {
@@ -216,17 +222,156 @@ impl Executor {
             Instruction::TableBranch { .. } => ExecOutcome::Fault {
                 reason: super::FaultReason::UnimplementedInstr,
             },
-            Instruction::Push { regs, lr } => ExecOutcome::Fault {
-                reason: super::FaultReason::UnimplementedInstr,
-            },
-            Instruction::Pop { regs, pc } => ExecOutcome::Fault {
-                reason: super::FaultReason::UnimplementedInstr,
-            },
-            Instruction::Ldm { .. } | Instruction::Stm { .. } => ExecOutcome::Fault {
-                reason: super::FaultReason::UnimplementedInstr,
-            },
-            Instruction::Ldr { .. } | Instruction::Str { .. } | Instruction::LdrLiteral { .. } => {
-                ExecOutcome::Fault { reason: super::FaultReason::UnimplementedInstr }
+            Instruction::Push { regs, lr } => {
+                // PUSH {reglist} — 递减 SP 并压栈
+                let mut sp = cpu.regs[13];
+                let mut count = 0u32;
+                for i in 0..8 {
+                    if regs & (1 << i) != 0 {
+                        count += 1;
+                    }
+                }
+                if *lr {
+                    count += 1;
+                }
+                sp = sp.wrapping_sub(count * 4);
+                let mut addr = sp;
+                for i in 0..8 {
+                    if regs & (1 << i) != 0 {
+                        let val = cpu.regs[i];
+                        if let Err(f) = memory.write_u32(addr, val) {
+                            return ExecOutcome::Fault { reason: super::FaultReason::MemManage { address: addr } };
+                        }
+                        addr += 4;
+                    }
+                }
+                if *lr {
+                    let val = cpu.regs[14];
+                    if let Err(_f) = memory.write_u32(addr, val) {
+                        return ExecOutcome::Fault { reason: super::FaultReason::MemManage { address: addr } };
+                    }
+                }
+                cpu.regs[13] = sp;
+                ExecOutcome::Continue
+            }
+            Instruction::Pop { regs, pc } => {
+                // POP {reglist} — 出栈并递增 SP
+                let mut sp = cpu.regs[13];
+                let mut addr = sp;
+                for i in 0..8 {
+                    if regs & (1 << i) != 0 {
+                        let val = match memory.read_u32(addr) {
+                            Ok(v) => v,
+                            Err(_f) => {
+                                return ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } }
+                            }
+                        };
+                        cpu.regs[i] = val;
+                        addr += 4;
+                    }
+                }
+                let mut count = 0u32;
+                for i in 0..8 {
+                    if regs & (1 << i) != 0 {
+                        count += 1;
+                    }
+                }
+                if *pc {
+                    let val = match memory.read_u32(addr) {
+                        Ok(v) => v,
+                        Err(_f) => {
+                            return ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } }
+                        }
+                    };
+                    cpu.regs[15] = val & !1; // 清 Thumb 位
+                    count += 1;
+                }
+                cpu.regs[13] = sp.wrapping_add(count * 4);
+                ExecOutcome::Continue
+            }
+            Instruction::Ldm { rn, regs, writeback } => {
+                let mut addr = cpu.regs[*rn as usize];
+                let mut last = 0u32;
+                for i in 0..16 {
+                    if regs & (1 << i) != 0 {
+                        let val = match memory.read_u32(addr) {
+                            Ok(v) => v,
+                            Err(_f) => {
+                                return ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } }
+                            }
+                        };
+                        cpu.regs[i] = val;
+                        addr += 4;
+                        last = addr;
+                    }
+                }
+                if *writeback {
+                    cpu.regs[*rn as usize] = last;
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::Stm { rn, regs, writeback } => {
+                let base = cpu.regs[*rn as usize];
+                let mut addr = base;
+                for i in 0..16 {
+                    if regs & (1 << i) != 0 {
+                        let val = cpu.regs[i];
+                        if let Err(_f) = memory.write_u32(addr, val) {
+                            return ExecOutcome::Fault { reason: super::FaultReason::MemManage { address: addr } };
+                        }
+                        addr += 4;
+                    }
+                }
+                if *writeback {
+                    cpu.regs[*rn as usize] = addr;
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::Ldr { rt, rn, offset, width } => {
+                let base = cpu.regs[*rn as usize];
+                let addr = match offset {
+                    LoadStoreOffset::Immediate(imm) => base.wrapping_add(*imm),
+                    LoadStoreOffset::Register(rm) => base.wrapping_add(cpu.regs[*rm as usize]),
+                };
+                let val = match width {
+                    AccessWidth::Byte => memory.read_u8(addr).map(|v| v as u32),
+                    AccessWidth::HalfWord => memory.read_u16(addr).map(|v| v as u32),
+                    AccessWidth::Word => memory.read_u32(addr),
+                };
+                match val {
+                    Ok(v) => {
+                        cpu.regs[*rt as usize] = v;
+                        ExecOutcome::Continue
+                    }
+                    Err(_f) => ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } },
+                }
+            }
+            Instruction::Str { rt, rn, offset, width } => {
+                let base = cpu.regs[*rn as usize];
+                let addr = match offset {
+                    LoadStoreOffset::Immediate(imm) => base.wrapping_add(*imm),
+                    LoadStoreOffset::Register(rm) => base.wrapping_add(cpu.regs[*rm as usize]),
+                };
+                let val = cpu.regs[*rt as usize];
+                let result = match width {
+                    AccessWidth::Byte => memory.write_u8(addr, val as u8),
+                    AccessWidth::HalfWord => memory.write_u16(addr, val as u16),
+                    AccessWidth::Word => memory.write_u32(addr, val),
+                };
+                match result {
+                    Ok(()) => ExecOutcome::Continue,
+                    Err(_f) => ExecOutcome::Fault { reason: super::FaultReason::MemManage { address: addr } },
+                }
+            }
+            Instruction::LdrLiteral { rt, imm } => {
+                let addr = cpu.regs[15].wrapping_add(*imm) & !3;
+                match memory.read_u32(addr) {
+                    Ok(v) => {
+                        cpu.regs[*rt as usize] = v;
+                        ExecOutcome::Continue
+                    }
+                    Err(_f) => ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } },
+                }
             }
             Instruction::MsrMrs { .. } => ExecOutcome::Fault {
                 reason: super::FaultReason::UnimplementedInstr,
@@ -334,5 +479,82 @@ impl Executor {
             Cond::Le => z || (n != v),
             Cond::Al => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::decode::{AccessWidth, LoadStoreOffset};
+    use crate::memory::Memory;
+
+    fn setup() -> (Executor, CpuState, Memory) {
+        (Executor::new(), CpuState::default(), Memory::test_ram())
+    }
+
+    #[test]
+    fn ldr_str_word_roundtrip() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        // R0 = 0x2000_0000 (SRAM)，R1 = 0x1234_5678
+        cpu.regs[0] = 0x2000_0000;
+        cpu.regs[1] = 0x1234_5678;
+        // STR R1, [R0]
+        let instr = Instruction::Str { rt: 1, rn: 0, offset: LoadStoreOffset::Immediate(0), width: AccessWidth::Word };
+        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        // LDR R2, [R0]
+        let instr = Instruction::Ldr { rt: 2, rn: 0, offset: LoadStoreOffset::Immediate(0), width: AccessWidth::Word };
+        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        assert_eq!(cpu.regs[2], 0x1234_5678);
+    }
+
+    #[test]
+    fn ldr_byte() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        cpu.regs[0] = 0x2000_0000;
+        mem.write_u8(0x2000_0004, 0xAB).unwrap();
+        let instr = Instruction::Ldr { rt: 3, rn: 0, offset: LoadStoreOffset::Immediate(4), width: AccessWidth::Byte };
+        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        assert_eq!(cpu.regs[3], 0xAB);
+    }
+
+    #[test]
+    fn push_pop_roundtrip() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        cpu.regs[13] = 0x2000_1000; // SP
+        cpu.regs[0] = 0x1111_1111;
+        cpu.regs[1] = 0x2222_2222;
+        cpu.regs[14] = 0x0800_0001; // LR
+        // PUSH {R0, R1, LR}
+        let instr = Instruction::Push { regs: 0b11, lr: true };
+        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        assert_eq!(cpu.regs[13], 0x2000_0FF4); // SP -= 12
+        // POP {R0, R1, PC}
+        cpu.regs[0] = 0;
+        cpu.regs[1] = 0;
+        let instr = Instruction::Pop { regs: 0b11, pc: true };
+        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        assert_eq!(cpu.regs[0], 0x1111_1111);
+        assert_eq!(cpu.regs[1], 0x2222_2222);
+        assert_eq!(cpu.regs[15], 0x0800_0000); // PC 清 Thumb 位
+        assert_eq!(cpu.regs[13], 0x2000_1000);
+    }
+
+    #[test]
+    fn ldm_stm_writeback() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        cpu.regs[0] = 0x2000_0000;
+        cpu.regs[1] = 0xAA;
+        cpu.regs[2] = 0xBB;
+        // STM R0!, {R1, R2}
+        let instr = Instruction::Stm { rn: 0, regs: 0b110, writeback: true };
+        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        assert_eq!(cpu.regs[0], 0x2000_0008); // writeback
+        // LDM R0!, {R3, R4}
+        cpu.regs[0] = 0x2000_0000;
+        let instr = Instruction::Ldm { rn: 0, regs: 0b11000, writeback: true };
+        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        assert_eq!(cpu.regs[3], 0xAA);
+        assert_eq!(cpu.regs[4], 0xBB);
+        assert_eq!(cpu.regs[0], 0x2000_0008);
     }
 }
