@@ -373,12 +373,15 @@ impl Executor {
                     Err(_f) => ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } },
                 }
             }
-            Instruction::MsrMrs { .. } => ExecOutcome::Fault {
-                reason: super::FaultReason::UnimplementedInstr,
-            },
-            Instruction::Svc { .. } => ExecOutcome::Fault {
-                reason: super::FaultReason::UnimplementedInstr,
-            },
+            Instruction::MsrMrs { .. } => {
+                // MRS/MSR 尚未在 decode 中实现（32-bit Thumb-2 0xF3EF/0xF380），保持诚实 Unimplemented
+                ExecOutcome::Fault { reason: super::FaultReason::UnimplementedInstr }
+            }
+            Instruction::Svc { imm8 } => {
+                // SVC → SVCall 异常（异常号 11）
+                let _ = imm8;
+                ExecOutcome::Fault { reason: super::FaultReason::UnimplementedInstr } // 异常入口由上层调度
+            }
             Instruction::ExceptionReturn => ExecOutcome::ExceptionReturn,
             Instruction::Unimplemented { .. } => ExecOutcome::Fault {
                 reason: super::FaultReason::UnimplementedInstr,
