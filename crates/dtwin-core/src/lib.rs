@@ -5,6 +5,7 @@
 
 #![deny(unsafe_code)] // 核心引擎禁止 unsafe，内存安全由编译器保证
 
+pub mod engine;
 pub mod memory;
 pub mod nvic;
 pub mod peripheral;
