@@ -1,0 +1,18 @@
+[package]
+name = "dtwin-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dtwin"
+path = "src/main.rs"
+
+[dependencies]
+dtwin-core = { path = "../dtwin-core" }
+dtwin-chip = { path = "../dtwin-chip" }
+dtwin-gdb = { path = "../dtwin-gdb" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
