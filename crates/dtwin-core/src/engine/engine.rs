@@ -59,7 +59,9 @@ impl Engine {
             Ok(v) => v,
             Err(_) => {
                 self.stats.faults += 1;
-                return EngineResult::Fault { reason: FaultReason::BusFault { address: pc } };
+                return EngineResult::Fault {
+                    reason: FaultReason::BusFault { address: pc },
+                };
             }
         };
 
@@ -70,7 +72,9 @@ impl Engine {
                 Ok(v) => v,
                 Err(_) => {
                     self.stats.faults += 1;
-                    return EngineResult::Fault { reason: FaultReason::BusFault { address: pc + 2 } };
+                    return EngineResult::Fault {
+                        reason: FaultReason::BusFault { address: pc + 2 },
+                    };
                 }
             };
             let full = ((raw as u32) << 16) | hi as u32;
@@ -87,7 +91,11 @@ impl Engine {
         match outcome {
             ExecOutcome::Continue => {
                 // PC 默认 +2/+4（分支指令自行改 PC）
-                let width = if (raw & 0xF800) == 0xE800 || (raw & 0xF000) == 0xF000 { 4 } else { 2 };
+                let width = if (raw & 0xF800) == 0xE800 || (raw & 0xF000) == 0xF000 {
+                    4
+                } else {
+                    2
+                };
                 cpu.regs[15] = cpu.regs[15].wrapping_add(width);
                 EngineResult::Halted // 单步：返回暂停
             }
@@ -159,6 +167,35 @@ mod tests {
         eng.step(&mut cpu, &mut mem, &mut nvic);
         assert_eq!(cpu.regs[0], 5);
         assert_eq!(cpu.regs[15], 2);
+        assert_eq!(eng.stats.instructions, 1);
+    }
+
+    /// 取指→解码→执行 全链路：SSAT 饱和运算（DSP）
+    #[test]
+    fn engine_full_pipeline_dsp() {
+        // GIVEN: 内存中放置 SSAT R0, #8, R1（0xF301 0007，R1 = 200 → 饱和 127）
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::test_ram();
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        cpu.regs[15] = 0;
+        cpu.regs[1] = 200;
+        // 半字 0xF301 在前（低位地址），小端字节序
+        mem.flash[0] = 0x01;
+        mem.flash[1] = 0xF3;
+        mem.flash[2] = 0x07;
+        mem.flash[3] = 0x00;
+
+        // WHEN: 单步执行
+        assert_eq!(
+            eng.step(&mut cpu, &mut mem, &mut nvic),
+            EngineResult::Halted
+        );
+
+        // THEN: R0 = 127（SSAT 饱和），Q 置位
+        assert_eq!(cpu.regs[0], 127);
+        assert_ne!(cpu.xpsr & (1 << 27), 0);
+        assert_eq!(cpu.regs[15], 4);
         assert_eq!(eng.stats.instructions, 1);
     }
 }

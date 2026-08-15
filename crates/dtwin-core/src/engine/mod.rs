@@ -8,6 +8,9 @@ pub mod engine;
 pub mod exec;
 pub mod fpu;
 
+#[cfg(test)]
+mod test_util;
+
 /// 执行模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecMode {
@@ -20,12 +23,24 @@ pub enum ExecMode {
 /// 异常触发原因（供 NVIC/调试器观测）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultReason {
-    MemManage { address: u32 },
-    BusFault { address: u32 },
-    UsageFault { address: u32 },
-    HardFault { pc: u32 },
-    UnalignedAccess { address: u32 },
-    IllegalInstruction { pc: u32 },
+    MemManage {
+        address: u32,
+    },
+    BusFault {
+        address: u32,
+    },
+    UsageFault {
+        address: u32,
+    },
+    HardFault {
+        pc: u32,
+    },
+    UnalignedAccess {
+        address: u32,
+    },
+    IllegalInstruction {
+        pc: u32,
+    },
     /// 已解码但尚未实现执行（Phase 1 部分支持）
     UnimplementedInstr,
 }

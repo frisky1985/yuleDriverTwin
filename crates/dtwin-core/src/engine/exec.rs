@@ -3,7 +3,10 @@
 //! 基于 Decoder 输出的统一指令表示执行，更新 CPU 状态。
 //! Phase 1: 核心整数指令（数据传送/算术逻辑/移位/分支/压栈）
 
-use super::decode::{AccessWidth, Cond, Instruction, LoadStoreOffset, ShiftAmount, ShiftKind, SpecialReg};
+use super::decode::{
+    AccessWidth, Cond, DspShiftKind, Instruction, LoadStoreOffset, QAddKind, ShiftAmount, ShiftKind,
+};
+use super::dsp;
 use crate::memory::Memory;
 use crate::CpuState;
 
@@ -62,7 +65,13 @@ impl Executor {
                 }
                 ExecOutcome::Continue
             }
-            Instruction::Add { rd, rn, rm, imm, flags } => {
+            Instruction::Add {
+                rd,
+                rn,
+                rm,
+                imm,
+                flags,
+            } => {
                 let a = cpu.regs[*rn as usize];
                 let b = match (rm, imm) {
                     (Some(r), _) => cpu.regs[*r as usize],
@@ -76,7 +85,13 @@ impl Executor {
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
             }
-            Instruction::Sub { rd, rn, rm, imm, flags } => {
+            Instruction::Sub {
+                rd,
+                rn,
+                rm,
+                imm,
+                flags,
+            } => {
                 let a = cpu.regs[*rn as usize];
                 let b = match (rm, imm) {
                     (Some(r), _) => cpu.regs[*r as usize],
@@ -132,7 +147,11 @@ impl Executor {
             }
             Instruction::Udiv { rd, rn, rm } => {
                 let divisor = cpu.regs[*rm as usize];
-                cpu.regs[*rd as usize] = if divisor == 0 { 0 } else { cpu.regs[*rn as usize] / divisor };
+                cpu.regs[*rd as usize] = if divisor == 0 {
+                    0
+                } else {
+                    cpu.regs[*rn as usize] / divisor
+                };
                 ExecOutcome::Continue
             }
             Instruction::Sdiv { rd, rn, rm } => {
@@ -144,11 +163,19 @@ impl Executor {
                 };
                 ExecOutcome::Continue
             }
-            Instruction::Shift { rd, rm, kind, amount, flags } => {
+            Instruction::Shift {
+                rd,
+                rm,
+                kind,
+                amount,
+                flags,
+            } => {
                 let val = cpu.regs[*rm as usize];
                 let result = match amount {
                     ShiftAmount::Immediate(n) => self.shift_val(val, *kind, *n),
-                    ShiftAmount::Register(r) => self.shift_val(val, *kind, (cpu.regs[*r as usize] & 0xFF) as u8),
+                    ShiftAmount::Register(r) => {
+                        self.shift_val(val, *kind, (cpu.regs[*r as usize] & 0xFF) as u8)
+                    }
                 };
                 if *flags {
                     self.update_flags_logical(cpu, result);
@@ -197,18 +224,26 @@ impl Executor {
             Instruction::BranchExchange { rm } => {
                 let target = cpu.regs[*rm as usize];
                 if target & 1 == 0 {
-                    ExecOutcome::Fault { reason: super::FaultReason::UsageFault { address: target } }
+                    ExecOutcome::Fault {
+                        reason: super::FaultReason::UsageFault { address: target },
+                    }
                 } else {
-                    ExecOutcome::Branch { target: target & !1 }
+                    ExecOutcome::Branch {
+                        target: target & !1,
+                    }
                 }
             }
             Instruction::BranchLinkExchange { rm } => {
                 let target = cpu.regs[*rm as usize];
                 cpu.regs[14] = cpu.regs[15] - 1;
                 if target & 1 == 0 {
-                    ExecOutcome::Fault { reason: super::FaultReason::UsageFault { address: target } }
+                    ExecOutcome::Fault {
+                        reason: super::FaultReason::UsageFault { address: target },
+                    }
                 } else {
-                    ExecOutcome::Branch { target: target & !1 }
+                    ExecOutcome::Branch {
+                        target: target & !1,
+                    }
                 }
             }
             Instruction::CompareBranch { rn, target, zero } => {
@@ -240,7 +275,9 @@ impl Executor {
                     if regs & (1 << i) != 0 {
                         let val = cpu.regs[i];
                         if let Err(f) = memory.write_u32(addr, val) {
-                            return ExecOutcome::Fault { reason: super::FaultReason::MemManage { address: addr } };
+                            return ExecOutcome::Fault {
+                                reason: super::FaultReason::MemManage { address: addr },
+                            };
                         }
                         addr += 4;
                     }
@@ -248,7 +285,9 @@ impl Executor {
                 if *lr {
                     let val = cpu.regs[14];
                     if let Err(_f) = memory.write_u32(addr, val) {
-                        return ExecOutcome::Fault { reason: super::FaultReason::MemManage { address: addr } };
+                        return ExecOutcome::Fault {
+                            reason: super::FaultReason::MemManage { address: addr },
+                        };
                     }
                 }
                 cpu.regs[13] = sp;
@@ -263,7 +302,9 @@ impl Executor {
                         let val = match memory.read_u32(addr) {
                             Ok(v) => v,
                             Err(_f) => {
-                                return ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } }
+                                return ExecOutcome::Fault {
+                                    reason: super::FaultReason::BusFault { address: addr },
+                                }
                             }
                         };
                         cpu.regs[i] = val;
@@ -280,7 +321,9 @@ impl Executor {
                     let val = match memory.read_u32(addr) {
                         Ok(v) => v,
                         Err(_f) => {
-                            return ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } }
+                            return ExecOutcome::Fault {
+                                reason: super::FaultReason::BusFault { address: addr },
+                            }
                         }
                     };
                     cpu.regs[15] = val & !1; // 清 Thumb 位
@@ -289,7 +332,11 @@ impl Executor {
                 cpu.regs[13] = sp.wrapping_add(count * 4);
                 ExecOutcome::Continue
             }
-            Instruction::Ldm { rn, regs, writeback } => {
+            Instruction::Ldm {
+                rn,
+                regs,
+                writeback,
+            } => {
                 let mut addr = cpu.regs[*rn as usize];
                 let mut last = 0u32;
                 for i in 0..16 {
@@ -297,7 +344,9 @@ impl Executor {
                         let val = match memory.read_u32(addr) {
                             Ok(v) => v,
                             Err(_f) => {
-                                return ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } }
+                                return ExecOutcome::Fault {
+                                    reason: super::FaultReason::BusFault { address: addr },
+                                }
                             }
                         };
                         cpu.regs[i] = val;
@@ -310,14 +359,20 @@ impl Executor {
                 }
                 ExecOutcome::Continue
             }
-            Instruction::Stm { rn, regs, writeback } => {
+            Instruction::Stm {
+                rn,
+                regs,
+                writeback,
+            } => {
                 let base = cpu.regs[*rn as usize];
                 let mut addr = base;
                 for i in 0..16 {
                     if regs & (1 << i) != 0 {
                         let val = cpu.regs[i];
                         if let Err(_f) = memory.write_u32(addr, val) {
-                            return ExecOutcome::Fault { reason: super::FaultReason::MemManage { address: addr } };
+                            return ExecOutcome::Fault {
+                                reason: super::FaultReason::MemManage { address: addr },
+                            };
                         }
                         addr += 4;
                     }
@@ -327,7 +382,12 @@ impl Executor {
                 }
                 ExecOutcome::Continue
             }
-            Instruction::Ldr { rt, rn, offset, width } => {
+            Instruction::Ldr {
+                rt,
+                rn,
+                offset,
+                width,
+            } => {
                 let base = cpu.regs[*rn as usize];
                 let addr = match offset {
                     LoadStoreOffset::Immediate(imm) => base.wrapping_add(*imm),
@@ -343,10 +403,17 @@ impl Executor {
                         cpu.regs[*rt as usize] = v;
                         ExecOutcome::Continue
                     }
-                    Err(_f) => ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } },
+                    Err(_f) => ExecOutcome::Fault {
+                        reason: super::FaultReason::BusFault { address: addr },
+                    },
                 }
             }
-            Instruction::Str { rt, rn, offset, width } => {
+            Instruction::Str {
+                rt,
+                rn,
+                offset,
+                width,
+            } => {
                 let base = cpu.regs[*rn as usize];
                 let addr = match offset {
                     LoadStoreOffset::Immediate(imm) => base.wrapping_add(*imm),
@@ -360,7 +427,9 @@ impl Executor {
                 };
                 match result {
                     Ok(()) => ExecOutcome::Continue,
-                    Err(_f) => ExecOutcome::Fault { reason: super::FaultReason::MemManage { address: addr } },
+                    Err(_f) => ExecOutcome::Fault {
+                        reason: super::FaultReason::MemManage { address: addr },
+                    },
                 }
             }
             Instruction::LdrLiteral { rt, imm } => {
@@ -370,19 +439,208 @@ impl Executor {
                         cpu.regs[*rt as usize] = v;
                         ExecOutcome::Continue
                     }
-                    Err(_f) => ExecOutcome::Fault { reason: super::FaultReason::BusFault { address: addr } },
+                    Err(_f) => ExecOutcome::Fault {
+                        reason: super::FaultReason::BusFault { address: addr },
+                    },
                 }
             }
             Instruction::MsrMrs { .. } => {
                 // MRS/MSR 尚未在 decode 中实现（32-bit Thumb-2 0xF3EF/0xF380），保持诚实 Unimplemented
-                ExecOutcome::Fault { reason: super::FaultReason::UnimplementedInstr }
+                ExecOutcome::Fault {
+                    reason: super::FaultReason::UnimplementedInstr,
+                }
             }
             Instruction::Svc { imm8 } => {
                 // SVC → SVCall 异常（异常号 11）
                 let _ = imm8;
-                ExecOutcome::Fault { reason: super::FaultReason::UnimplementedInstr } // 异常入口由上层调度
+                ExecOutcome::Fault {
+                    reason: super::FaultReason::UnimplementedInstr,
+                } // 异常入口由上层调度
             }
             Instruction::ExceptionReturn => ExecOutcome::ExceptionReturn,
+
+            // ================= Phase 3: DSP =================
+            Instruction::Sat {
+                rd,
+                rn,
+                sat_imm,
+                signed,
+                shift_kind,
+                shift_imm,
+            } => {
+                let t = cpu.regs[*rn as usize];
+                let shifted = match shift_kind {
+                    DspShiftKind::Lsl => {
+                        let n = *shift_imm & 0x1F;
+                        if n == 0 {
+                            t
+                        } else {
+                            t << n
+                        }
+                    }
+                    DspShiftKind::Asr => {
+                        let n = *shift_imm & 0x1F;
+                        if *signed {
+                            // SSAT: ASR（n=0 → 移 32 位，符号填充）
+                            if n == 0 {
+                                ((t as i32) >> 31) as u32
+                            } else {
+                                ((t as i32) >> n) as u32
+                            }
+                        } else {
+                            // USAT: LSR（n=0 → 移 32 位 → 0）
+                            if n == 0 {
+                                0
+                            } else {
+                                t >> n
+                            }
+                        }
+                    }
+                };
+                let (result, sat) = if *signed {
+                    let r = dsp::ssat(shifted as i32, *sat_imm as u32);
+                    (r as u32, r != shifted as i32)
+                } else {
+                    let r = dsp::usat(shifted as i32, *sat_imm as u32);
+                    (r, r != shifted)
+                };
+                if sat {
+                    self.set_q(cpu);
+                }
+                cpu.regs[*rd as usize] = result;
+                ExecOutcome::Continue
+            }
+            Instruction::QAddSub { rd, rn, rm, kind } => {
+                let a = cpu.regs[*rm as usize] as i32;
+                let b = cpu.regs[*rn as usize] as i32;
+                let (result, sat) = match kind {
+                    QAddKind::Qadd => dsp::qadd_q(a, b),
+                    QAddKind::Qsub => dsp::qsub_q(a, b),
+                    QAddKind::Qdadd => dsp::qdadd_q(a, b),
+                    QAddKind::Qdsub => dsp::qdsub_q(a, b),
+                };
+                if sat {
+                    self.set_q(cpu);
+                }
+                cpu.regs[*rd as usize] = result as u32;
+                ExecOutcome::Continue
+            }
+            Instruction::Simd16 {
+                rd,
+                rn,
+                rm,
+                kind,
+                unsigned,
+            } => {
+                let a = cpu.regs[*rn as usize];
+                let b = cpu.regs[*rm as usize];
+                let (result, ge) = dsp::simd16(a, b, *kind, *unsigned);
+                cpu.regs[*rd as usize] = result;
+                // GE[1:0] 更新（GE[3:2] 不变）
+                cpu.xpsr = (cpu.xpsr & !(0x3 << 16)) | (((ge as u32) & 0x3) << 16);
+                ExecOutcome::Continue
+            }
+            Instruction::DualHalfMul {
+                rd,
+                rn,
+                rm,
+                swap,
+                sub,
+            } => {
+                let (bl, bh) = dsp::dual_half_operands(cpu.regs[*rm as usize], *swap);
+                let al = cpu.regs[*rn as usize] as i16 as i32;
+                let ah = (cpu.regs[*rn as usize] >> 16) as i16 as i32;
+                let sum = if *sub {
+                    al * bl - ah * bh
+                } else {
+                    al * bl + ah * bh
+                };
+                cpu.regs[*rd as usize] = sum as u32;
+                ExecOutcome::Continue
+            }
+            Instruction::DualHalfMulAcc {
+                rd,
+                rn,
+                rm,
+                ra,
+                swap,
+                sub,
+            } => {
+                let (bl, bh) = dsp::dual_half_operands(cpu.regs[*rm as usize], *swap);
+                let al = cpu.regs[*rn as usize] as i16 as i32;
+                let ah = (cpu.regs[*rn as usize] >> 16) as i16 as i32;
+                let sum = if *sub {
+                    al * bl - ah * bh
+                } else {
+                    al * bl + ah * bh
+                };
+                cpu.regs[*rd as usize] = cpu.regs[*ra as usize].wrapping_add(sum as u32);
+                ExecOutcome::Continue
+            }
+            Instruction::DualHalfMulLong {
+                rdlo,
+                rdhi,
+                rn,
+                rm,
+                swap,
+                sub,
+            } => {
+                let (bl, bh) = dsp::dual_half_operands(cpu.regs[*rm as usize], *swap);
+                let al = cpu.regs[*rn as usize] as i16 as i64;
+                let ah = (cpu.regs[*rn as usize] >> 16) as i16 as i64;
+                let sum = if *sub {
+                    al * bl as i64 - ah * bh as i64
+                } else {
+                    al * bl as i64 + ah * bh as i64
+                };
+                let acc =
+                    ((cpu.regs[*rdhi as usize] as u64) << 32) | cpu.regs[*rdlo as usize] as u64;
+                let result = acc.wrapping_add(sum as u64);
+                cpu.regs[*rdlo as usize] = result as u32;
+                cpu.regs[*rdhi as usize] = (result >> 32) as u32;
+                ExecOutcome::Continue
+            }
+            Instruction::Mla {
+                rd,
+                rn,
+                rm,
+                ra,
+                sub,
+            } => {
+                let prod = cpu.regs[*rn as usize].wrapping_mul(cpu.regs[*rm as usize]);
+                cpu.regs[*rd as usize] = if *sub {
+                    cpu.regs[*ra as usize].wrapping_sub(prod)
+                } else {
+                    cpu.regs[*ra as usize].wrapping_add(prod)
+                };
+                ExecOutcome::Continue
+            }
+            Instruction::Pkh {
+                rd,
+                rn,
+                rm,
+                tb,
+                shift_imm,
+            } => {
+                let rn_val = cpu.regs[*rn as usize];
+                let rm_val = cpu.regs[*rm as usize];
+                let n = *shift_imm & 0x1F;
+                if *tb {
+                    // PKHTB: 高半字取 Rn，低半字取 ASR(Rm, n)
+                    let shifted = if n == 0 {
+                        ((rm_val as i32) >> 31) as u32
+                    } else {
+                        ((rm_val as i32) >> n) as u32
+                    };
+                    cpu.regs[*rd as usize] = (rn_val & 0xFFFF_0000) | (shifted & 0xFFFF);
+                } else {
+                    // PKHBT: 低半字取 Rn，高半字取 LSL(Rm, n)
+                    let shifted = if n == 0 { rm_val } else { rm_val << n };
+                    cpu.regs[*rd as usize] = (rn_val & 0xFFFF) | (shifted & 0xFFFF_0000);
+                }
+                ExecOutcome::Continue
+            }
+
             Instruction::Unimplemented { .. } => ExecOutcome::Fault {
                 reason: super::FaultReason::UnimplementedInstr,
             },
@@ -390,6 +648,11 @@ impl Executor {
                 reason: super::FaultReason::IllegalInstruction { pc: *address },
             },
         }
+    }
+
+    /// 置位 DSP Q 标志（APSR bit27，粘性）
+    fn set_q(&self, cpu: &mut CpuState) {
+        cpu.xpsr |= 1 << 27;
     }
 
     /// 移位计算
@@ -502,11 +765,27 @@ mod tests {
         cpu.regs[0] = 0x2000_0000;
         cpu.regs[1] = 0x1234_5678;
         // STR R1, [R0]
-        let instr = Instruction::Str { rt: 1, rn: 0, offset: LoadStoreOffset::Immediate(0), width: AccessWidth::Word };
-        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        let instr = Instruction::Str {
+            rt: 1,
+            rn: 0,
+            offset: LoadStoreOffset::Immediate(0),
+            width: AccessWidth::Word,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
         // LDR R2, [R0]
-        let instr = Instruction::Ldr { rt: 2, rn: 0, offset: LoadStoreOffset::Immediate(0), width: AccessWidth::Word };
-        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        let instr = Instruction::Ldr {
+            rt: 2,
+            rn: 0,
+            offset: LoadStoreOffset::Immediate(0),
+            width: AccessWidth::Word,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
         assert_eq!(cpu.regs[2], 0x1234_5678);
     }
 
@@ -515,8 +794,16 @@ mod tests {
         let (mut ex, mut cpu, mut mem) = setup();
         cpu.regs[0] = 0x2000_0000;
         mem.write_u8(0x2000_0004, 0xAB).unwrap();
-        let instr = Instruction::Ldr { rt: 3, rn: 0, offset: LoadStoreOffset::Immediate(4), width: AccessWidth::Byte };
-        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        let instr = Instruction::Ldr {
+            rt: 3,
+            rn: 0,
+            offset: LoadStoreOffset::Immediate(4),
+            width: AccessWidth::Byte,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
         assert_eq!(cpu.regs[3], 0xAB);
     }
 
@@ -527,15 +814,27 @@ mod tests {
         cpu.regs[0] = 0x1111_1111;
         cpu.regs[1] = 0x2222_2222;
         cpu.regs[14] = 0x0800_0001; // LR
-        // PUSH {R0, R1, LR}
-        let instr = Instruction::Push { regs: 0b11, lr: true };
-        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+                                    // PUSH {R0, R1, LR}
+        let instr = Instruction::Push {
+            regs: 0b11,
+            lr: true,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
         assert_eq!(cpu.regs[13], 0x2000_0FF4); // SP -= 12
-        // POP {R0, R1, PC}
+                                               // POP {R0, R1, PC}
         cpu.regs[0] = 0;
         cpu.regs[1] = 0;
-        let instr = Instruction::Pop { regs: 0b11, pc: true };
-        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        let instr = Instruction::Pop {
+            regs: 0b11,
+            pc: true,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
         assert_eq!(cpu.regs[0], 0x1111_1111);
         assert_eq!(cpu.regs[1], 0x2222_2222);
         assert_eq!(cpu.regs[15], 0x0800_0000); // PC 清 Thumb 位
@@ -549,13 +848,27 @@ mod tests {
         cpu.regs[1] = 0xAA;
         cpu.regs[2] = 0xBB;
         // STM R0!, {R1, R2}
-        let instr = Instruction::Stm { rn: 0, regs: 0b110, writeback: true };
-        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        let instr = Instruction::Stm {
+            rn: 0,
+            regs: 0b110,
+            writeback: true,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
         assert_eq!(cpu.regs[0], 0x2000_0008); // writeback
-        // LDM R0!, {R3, R4}
+                                              // LDM R0!, {R3, R4}
         cpu.regs[0] = 0x2000_0000;
-        let instr = Instruction::Ldm { rn: 0, regs: 0b11000, writeback: true };
-        assert_eq!(ex.execute(&mut cpu, &mut mem, &instr), ExecOutcome::Continue);
+        let instr = Instruction::Ldm {
+            rn: 0,
+            regs: 0b11000,
+            writeback: true,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
         assert_eq!(cpu.regs[3], 0xAA);
         assert_eq!(cpu.regs[4], 0xBB);
         assert_eq!(cpu.regs[0], 0x2000_0008);

@@ -43,7 +43,7 @@ impl CoreType {
 pub struct CpuState {
     /// 通用寄存器 R0-R15
     pub regs: [u32; 16],
-    /// 程序状态寄存器 xPSR
+    /// 程序状态寄存器 xPSR（bit27=Q，bits[19:16]=GE，bits[31:28]=NZCV）
     pub xpsr: u32,
     /// 主栈指针
     pub msp: u32,
