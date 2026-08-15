@@ -355,6 +355,34 @@ impl Memory {
         }
     }
 
+    /// 直接向区域存储写入字节序列（ELF 加载专用）
+    ///
+    /// 绕过运行时访问权限检查（Flash 只读区以"烧录"语义直写），不触发 watchpoint，
+    /// 不统计读写周期；地址必须完全落在某个区域内，否则返回 BusFault。
+    pub fn load_bytes(&mut self, addr: u32, data: &[u8]) -> Result<(), MemoryFault> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        // 先校验区域与边界（不持有引用跨可变借用）
+        let (region_type, off, in_bounds) = {
+            let region = self.region_at(addr).ok_or(MemoryFault::BusFault { address: addr })?;
+            let off = Self::offset_in(region, addr);
+            let in_bounds = addr
+                .checked_add(data.len() as u32)
+                .map(|end| end <= region.end)
+                .unwrap_or(false);
+            (region.region_type, off, in_bounds)
+        };
+        if !in_bounds {
+            return Err(MemoryFault::BusFault { address: addr });
+        }
+        let storage = self
+            .storage_mut_by_type(region_type)
+            .ok_or(MemoryFault::BusFault { address: addr })?;
+        storage[off..off + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
     /// 按宽度读取
     pub fn read(&mut self, addr: u32, width: u32) -> Result<u32, MemoryFault> {
         match width {
@@ -499,6 +527,28 @@ mod tests {
         assert_eq!(m.flash[0x300], 0xFF);
         // 擦除后读也恢复
         assert_eq!(m.read_u8(0x0000_0300).unwrap(), 0xFF);
+    }
+
+    #[test]
+    fn load_bytes_writes_directly() {
+        let mut m = Memory::test_ram();
+        // Flash 只读区域也能以"烧录"语义直写
+        m.load_bytes(0x0000_0100, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        assert_eq!(m.read_u32(0x0000_0100).unwrap(), 0xEFBE_ADDE);
+        // SRAM 正常直写
+        m.load_bytes(0x2000_0000, &[1, 2, 3]).unwrap();
+        assert_eq!(m.read_u8(0x2000_0000).unwrap(), 1);
+        // 空数据不报错
+        m.load_bytes(0x2000_0004, &[]).unwrap();
+        // 区域外 / 跨边界 → BusFault
+        assert_eq!(
+            m.load_bytes(0x3000_0000, &[1]),
+            Err(MemoryFault::BusFault { address: 0x3000_0000 })
+        );
+        assert_eq!(
+            m.load_bytes(0x0000_0FFE, &[1, 2, 3]),
+            Err(MemoryFault::BusFault { address: 0x0000_0FFE })
+        );
     }
 
     #[test]
