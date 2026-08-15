@@ -33,3 +33,6 @@ dist/
 # Local config
 .env
 *.local
+
+# A9 固件构建产物（源码见 fixtures/*.c/.S/.ld，ELF 快照见 *.elf.dat）
+crates/dtwin-chip/tests/fixtures/build/

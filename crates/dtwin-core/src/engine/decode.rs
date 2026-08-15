@@ -632,14 +632,18 @@ impl Decoder {
     pub fn decode_word(&mut self, bits: u32, pc: u32) -> Instruction {
         self.decoded_count += 1;
         let top = (bits >> 16) as u16;
-        // MOVW/MOVT (11110 i 100100 ...)
-        if (top & 0xFBF0) == 0xF240 {
-            let imm4 = ((top >> 4) & 0xF) as u32;
-            let imm3 = ((bits >> 12) & 0x7) as u32;
+        // MOVW/MOVT (11110 i 100100/101100 imm4 0 imm3 Rd imm8)
+        // A9 实测修正：imm4 = top[3:0]（原 (top>>4)&0xF 取错位）、
+        // imm16 = imm4:i:imm3:imm8（原漏 i 位）、MOVT 判别 = top bit7
+        // （原 top&0x0008 误判，导致 MOVW 被当 MOVT 写入高半字）。
+        if (top & 0xFB70) == 0xF240 {
+            let imm4 = (top & 0xF) as u32; // bits[19:16]
+            let i = ((top >> 10) & 1) as u32; // bit26
+            let imm3 = ((bits >> 12) & 0x7) as u32; // bits[14:12]
             let imm8 = (bits & 0xFF) as u32;
             let rd = ((bits >> 8) & 0xF) as u8;
-            let imm16 = ((imm4 << 12) | (imm3 << 8) | imm8) as u16;
-            let top_half = (top & 0x0008) != 0; // MOVT if bit 11 set
+            let imm16 = ((imm4 << 12) | (i << 11) | (imm3 << 8) | imm8) as u16;
+            let top_half = (top & 0x0080) != 0; // MOVT：bit23=1（bit7 of top）
             return Instruction::MovImm32 {
                 rd,
                 imm16,
@@ -1604,13 +1608,16 @@ impl Decoder {
             // 立即数形式：imm3 = bits[8:6]
             (None, Some(((bits >> 6) & 0x7) as u32))
         };
+        // A9 实测修正：立即数形式恒置标志（ADDS/SUBS）；寄存器形式仅
+        // SUB（SUBS，0x1A00-0x1A7F）置标志，ADD（0x1800-0x187F）不置标志。
+        let flags = ((bits >> 10) & 1) == 1 || op == 1;
         if op == 0 {
             Instruction::Add {
                 rd,
                 rn,
                 rm,
                 imm,
-                flags: true,
+                flags,
             }
         } else {
             Instruction::Sub {
@@ -1618,7 +1625,7 @@ impl Decoder {
                 rn,
                 rm,
                 imm,
-                flags: true,
+                flags,
             }
         }
     }
