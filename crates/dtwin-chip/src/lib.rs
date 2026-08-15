@@ -1,6 +1,9 @@
 //! dtwin-chip — 芯片配置文件系统（TOML/SVD 导入/overlay 继承）
 
 pub mod profile;
+pub mod s32k312;
+
+pub use s32k312::S32K312;
 
 /// 芯片配置文件结构（TOML 四大模块：内核/内存/外设/时钟树）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
