@@ -406,7 +406,8 @@ impl Executor {
                         }
                     };
                     cpu.regs[13] = sp.wrapping_add((count + 1) * 4);
-                    return ExecOutcome::Branch { target: val & !1 }; // 清 Thumb 位
+                    cpu.regs[15] = val & !1; // 清 Thumb 位后直接写入 PC（与 LDM 写 PC 语义一致）
+                    return ExecOutcome::Branch { target: val & !1 };
                 }
                 cpu.regs[13] = sp.wrapping_add(count * 4);
                 ExecOutcome::Continue
