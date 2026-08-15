@@ -160,6 +160,70 @@ pub fn simd16(
     (res_lo | (res_hi << 16), ge)
 }
 
+/// 8-bit SIMD：每字节独立加/减（可减半），返回 (结果, GE[3:0])
+///
+/// - 非减半：有符号 GE = 字节结果 ≥ 0；无符号加 GE = 进位；无符号减 GE = 无借位
+/// - 减半（SHADD8/SHSUB8/UHADD8/UHSUB8）：结果 = (a ± b) >> 1（扩展宽度运算后移 1），
+///   GE[3:0] 清零（与 QEMU target/arm/helper.c 实现一致）
+pub fn simd8(a: u32, b: u32, unsigned: bool, halving: bool, sub: bool) -> (u32, u8) {
+    let mut res = 0u32;
+    let mut ge = 0u8;
+    for n in 0..4 {
+        let shift = n * 8;
+        let av = (a >> shift) & 0xFF;
+        let bv = (b >> shift) & 0xFF;
+        // 字节结果（减半用扩展宽度求 (a±b) 后移 1，避免环绕丢位）
+        let byte: u32 = if halving {
+            // QEMU op_addsub.h 语义：SHADD8/SHSUB8 用 int32 算术右移，
+            // UHADD8/UHSUB8 用 uint32 逻辑右移（UHSUB8 回绕减，无 +0x100）
+            let sum: u32 = if sub {
+                if unsigned {
+                    av.wrapping_sub(bv)
+                } else {
+                    ((av as i8 as i32) - (bv as i8 as i32)) as u32
+                }
+            } else if unsigned {
+                av.wrapping_add(bv)
+            } else {
+                ((av as i8 as i32) + (bv as i8 as i32)) as u32
+            };
+            if unsigned {
+                (sum >> 1) & 0xFF
+            } else {
+                ((sum as i32) >> 1) as u32 & 0xFF
+            }
+        } else if sub {
+            if unsigned {
+                av.wrapping_sub(bv) & 0xFF
+            } else {
+                ((av as i8 as i16) - (bv as i8 as i16)) as u32 & 0xFF
+            }
+        } else if unsigned {
+            av.wrapping_add(bv) & 0xFF
+        } else {
+            ((av as i8 as i16) + (bv as i8 as i16)) as u32 & 0xFF
+        };
+        res |= byte << shift;
+        if !halving {
+            let flag = if sub {
+                if unsigned {
+                    av >= bv // 无借位
+                } else {
+                    (av as i8 as i16) - (bv as i8 as i16) >= 0
+                }
+            } else if unsigned {
+                (av as u16) + (bv as u16) > 0xFF // 进位
+            } else {
+                (av as i8 as i16) + (bv as i8 as i16) >= 0
+            };
+            if flag {
+                ge |= 1 << n;
+            }
+        }
+    }
+    (res, ge)
+}
+
 /// 取 Rm 的双半字（可选交换：SMUADX 等交换 Rm 的 lo/hi）
 /// 返回 (低半字有符号扩展, 高半字有符号扩展)
 pub fn dual_half_operands(rm: u32, swap: bool) -> (i32, i32) {
@@ -239,6 +303,52 @@ mod tests {
         // 低半字: Rn.lo(0x0005) − Rm.hi(0x0001) = 4；高半字: Rn.hi(0x0002) + Rm.lo(0x0003) = 5
         assert_eq!(r, 0x0005_0004);
         assert_eq!(ge, 0b11);
+    }
+
+    #[test]
+    fn simd8_ge_semantics() {
+        // 有符号 SADD8：GE = 每字节结果 ≥ 0
+        let (r, ge) = simd8(0x01_02_03_04, 0x01_02_03_04, false, false, false);
+        assert_eq!(r, 0x02_04_06_08);
+        assert_eq!(ge, 0b1111);
+        // 有符号负数：高字节 -1 + 0 = -1 → GE 清位
+        let (r, ge) = simd8(0xFF_00_00_00, 0x00_00_00_00, false, false, false);
+        assert_eq!(r, 0xFF_00_00_00);
+        assert_eq!(ge, 0b0111);
+        // 无符号 UADD8：GE = 进位
+        let (r, ge) = simd8(0xFF_01_01_01, 0x01_01_01_01, true, false, false);
+        assert_eq!(r, 0x00_02_02_02);
+        assert_eq!(ge, 0b1000);
+        // 无符号 USUB8：GE = 无借位
+        let (r, ge) = simd8(0x05_05_05_05, 0x02_08_01_0F, true, false, true);
+        assert_eq!(r, 0x03_FD_04_F6);
+        assert_eq!(ge, 0b1010); // 字节 1,3 无借位；字节 0,2 借位（0x0F/0x08 > 0x05）
+        // 有符号 SSUB8：GE = 结果 ≥ 0
+        let (r, ge) = simd8(0x05_05_00_05, 0x02_01_01_01, false, false, true);
+        assert_eq!(r, 0x0304_FF04); // 字节 1：0x00-0x01 = -1 → 0xFF
+        assert_eq!(ge, 0b1101);
+    }
+
+    #[test]
+    fn simd8_halving_semantics() {
+        // SHADD8(1, 3) = 2；SHADD8(-1, -1) = -1（算术移位）
+        let (r, ge) = simd8(0x01_01_01_01, 0x03_03_03_03, false, true, false);
+        assert_eq!(r, 0x02_02_02_02);
+        assert_eq!(ge, 0); // 减半不更新 GE（QEMU 语义：清零）
+        let (r, _) = simd8(0xFF_FF_FF_FF, 0xFF_FF_FF_FF, false, true, false);
+        assert_eq!(r, 0xFF_FF_FF_FF); // (-2)>>1 = -1
+        // UHADD8(0xFF, 0x01) = 0x80（无符号扩展相加）
+        let (r, ge) = simd8(0xFF_00_00_00, 0x01_00_00_00, true, true, false);
+        assert_eq!(r, 0x80_00_00_00);
+        assert_eq!(ge, 0);
+        // SHSUB8(1, 3) = -1（算术移位）；UHSUB8(0x05, 0x03) = (5-3)>>1 = 1
+        let (r, _) = simd8(0x01_00_00_00, 0x03_00_00_00, false, true, true);
+        assert_eq!(r, 0xFF_00_00_00); // (-2)>>1 = -1
+        let (r, _) = simd8(0x05_00_00_00, 0x03_00_00_00, true, true, true);
+        assert_eq!(r, 0x01_00_00_00);
+        // UHSUB8(0x01, 0x03) = 回绕减后逻辑右移 → 0xFF（QEMU 语义，无 +0x100）
+        let (r, _) = simd8(0x01_00_00_00, 0x03_00_00_00, true, true, true);
+        assert_eq!(r, 0xFF_00_00_00);
     }
 
     // ==================== 指令级 golden 测试（GIVEN/WHEN/THEN） ====================
@@ -635,5 +745,113 @@ mod tests {
         assert_eq!(h.exec_word(0xEAC1_0002), ExecOutcome::Continue);
         // THEN: R0 = 0x3333_2222
         assert_eq!(h.cpu.regs[0], 0x3333_2222);
+    }
+
+    // ============ P3-补：8-bit SIMD golden（编码经 arm-none-eabi-as 实测） ============
+
+    #[test]
+    fn golden_sadd8_ge() {
+        // GIVEN: R1 = 0x01_02_03_04，R2 = 0x01_02_03_04
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x0102_0304;
+        h.cpu.regs[2] = 0x0102_0304;
+        // WHEN: SADD8 R0, R1, R2（0xFA81 F002）
+        assert_eq!(h.exec_word(0xFA81_F002), ExecOutcome::Continue);
+        // THEN: R0 = 0x02_04_06_08，GE[3:0] = 1111
+        assert_eq!(h.cpu.regs[0], 0x0204_0608);
+        assert_eq!(h.ge_flags(), 0b1111);
+    }
+
+    #[test]
+    fn golden_sadd8_negative_ge_clear() {
+        // GIVEN: R1 = 0xFF_00_00_00（高字节 -1），R2 = 0
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0xFF00_0000;
+        // WHEN: SADD8 R0, R1, R2（0xFA81 F002）
+        assert_eq!(h.exec_word(0xFA81_F002), ExecOutcome::Continue);
+        // THEN: 高字节结果 -1 < 0 → GE[3] = 0，其余 ≥ 0 → GE = 0111
+        assert_eq!(h.cpu.regs[0], 0xFF00_0000);
+        assert_eq!(h.ge_flags(), 0b0111);
+    }
+
+    #[test]
+    fn golden_uadd8_carry_ge() {
+        // GIVEN: R1 = 0xFF_01_01_01，R2 = 0x01_01_01_01
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0xFF01_0101;
+        h.cpu.regs[2] = 0x0101_0101;
+        // WHEN: UADD8 R0, R1, R2（0xFA81 F042）
+        assert_eq!(h.exec_word(0xFA81_F042), ExecOutcome::Continue);
+        // THEN: 高字节进位 → GE = 1000
+        assert_eq!(h.cpu.regs[0], 0x0002_0202);
+        assert_eq!(h.ge_flags(), 0b1000);
+    }
+
+    #[test]
+    fn golden_usub8_borrow_ge() {
+        // GIVEN: R1 = 0x05_05_05_05，R2 = 0x02_08_01_0F
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x0505_0505;
+        h.cpu.regs[2] = 0x0208_010F;
+        // WHEN: USUB8 R0, R1, R2（0xFAC1 F042）
+        assert_eq!(h.exec_word(0xFAC1_F042), ExecOutcome::Continue);
+        // THEN: R0 = 0x03_FD_04_F6；GE = 1010（字节 0,2 无借位）
+        assert_eq!(h.cpu.regs[0], 0x03FD_04F6);
+        assert_eq!(h.ge_flags(), 0b1010);
+    }
+
+    #[test]
+    fn golden_ssub8_signed_ge() {
+        // GIVEN: R1 = 0x0505_0005（字节 1 = 0x00），R2 = 0x0201_0101
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x0505_0005;
+        h.cpu.regs[2] = 0x0201_0101;
+        // WHEN: SSUB8 R0, R1, R2（0xFAC1 F002）
+        assert_eq!(h.exec_word(0xFAC1_F002), ExecOutcome::Continue);
+        // THEN: 字节 1 结果 -1 → GE[1] = 0 → GE = 1101
+        assert_eq!(h.cpu.regs[0], 0x0304_FF04);
+        assert_eq!(h.ge_flags(), 0b1101);
+    }
+
+    #[test]
+    fn golden_shadd8_halving_ge_zero() {
+        // GIVEN: R1 = 0x01_01_01_01，R2 = 0x03_03_03_03，GE 预置 0xF
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x0101_0101;
+        h.cpu.regs[2] = 0x0303_0303;
+        h.cpu.xpsr |= 0xF << 16;
+        // WHEN: SHADD8 R0, R1, R2（0xFA81 F022）
+        assert_eq!(h.exec_word(0xFA81_F022), ExecOutcome::Continue);
+        // THEN: R0 = 0x02_02_02_02；减半指令 GE 清零
+        assert_eq!(h.cpu.regs[0], 0x0202_0202);
+        assert_eq!(h.ge_flags(), 0);
+    }
+
+    #[test]
+    fn golden_uhadd8_wide_sum() {
+        // GIVEN: R1 = 0xFF_00_00_00，R2 = 0x01_00_00_00
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0xFF00_0000;
+        h.cpu.regs[2] = 0x0100_0000;
+        // WHEN: UHADD8 R0, R1, R2（0xFA81 F062）
+        assert_eq!(h.exec_word(0xFA81_F062), ExecOutcome::Continue);
+        // THEN: (255+1)>>1 = 128 = 0x80
+        assert_eq!(h.cpu.regs[0], 0x8000_0000);
+        assert_eq!(h.ge_flags(), 0);
+    }
+
+    #[test]
+    fn golden_shsub8_uhsub8() {
+        // GIVEN: R1 = 0x01_00_00_00，R2 = 0x03_00_00_00
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x0100_0000;
+        h.cpu.regs[2] = 0x0300_0000;
+        // WHEN: SHSUB8 R0, R1, R2（0xFAC1 F022）→ (-2)>>1 = -1
+        assert_eq!(h.exec_word(0xFAC1_F022), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFF00_0000);
+        // WHEN: UHSUB8 R0, R1, R2（0xFAC1 F062）→ 回绕减后逻辑右移 → 0xFF
+        assert_eq!(h.exec_word(0xFAC1_F062), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFF00_0000);
+        assert_eq!(h.ge_flags(), 0);
     }
 }

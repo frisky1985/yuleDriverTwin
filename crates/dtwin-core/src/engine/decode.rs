@@ -146,6 +146,18 @@ pub enum Instruction {
         kind: Simd16Kind,
         unsigned: bool,
     },
+    /// 8-bit SIMD: SADD8/SSUB8/UADD8/USUB8/SHADD8/SHSUB8/UHADD8/UHSUB8（写 GE[3:0]）
+    Simd8 {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        /// true = 无符号（U 前缀）
+        unsigned: bool,
+        /// true = 减半（H 前缀）
+        halving: bool,
+        /// true = 减法家族（SSUB8/USUB8/SHSUB8/UHSUB8）
+        sub: bool,
+    },
     /// SMUAD/SMUSD: 双半字乘法（可选交换 Rm 半字）
     DualHalfMul {
         rd: u8,
@@ -524,6 +536,14 @@ impl Decoder {
         {
             return self.decode_simd16(bits);
         }
+        // 8-bit SIMD（SADD8/SSUB8 家族：top 0xFA8x 加 / 0xFACx 减，低半字 0xF0xx）
+        // bits[7:6] != 10 排除 QADD8/QSUB8 等（QADD 家族判别位）
+        if matches!(top & 0xFFF8, 0xFA80 | 0xFAC0)
+            && (bits & 0xF000) == 0xF000
+            && (bits & 0x00C0) != 0x0080
+        {
+            return self.decode_simd8(bits);
+        }
         // SMUAD/SMUSD/SMLAD/SMLSD（0xFB20/0xFB40，低半字 bits[7:5]=000）
         if matches!(top & 0xFFF8, 0xFB20 | 0xFB40) && (bits & 0x00E0) == 0 {
             return self.decode_dual_half_mul(bits);
@@ -660,6 +680,27 @@ impl Decoder {
         Instruction::QAddSub { rd, rn, rm, kind }
     }
 
+    /// 解码 8-bit SIMD（SADD8/SSUB8/UADD8/USUB8/SHADD8/SHSUB8/UHADD8/UHSUB8）
+    /// 编码（汇编器实测）：top = 0xFA8x（加家族）/ 0xFACx（减家族，bit22=1），
+    /// 低半字 0xF0xx：bit21 = 无符号（U），bit20 = 减半（H）
+    fn decode_simd8(&self, bits: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let rn = (top & 0xF) as u8;
+        let rd = ((bits >> 8) & 0xF) as u8;
+        let rm = (bits & 0xF) as u8;
+        let unsigned = (bits & 0x40) != 0; // bit21
+        let halving = (bits & 0x20) != 0; // bit20
+        let sub = (top & 0x40) != 0; // bit22：0xFA8x 加 / 0xFACx 减
+        Instruction::Simd8 {
+            rd,
+            rn,
+            rm,
+            unsigned,
+            halving,
+            sub,
+        }
+    }
+
     /// 解码半字 SIMD（SADD16 等）
     fn decode_simd16(&self, bits: u32) -> Instruction {
         let top = (bits >> 16) as u16;
@@ -680,9 +721,7 @@ impl Decoder {
             kind,
             unsigned,
         }
-    }
-
-    /// 解码 SMUAD/SMUSD/SMLAD/SMLSD
+    }    /// 解码 SMUAD/SMUSD/SMLAD/SMLSD
     fn decode_dual_half_mul(&self, bits: u32) -> Instruction {
         let top = (bits >> 16) as u16;
         let rn = (top & 0xF) as u8;

@@ -579,6 +579,22 @@ impl Executor {
                 cpu.xpsr = (cpu.xpsr & !(0x3 << 16)) | (((ge as u32) & 0x3) << 16);
                 ExecOutcome::Continue
             }
+            Instruction::Simd8 {
+                rd,
+                rn,
+                rm,
+                unsigned,
+                halving,
+                sub,
+            } => {
+                let a = cpu.regs[*rn as usize];
+                let b = cpu.regs[*rm as usize];
+                let (result, ge) = dsp::simd8(a, b, *unsigned, *halving, *sub);
+                cpu.regs[*rd as usize] = result;
+                // GE[3:0] 更新（bits[19:16]）
+                cpu.xpsr = (cpu.xpsr & !(0xF << 16)) | (((ge as u32) & 0xF) << 16);
+                ExecOutcome::Continue
+            }
             Instruction::DualHalfMul {
                 rd,
                 rn,
