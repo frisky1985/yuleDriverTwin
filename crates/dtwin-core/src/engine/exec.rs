@@ -33,6 +33,24 @@ pub struct Executor {
     pub cycle_count: u64,
 }
 
+/// 是否为 FPU（VFP）指令（CPACR 门控用，P5-补）
+fn is_fpu_instr(instr: &Instruction) -> bool {
+    matches!(
+        instr,
+        Instruction::FpVmovReg { .. }
+            | Instruction::FpVmovCore { .. }
+            | Instruction::FpVmovCoreD { .. }
+            | Instruction::FpVmovImm { .. }
+            | Instruction::FpArith3 { .. }
+            | Instruction::FpUnary { .. }
+            | Instruction::FpCmp { .. }
+            | Instruction::FpCvt { .. }
+            | Instruction::FpCvtFixed { .. }
+            | Instruction::FpLoadStore { .. }
+            | Instruction::FpLoadStoreMulti { .. }
+    )
+}
+
 impl Executor {
     pub fn new() -> Self {
         Self::default()
@@ -47,6 +65,14 @@ impl Executor {
     ) -> ExecOutcome {
         self.executed_count += 1;
         self.cycle_count += 1;
+        // FPU 门控（CPACR，P5-补）：CP10/CP11 未使能时浮点指令 → NOCP UsageFault
+        if !cpu.fpu_enabled() && is_fpu_instr(instr) {
+            return ExecOutcome::Fault {
+                reason: super::FaultReason::UsageFault {
+                    address: cpu.regs[15],
+                },
+            };
+        }
         match instr {
             Instruction::Nop => ExecOutcome::Continue,
             Instruction::Mov { rd, rm, imm } => {
@@ -821,6 +847,14 @@ impl Executor {
                                     flags.ufc = true;
                                     flags.ixc = true;
                                 }
+                                // IXC：sqrt 不精确（完美平方除外）。
+                                // 融合乘加 r*r − f == 0 ⟺ r 为精确平方根。
+                                if f != 0.0
+                                    && !f.is_infinite()
+                                    && r.mul_add(r, -f) != 0.0
+                                {
+                                    flags.ixc = true;
+                                }
                                 self.apply_fpu_flags(fpu, &flags);
                                 fpu.write_d(*vd as usize, r.to_bits());
                             }
@@ -849,6 +883,13 @@ impl Executor {
                                 let mut flags = fpu::FpOpFlags::default();
                                 if fpu::is_denormal_f32(r.to_bits()) {
                                     flags.ufc = true;
+                                    flags.ixc = true;
+                                }
+                                // IXC：f32 平方根不精确判定（f64 精确中间量，r 为 f32 精确值）
+                                if f != 0.0
+                                    && !f.is_infinite()
+                                    && (r as f64).mul_add(r as f64, -(f as f64)) != 0.0
+                                {
                                     flags.ixc = true;
                                 }
                                 self.apply_fpu_flags(fpu, &flags);
@@ -1716,5 +1757,84 @@ mod tests {
                 reason: crate::engine::FaultReason::UnimplementedInstr,
             }
         );
+    }
+
+    // ============ P5-补：VSQRT IXC + CPACR 门控 ============
+
+    /// VSQRT 不精确检测：完美平方无 IXC，非平方有 IXC（f32/f64）
+    #[test]
+    fn golden_vsqrt_ixc() {
+        let mut h = crate::engine::test_util::Harness::new();
+        // sqrt(4.0) = 2.0 精确 → 无 IXC（FPSCR bit4）
+        h.cpu.fpu.write_s(1, 4.0f32.to_bits());
+        assert_eq!(h.exec_word(0xEEB1_0AE0), ExecOutcome::Continue); // VSQRT.F32 S0, S1
+        assert_eq!(h.cpu.fpu.read_s(0), 2.0f32.to_bits());
+        assert_eq!(h.cpu.fpu.fpscr & (1 << 4), 0);
+        // sqrt(2.0) 不精确 → IXC 置位
+        h.cpu.fpu.write_s(1, 2.0f32.to_bits());
+        assert_eq!(h.exec_word(0xEEB1_0AE0), ExecOutcome::Continue);
+        assert_ne!(h.cpu.fpu.fpscr & (1 << 4), 0);
+        // f64：sqrt(9.0) 精确（IXC 为粘性位，先清零 FPSCR 再验证）
+        h.cpu.fpu.fpscr = 0;
+        h.cpu.fpu.write_d(1, 9.0f64.to_bits());
+        assert_eq!(h.exec_word(0xEEB1_0BC1), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(0), 3.0f64.to_bits());
+        assert_eq!(h.cpu.fpu.fpscr & (1 << 4), 0);
+        // f64：sqrt(2.0) 不精确 → IXC
+        h.cpu.fpu.write_d(1, 2.0f64.to_bits());
+        assert_eq!(h.exec_word(0xEEB1_0BC1), ExecOutcome::Continue);
+        assert_ne!(h.cpu.fpu.fpscr & (1 << 4), 0);
+    }
+
+    /// CPACR 门控：FPU 未使能（cpacr = 0）时浮点指令 → NOCP UsageFault
+    #[test]
+    fn golden_cpacr_gate_fpu_disabled() {
+        let mut h = crate::engine::test_util::Harness::new();
+        // GIVEN: FPU 关闭（CPACR CP10/CP11 = 0）
+        h.cpu.cpacr = 0;
+        // WHEN: VADD.F32 S0, S1, S2（0xEE30 0A81）
+        let out = h.exec_word(0xEE30_0A81);
+        // THEN: NOCP UsageFault，FPU 状态不变
+        assert_eq!(
+            out,
+            ExecOutcome::Fault {
+                reason: crate::engine::FaultReason::UsageFault {
+                    address: h.cpu.regs[15],
+                }
+            }
+        );
+        assert_eq!(h.cpu.fpu.read_s(0), 0);
+        // VLDR 也被门控
+        h.cpu.regs[1] = 0x2000_0000;
+        let out = h.exec_word(0xED91_0A00);
+        assert!(matches!(
+            out,
+            ExecOutcome::Fault {
+                reason: crate::engine::FaultReason::UsageFault { .. }
+            }
+        ));
+        // MRS/MSR（核心寄存器）不受 CPACR 门控
+        h.cpu.regs[2] = 1;
+        assert_eq!(h.exec_word(0xF382_8810), ExecOutcome::Continue); // MSR PRIMASK, r2
+        assert_eq!(h.cpu.primask, 1);
+    }
+
+    /// CPACR 门控：重新使能后 FPU 恢复工作（特权级访问恢复语义）
+    #[test]
+    fn golden_cpacr_gate_reenable() {
+        let mut h = crate::engine::test_util::Harness::new();
+        h.cpu.cpacr = 0;
+        assert!(matches!(
+            h.exec_word(0xEE30_0A81),
+            ExecOutcome::Fault {
+                reason: crate::engine::FaultReason::UsageFault { .. }
+            }
+        ));
+        // 重新使能 CP10/CP11
+        h.cpu.cpacr = 0x00F0_0000;
+        h.cpu.fpu.write_s(1, 1.0f32.to_bits());
+        h.cpu.fpu.write_s(2, 2.0f32.to_bits());
+        assert_eq!(h.exec_word(0xEE30_0A81), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), 3.0f32.to_bits());
     }
 }

@@ -468,7 +468,7 @@ pub fn f32_mul_add(
 // ==================== 双精度（骨架） ====================
 
 /// f64 加法
-pub fn f64_add(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
+pub fn f64_add(fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
     let mut flags = FpOpFlags::default();
     flags.probe_inputs_f64(a, b);
     if is_nan_f64(a) || is_nan_f64(b) {
@@ -479,12 +479,20 @@ pub fn f64_add(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
     let ra = f64::from_bits(a);
     let rb = f64::from_bits(b);
     let res = ra + rb;
-    f64_common_flags(ra, rb, res, &mut flags, BinOp::Add);
-    (res.to_bits(), flags)
+    let mode = fpu.rounding_mode();
+    if mode == FpRounding::Nearest {
+        f64_common_flags(ra, rb, res, &mut flags, BinOp::Add);
+        (res.to_bits(), flags)
+    } else {
+        let rel = f64_add_relation(ra, rb, res);
+        let final_res = round_f64_dir(mode, res, rel);
+        f64_dir_flags(ra, rb, final_res, rel, &mut flags);
+        (final_res.to_bits(), flags)
+    }
 }
 
 /// f64 减法
-pub fn f64_sub(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
+pub fn f64_sub(fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
     let mut flags = FpOpFlags::default();
     flags.probe_inputs_f64(a, b);
     if is_nan_f64(a) || is_nan_f64(b) {
@@ -495,12 +503,20 @@ pub fn f64_sub(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
     let ra = f64::from_bits(a);
     let rb = f64::from_bits(b);
     let res = ra - rb;
-    f64_common_flags(ra, rb, res, &mut flags, BinOp::Sub);
-    (res.to_bits(), flags)
+    let mode = fpu.rounding_mode();
+    if mode == FpRounding::Nearest {
+        f64_common_flags(ra, rb, res, &mut flags, BinOp::Sub);
+        (res.to_bits(), flags)
+    } else {
+        let rel = f64_add_relation(ra, -rb, res);
+        let final_res = round_f64_dir(mode, res, rel);
+        f64_dir_flags(ra, rb, final_res, rel, &mut flags);
+        (final_res.to_bits(), flags)
+    }
 }
 
 /// f64 乘法
-pub fn f64_mul(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
+pub fn f64_mul(fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
     let mut flags = FpOpFlags::default();
     flags.probe_inputs_f64(a, b);
     if is_nan_f64(a) || is_nan_f64(b) {
@@ -511,12 +527,20 @@ pub fn f64_mul(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
     let ra = f64::from_bits(a);
     let rb = f64::from_bits(b);
     let res = ra * rb;
-    f64_common_flags(ra, rb, res, &mut flags, BinOp::Mul);
-    (res.to_bits(), flags)
+    let mode = fpu.rounding_mode();
+    if mode == FpRounding::Nearest {
+        f64_common_flags(ra, rb, res, &mut flags, BinOp::Mul);
+        (res.to_bits(), flags)
+    } else {
+        let rel = f64_mul_relation(ra, rb, res);
+        let final_res = round_f64_dir(mode, res, rel);
+        f64_dir_flags(ra, rb, final_res, rel, &mut flags);
+        (final_res.to_bits(), flags)
+    }
 }
 
 /// f64 除法
-pub fn f64_div(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
+pub fn f64_div(fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
     let mut flags = FpOpFlags::default();
     flags.probe_inputs_f64(a, b);
     if is_nan_f64(a) || is_nan_f64(b) {
@@ -536,8 +560,16 @@ pub fn f64_div(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
         return (res.to_bits(), flags);
     }
     let res = ra / rb;
-    f64_common_flags(ra, rb, res, &mut flags, BinOp::Div);
-    (res.to_bits(), flags)
+    let mode = fpu.rounding_mode();
+    if mode == FpRounding::Nearest {
+        f64_common_flags(ra, rb, res, &mut flags, BinOp::Div);
+        (res.to_bits(), flags)
+    } else {
+        let rel = f64_div_relation(ra, rb, res);
+        let final_res = round_f64_dir(mode, res, rel);
+        f64_dir_flags(ra, rb, final_res, rel, &mut flags);
+        (final_res.to_bits(), flags)
+    }
 }
 
 /// f64 乘加（融合单舍入）
@@ -738,6 +770,285 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
         a = t;
     }
     a
+}
+
+// ==================== f64 定向舍入（P5-补：RZ/RP/RM 精确化） ====================
+//
+// 策略：以原生 f64 运算得到正确舍入的 RN 结果 r，再按「精确结果与 r 的大小关系」
+// 用 next_up/next_down 调整 1 ulp 得到 RZ/RP/RM 结果。
+// - 加/减/乘：精确结果用 u128/i128 尾数算术精确求出，关系判定精确（含 sticky 尾）。
+// - 除：RN 结果正确舍入；关系用融合乘加余数 r*b-a 的符号近似判定（常规值可靠，
+//   极端指数差场景有理论误差，见 f64_div_relation 注释）。
+
+use std::cmp::Ordering;
+
+/// 下一个可表示的 f64（向 +∞）
+fn next_up_f64(f: f64) -> f64 {
+    if f.is_nan() || f == f64::INFINITY {
+        return f;
+    }
+    if f == 0.0 {
+        return f64::from_bits(1); // +最小次正规
+    }
+    if f.is_sign_negative() {
+        f64::from_bits(f.to_bits() - 1)
+    } else {
+        f64::from_bits(f.to_bits() + 1)
+    }
+}
+
+/// 下一个可表示的 f64（向 −∞）
+fn next_down_f64(f: f64) -> f64 {
+    if f.is_nan() || f == f64::NEG_INFINITY {
+        return f;
+    }
+    if f == 0.0 {
+        return f64::from_bits(0x8000_0000_0000_0001); // −最小次正规
+    }
+    if f.is_sign_negative() {
+        f64::from_bits(f.to_bits() + 1)
+    } else {
+        f64::from_bits(f.to_bits() - 1)
+    }
+}
+
+/// 按舍入模式对 RN 结果 r 做定向调整（rel = 精确结果与 r 的关系）
+fn round_f64_dir(mode: FpRounding, r: f64, rel: Ordering) -> f64 {
+    match mode {
+        FpRounding::Nearest => r,
+        FpRounding::Zero => match rel {
+            Ordering::Equal => r,
+            Ordering::Greater => {
+                if r > 0.0 {
+                    r
+                } else {
+                    next_up_f64(r)
+                }
+            }
+            Ordering::Less => {
+                if r > 0.0 {
+                    next_down_f64(r)
+                } else {
+                    r
+                }
+            }
+        },
+        FpRounding::PlusInf => match rel {
+            Ordering::Equal => r,
+            Ordering::Greater => next_up_f64(r),
+            Ordering::Less => r,
+        },
+        FpRounding::MinusInf => match rel {
+            Ordering::Equal => r,
+            Ordering::Greater => r,
+            Ordering::Less => next_down_f64(r),
+        },
+    }
+}
+
+/// 定向舍入路径的通用标志（OFC/UFC/IXC）
+fn f64_dir_flags(a: f64, b: f64, res: f64, rel: Ordering, flags: &mut FpOpFlags) {
+    if res.is_infinite() && !a.is_infinite() && !b.is_infinite() {
+        flags.ofc = true;
+        flags.ixc = true;
+    }
+    if is_denormal_f64(res.to_bits()) {
+        flags.ufc = true;
+        flags.ixc = true;
+    }
+    if rel != Ordering::Equal {
+        flags.ixc = true;
+    }
+}
+
+/// 精确加法结果：返回 (有符号尾数 i128, 指数, 尾整数 u64, 尾指数, 尾为负)
+/// 值 = sig × 2^(exp-52) ± tail_int × 2^(tail_exp-52)，|tail_int × 2^(tail_exp-exp)| < 1 帧 LSB
+fn f64_exact_add(a: f64, b: f64) -> (i128, i32, u64, i32, bool) {
+    let sa = a.is_sign_negative();
+    let sb = b.is_sign_negative();
+    let (ma, ea) = f64_decompose(a);
+    let (mb, eb) = f64_decompose(b);
+    let (big_m, big_e, small_m, small_e, big_neg, small_neg) = if ea >= eb {
+        (ma, ea, mb, eb, sa, sb)
+    } else {
+        (mb, eb, ma, ea, sb, sa)
+    };
+    let diff = (big_e - small_e) as u32;
+    let (shifted, tail_int) = if diff >= 64 {
+        (0i128, small_m)
+    } else {
+        let sm = small_m as i128;
+        (sm >> diff, small_m & ((1u64 << diff) - 1))
+    };
+    let mut sig = big_m as i128;
+    if big_neg {
+        sig = -sig;
+    }
+    let mut s = shifted;
+    if small_neg {
+        s = -s;
+    }
+    (sig + s, big_e, tail_int, small_e, small_neg)
+}
+
+/// 精确结果 (sig, exp, tail_int, tail_exp, tail_neg) 与 RN 结果 r 的比较。
+///
+/// 将三者统一到公共指数帧（min(exp, rexp)）做有符号 i128 全精度比较；
+/// 尾数右移丢失的位以 sticky 破平。RN 语义下指数差 ≤ 1，60 位移位余量充足，
+/// 超出时（非法数据防御）结果可能不准（见 f64_div_relation 的近似注记）。
+fn cmp_exact_vs_f64(
+    sig: i128,
+    exp: i32,
+    tail_int: u64,
+    tail_exp: i32,
+    tail_neg: bool,
+    r: f64,
+) -> Ordering {
+    if r == 0.0 {
+        if sig != 0 || tail_int != 0 {
+            let neg = sig < 0 || (sig == 0 && tail_neg);
+            return if neg {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        return Ordering::Equal;
+    }
+    if r.is_infinite() {
+        return if r > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let (rsig, rexp) = f64_decompose(r);
+    let e_min = exp.min(rexp);
+    // sig / rsig 左移到公共帧（带符号；r 的符号并入 rsig）
+    let lhs = (sig as i128) << (exp - e_min).min(60);
+    let r_signed = if r.is_sign_negative() {
+        -(rsig as i128)
+    } else {
+        rsig as i128
+    };
+    let rhs = r_signed << (rexp - e_min).min(60);
+    // tail 对齐：tail_exp ≤ exp；可能需右移（丢失位 → sticky）
+    let (tail_v, tail_sticky) = if tail_exp >= e_min {
+        ((tail_int as i128) << (tail_exp - e_min).min(60), false)
+    } else {
+        let sh = (e_min - tail_exp).min(64);
+        if sh >= 64 {
+            (0i128, tail_int != 0)
+        } else {
+            (
+                (tail_int as i128) >> sh,
+                (tail_int & ((1u64 << sh) - 1)) != 0,
+            )
+        }
+    };
+    let tail_signed = if tail_neg { -tail_v } else { tail_v };
+    let diff = lhs + tail_signed - rhs;
+    match diff.cmp(&0) {
+        Ordering::Equal => {
+            // 帧内整数相等：由 sticky 破平
+            if tail_sticky {
+                if tail_neg {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            } else {
+                Ordering::Equal
+            }
+        }
+        o => o,
+    }
+}
+
+/// 加法/减法：精确结果与 RN 结果 r 的关系
+fn f64_add_relation(a: f64, b: f64, r: f64) -> Ordering {
+    if a == 0.0 || b == 0.0 {
+        // 精确结果 = 另一操作数
+        let x = if a == 0.0 { b } else { a };
+        return if x < r {
+            Ordering::Less
+        } else if x > r {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        };
+    }
+    if r.is_infinite() {
+        // 精确有限 → 与 ±Inf 的关系
+        return if r > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let (sig, exp, tail_int, tail_exp, tail_neg) = f64_exact_add(a, b);
+    cmp_exact_vs_f64(sig, exp, tail_int, tail_exp, tail_neg, r)
+}
+
+/// 乘法：精确乘积（u128 尾数，无尾数）与 RN 结果 r 的关系
+fn f64_mul_relation(a: f64, b: f64, r: f64) -> Ordering {
+    if a == 0.0 || b == 0.0 {
+        // 精确结果 = ±0
+        return if r == 0.0 {
+            Ordering::Equal
+        } else if r > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    if r.is_infinite() {
+        return if r > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let (ma, ea) = f64_decompose(a);
+    let (mb, eb) = f64_decompose(b);
+    let mut sig = (ma as i128) * (mb as i128);
+    if a.is_sign_negative() ^ b.is_sign_negative() {
+        sig = -sig;
+    }
+    cmp_exact_vs_f64(sig, ea + eb, 0, ea + eb, false, r)
+}
+
+/// 除法：关系近似判定（余数符号法）。
+///
+/// rem = fma(r, b, -a) = r×b − a（单舍入）。rem 的符号给出 r 相对 a/b 的偏向：
+/// r×b > a ⟺ r > a/b（b > 0 时）。常规指数范围内可靠；极端指数差场景（次正规/超大
+/// 指数）fma 自身舍入可能引入误差，属近似（与 f32 除法的既有近似同级别）。
+fn f64_div_relation(a: f64, b: f64, r: f64) -> Ordering {
+    if r == 0.0 {
+        if a == 0.0 {
+            return Ordering::Equal; // 0/b = 0
+        }
+        return if (a > 0.0) == (b > 0.0) {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
+    }
+    if r.is_infinite() {
+        return if r > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    let rem = r.mul_add(b, -a); // r×b − a（融合单舍入）
+    if rem == 0.0 {
+        Ordering::Equal
+    } else if (rem > 0.0) == (b > 0.0) {
+        Ordering::Less // r > a/b → 精确 < r
+    } else {
+        Ordering::Greater
+    }
 }
 
 // ==================== VCVT 转换（整数 ↔ 浮点） ====================
@@ -1024,6 +1335,102 @@ mod tests {
         assert!(f64_div_exact(1.0, 4.0));
         // 1.0 / 3.0 不精确
         assert!(!f64_div_exact(1.0, 3.0));
+    }
+
+    // ============ P5-补：f64 定向舍入 + VSQRT IXC + CPACR ============
+
+    /// f64 定向舍入：RP/RM/RZ（1.0 + 0.1，精确结果略小于 RN 值）
+    #[test]
+    fn f64_directed_rounding_add() {
+        let mut fpu = FpuRegisters::new();
+        // RN：1.0 + 0.1 → 0x3FF1_9999_9999_999A（1.1000000000000000888，精确 sig 分数 .625 向上取整）
+        let rn = f64_add(&fpu, 1.0f64.to_bits(), 0.1f64.to_bits()).0;
+        assert_eq!(rn, 0x3FF1_9999_9999_999A);
+        // 精确 < RN（rel = Less）
+        assert_eq!(
+            f64_add_relation(1.0, 0.1, f64::from_bits(rn)),
+            Ordering::Less
+        );
+        // RP（向 +∞）：精确 < RN → 保持 RN
+        fpu.fpscr = 1 << 22;
+        let (rp, flags) = f64_add(&fpu, 1.0f64.to_bits(), 0.1f64.to_bits());
+        assert_eq!(rp, 0x3FF1_9999_9999_999A);
+        assert!(flags.ixc);
+        // RM（向 −∞）：精确 < RN → next_down
+        fpu.fpscr = 2 << 22;
+        let (rm, _) = f64_add(&fpu, 1.0f64.to_bits(), 0.1f64.to_bits());
+        assert_eq!(rm, 0x3FF1_9999_9999_9999);
+        // RZ（向零）：正数同 RM
+        fpu.fpscr = 3 << 22;
+        let (rz, _) = f64_add(&fpu, 1.0f64.to_bits(), 0.1f64.to_bits());
+        assert_eq!(rz, 0x3FF1_9999_9999_9999);
+    }
+
+    /// f64 定向舍入：乘法（0.1 × 0.2，不精确）与除法（1/3）
+    #[test]
+    fn f64_directed_rounding_mul_div() {
+        let mut fpu = FpuRegisters::new();
+        let rn = f64_mul(&fpu, 0.1f64.to_bits(), 0.2f64.to_bits()).0;
+        let rel = f64_mul_relation(0.1, 0.2, f64::from_bits(rn));
+        // RP：rel = Greater → next_up（位模式 +1）；否则保持 RN
+        fpu.fpscr = 1 << 22;
+        let rp = f64_mul(&fpu, 0.1f64.to_bits(), 0.2f64.to_bits()).0;
+        let expected_rp = if rel == Ordering::Greater {
+            rn + 1
+        } else {
+            rn
+        };
+        assert_eq!(rp, expected_rp);
+        // RZ：正数 → 结果 ≤ RN
+        fpu.fpscr = 3 << 22;
+        let rz = f64_mul(&fpu, 0.1f64.to_bits(), 0.2f64.to_bits()).0;
+        assert!(rz <= rn);
+        // 除法 1/3：RN = 0x3FD5_5555_5555_5555，精确 1/3 > RN → RP = +1
+        let rn3 = f64_div(&fpu, 1.0f64.to_bits(), 3.0f64.to_bits()).0;
+        assert_eq!(rn3, 0x3FD5_5555_5555_5555);
+        fpu.fpscr = 1 << 22;
+        let rp3 = f64_div(&fpu, 1.0f64.to_bits(), 3.0f64.to_bits()).0;
+        assert_eq!(rp3, 0x3FD5_5555_5555_5556);
+        fpu.fpscr = 2 << 22;
+        let rm3 = f64_div(&fpu, 1.0f64.to_bits(), 3.0f64.to_bits()).0;
+        assert_eq!(rm3, 0x3FD5_5555_5555_5555);
+    }
+
+    /// 精确结果路径：可精确表示的加法在任意舍入模式下不变（rel = Equal）
+    #[test]
+    fn f64_directed_rounding_exact_case() {
+        let mut fpu = FpuRegisters::new();
+        // 1.5 + 2.25 = 3.75 精确
+        for mode in [0u32, 1, 2, 3] {
+            fpu.fpscr = mode << 22;
+            let (r, flags) = f64_add(&fpu, 1.5f64.to_bits(), 2.25f64.to_bits());
+            assert_eq!(r, 3.75f64.to_bits());
+            assert!(!flags.ixc);
+        }
+        // 1.0 / 4.0 精确（除法余数为 0 → rel = Equal）
+        fpu.fpscr = 1 << 22;
+        let (r, flags) = f64_div(&fpu, 1.0f64.to_bits(), 4.0f64.to_bits());
+        assert_eq!(r, 0.25f64.to_bits());
+        assert!(!flags.ixc);
+    }
+
+    /// f64 加/减/乘的精确关系判定（与 RN 结果的方向）
+    #[test]
+    fn f64_relation_helpers() {
+        // 1.0 + 0.1：精确 < RN（sig 分数 .625 向上取整）
+        let rn = (1.0f64 + 0.1f64).to_bits();
+        assert_eq!(
+            f64_add_relation(1.0, 0.1, f64::from_bits(rn)),
+            Ordering::Less
+        );
+        // 1.0 + 2.0 = 3.0 精确
+        assert_eq!(f64_add_relation(1.0, 2.0, 3.0), Ordering::Equal);
+        // 0.1 × 0.2 不精确
+        assert_ne!(f64_mul_relation(0.1, 0.2, 0.1 * 0.2), Ordering::Equal);
+        // 减法：1.0 - 0.1 不精确（精确值 0x...6666 舍入到 0x...6668 = r，精确 < r）
+        assert_eq!(f64_add_relation(1.0, -0.1, 1.0 - 0.1), Ordering::Less);
+        // 精确减法：1.5 - 0.25 = 1.25 可表示
+        assert_eq!(f64_add_relation(1.5, -0.25, 1.25), Ordering::Equal);
     }
 
     #[test]

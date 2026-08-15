@@ -41,7 +41,7 @@ impl CoreType {
 }
 
 /// 模拟实例核心状态
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CpuState {
     /// 通用寄存器 R0-R15
     pub regs: [u32; 16],
@@ -56,8 +56,35 @@ pub struct CpuState {
     pub faultmask: u8,
     pub basepri: u8,
     pub control: u8,
+    /// 协处理器访问控制（0xE000_ED88）：bits[23:20] = CP11/CP10 权限（11 = 全访问）
+    /// 默认 0x00F0_0000（FPU 使能，与 Phase 4 既有行为一致；真实复位值 0，板级初始化后使能）
+    pub cpacr: u32,
     /// FPU 寄存器文件（S0-S31/D0-D15 + FPSCR）
     pub fpu: FpuRegisters,
+}
+
+impl Default for CpuState {
+    fn default() -> Self {
+        Self {
+            regs: [0; 16],
+            xpsr: 0,
+            msp: 0,
+            psp: 0,
+            primask: 0,
+            faultmask: 0,
+            basepri: 0,
+            control: 0,
+            cpacr: 0x00F0_0000,
+            fpu: FpuRegisters::default(),
+        }
+    }
+}
+
+impl CpuState {
+    /// FPU 是否使能：CPACR CP10/CP11 均为 0b11（全访问）
+    pub fn fpu_enabled(&self) -> bool {
+        (self.cpacr & 0x00F0_0000) == 0x00F0_0000
+    }
 }
 
 #[cfg(test)]
