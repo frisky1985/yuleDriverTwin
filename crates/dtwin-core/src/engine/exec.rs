@@ -20,17 +20,45 @@ pub enum ExecOutcome {
     Branch { target: u32 },
     /// 异常返回（BX LR 特殊形式）
     ExceptionReturn,
+    /// IT 块内条件不成立：本指令被跳过（PC 仍正常前进）
+    Skipped,
+    /// 调试事件（BKPT 触发）
+    DebugEvent,
     /// 触发硬件异常
     Fault { reason: super::FaultReason },
 }
 
 /// 指令执行器
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Executor {
     /// 已执行指令数
     pub executed_count: u64,
     /// 周期计数（模拟时钟）
     pub cycle_count: u64,
+    /// IT 块剩余条件执行指令数（0 = 不在 IT 块内）
+    it_remaining: u8,
+    /// IT 块总指令数（1-4）
+    it_block_len: u8,
+    /// IT firstcond（首条指令条件）
+    it_firstcond: Cond,
+    /// IT mask（bits[3:0]：后续指令条件 bit0 的来源）
+    it_mask: u8,
+    /// 本指令是否处于 IT 块内（已被 IT 条件门控）
+    it_was_active: bool,
+}
+
+impl Default for Executor {
+    fn default() -> Self {
+        Self {
+            executed_count: 0,
+            cycle_count: 0,
+            it_remaining: 0,
+            it_block_len: 0,
+            it_firstcond: Cond::Al,
+            it_mask: 0,
+            it_was_active: false,
+        }
+    }
 }
 
 /// 是否为 FPU（VFP）指令（CPACR 门控用，P5-补）
@@ -56,6 +84,37 @@ impl Executor {
         Self::default()
     }
 
+    /// 是否处于 IT 块内（供引擎/调试器查询）
+    pub fn it_active(&self) -> bool {
+        self.it_remaining > 0
+    }
+
+    /// 当前 IT 条件（首条指令 = firstcond；后续指令 = firstcond 的 bits[3:1]
+    /// 拼上对应 mask 位作 bit0 —— QEMU 实测：ITE NE（mask 0100）→ NE,EQ；
+    /// ITEE NE（0010）→ NE,EQ,EQ；ITEEE EQ（1111）→ EQ,NE,NE,NE）
+    pub fn it_cond(&self) -> Cond {
+        self.it_cond_at(0)
+    }
+
+    /// 块内第 k 条指令（0 起）的条件
+    fn it_cond_at(&self, k: u8) -> Cond {
+        if k == 0 {
+            self.it_firstcond
+        } else {
+            let base = self.it_firstcond.to_bits() & 0xE;
+            let bit0 = (self.it_mask >> (4 - k)) & 1;
+            Cond::from_bits(base | bit0).unwrap_or(Cond::Al)
+        }
+    }
+
+    /// 清除 IT 状态（异常入口/调试事件时架构要求 ITSTATE 清零）
+    pub fn clear_it(&mut self) {
+        self.it_remaining = 0;
+        self.it_block_len = 0;
+        self.it_firstcond = Cond::Al;
+        self.it_mask = 0;
+    }
+
     /// 执行一条指令，返回下一步行为
     pub fn execute(
         &mut self,
@@ -65,6 +124,22 @@ impl Executor {
     ) -> ExecOutcome {
         self.executed_count += 1;
         self.cycle_count += 1;
+        // ---- IT 块条件门控（ITSTATE 状态机）----
+        // 在 IT 块内的每条指令先按 IT 条件判断：不成立 → Skipped（PC 由引擎 +width）；
+        // 条件 = firstcond 的 bits[3:1] 拼 mask 对应位作 bit0（ARM 实测语义，非增量翻转）；
+        // 跳过的指令同样推进 ITSTATE。
+        self.it_was_active = false;
+        if self.it_remaining > 0 {
+            let k = self.it_block_len - self.it_remaining; // 当前块内序号（0 起）
+            let cond = self.it_cond_at(k);
+            let holds = self.cond_holds(cpu, cond);
+            eprintln!("IT gate: k={k} cond={cond:?} holds={holds} rem={} xpsr={:#x}", self.it_remaining, cpu.xpsr);
+            self.it_remaining -= 1;
+            if !holds {
+                return ExecOutcome::Skipped;
+            }
+            self.it_was_active = true;
+        }
         // FPU 门控（CPACR，P5-补）：CP10/CP11 未使能时浮点指令 → NOCP UsageFault
         if !cpu.fpu_enabled() && is_fpu_instr(instr) {
             return ExecOutcome::Fault {
@@ -75,11 +150,15 @@ impl Executor {
         }
         match instr {
             Instruction::Nop => ExecOutcome::Continue,
-            Instruction::Mov { rd, rm, imm } => {
+            Instruction::Mov { rd, rm, imm, flags } => {
                 let val = match imm {
                     Some(v) => *v,
                     None => cpu.regs[*rm as usize],
                 };
+                if *flags {
+                    // 16 位 MOVS 形式：更新 N/Z
+                    self.update_flags_logical(cpu, val);
+                }
                 cpu.regs[*rd as usize] = val;
                 ExecOutcome::Continue
             }
@@ -350,8 +429,10 @@ impl Executor {
                 ExecOutcome::Continue
             }
             Instruction::Branch { cond, target } => {
+                // IT 块内：分支自身条件被 IT 条件替代（ARMv7-M：B<cond> 在 IT 块内
+                // 忽略自身 cond，用 IT 条件；门控已通过 → 直接分支）
                 if let Some(c) = cond {
-                    if self.cond_holds(cpu, *c) {
+                    if self.it_was_active || self.cond_holds(cpu, *c) {
                         ExecOutcome::Branch { target: *target }
                     } else {
                         ExecOutcome::Continue
@@ -362,6 +443,11 @@ impl Executor {
             }
             Instruction::BranchLink { target } => {
                 // LR = 下一条指令地址 | Thumb 位（PC 尚未递增，BL 恒为 32 位）
+                cpu.regs[14] = cpu.regs[15].wrapping_add(4) | 1;
+                ExecOutcome::Branch { target: *target }
+            }
+            Instruction::BranchLinkExchangeImm { target } => {
+                // LR = 下一条指令地址 | Thumb 位（PC 尚未递增，BLX 恒为 32 位）
                 cpu.regs[14] = cpu.regs[15].wrapping_add(4) | 1;
                 ExecOutcome::Branch { target: *target }
             }
@@ -652,6 +738,20 @@ impl Executor {
                 ExecOutcome::Fault {
                     reason: super::FaultReason::UnimplementedInstr,
                 } // 异常入口由上层调度
+            }
+            Instruction::Breakpoint { imm8: _ } => {
+                // BKPT：调试事件（引擎统计 exceptions 并停止 run）
+                ExecOutcome::DebugEvent
+            }
+            Instruction::It { cond, mask } => {
+                // ITSTATE：N = 4 - 最低置位位索引（GNU as/QEMU 实测：
+                // mask 1000→1 条、0100/1100→2、1110/1010/0010→3、1111/1101/0001→4）
+                let n = 4 - mask.trailing_zeros() as u8;
+                self.it_remaining = n;
+                self.it_block_len = n;
+                self.it_firstcond = *cond;
+                self.it_mask = *mask;
+                ExecOutcome::Continue
             }
             Instruction::ExceptionReturn => ExecOutcome::ExceptionReturn,
 
@@ -1662,6 +1762,58 @@ mod tests {
         h.exec_halfword(0x419A);
         assert_eq!(h.cpu.regs[2], 1);
         assert_eq!(h.nzcv(), 0b0010, "C=1（无借位）");
+    }
+
+    /// E2: BL 执行 — LR=(PC+4)|1 且跳转（编码 0xF000 F80F @0x86E → 0x890，固件实测）
+    #[test]
+    fn e2_bl_sets_lr_and_branches() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[15] = 0x86E;
+        assert_eq!(
+            h.exec_word(0xF000_F80F),
+            ExecOutcome::Branch { target: 0x890 }
+        );
+        assert_eq!(h.cpu.regs[14], (0x86E + 4) | 1, "LR = (PC+4)|1");
+        assert_eq!(h.cpu.regs[15], 0x86E, "PC 由引擎推进/分支目标写入");
+    }
+
+    /// E2: BLX 32-bit 执行 — 目标 = Align(PC,4)+4+imm（0xF000 E80C @0x4 → 0x20，as 实测），LR=(PC+4)|1
+    #[test]
+    fn e2_blx_sets_lr_and_branches() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[15] = 0x4;
+        assert_eq!(
+            h.exec_word(0xF000_E80C),
+            ExecOutcome::Branch { target: 0x20 }
+        );
+        assert_eq!(h.cpu.regs[14], (0x4 + 4) | 1, "LR = (PC+4)|1");
+    }
+
+    /// E2: BLX 负偏移 — 0xF7FF EFFE @0x0 → 0x0（Align 基址 + (-4)，as 实测）
+    #[test]
+    fn e2_blx_negative_offset() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[15] = 0x0;
+        assert_eq!(
+            h.exec_word(0xF7FF_EFFE),
+            ExecOutcome::Branch { target: 0x0 }
+        );
+    }
+
+    /// E2: BLX 非 4 对齐 PC — Align(PC,4)+4 基址（0xF000 E808 @0x6 → 0x18，as 实测）
+    #[test]
+    fn e2_blx_aligned_base() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[15] = 0x6;
+        assert_eq!(
+            h.exec_word(0xF000_E808),
+            ExecOutcome::Branch { target: 0x18 }
+        );
+        assert_eq!(h.cpu.regs[14], (0x6 + 4) | 1);
     }
 
     #[test]

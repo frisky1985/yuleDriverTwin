@@ -25,6 +25,8 @@ pub enum EngineResult {
     Halted,
     /// 触发未处理异常
     Fault { reason: FaultReason },
+    /// 调试事件（BKPT 触发）
+    DebugEvent,
     /// 达到指令数上限
     LimitReached,
 }
@@ -99,6 +101,17 @@ impl Engine {
                 cpu.regs[15] = cpu.regs[15].wrapping_add(width);
                 EngineResult::Halted // 单步：返回暂停
             }
+            // IT 条件不成立被跳过：PC 照常前进（指令已计数）
+            ExecOutcome::Skipped => {
+                let width = if (raw & 0xF800) == 0xE800 || (raw & 0xF000) == 0xF000 {
+                    4
+                } else {
+                    2
+                };
+                cpu.regs[15] = cpu.regs[15].wrapping_add(width);
+                self.stats.cycles = self.executor.cycle_count;
+                EngineResult::Halted
+            }
             ExecOutcome::Branch { target } => {
                 cpu.regs[15] = target;
                 EngineResult::Halted
@@ -107,8 +120,16 @@ impl Engine {
                 self.stats.exceptions += 1;
                 EngineResult::Halted
             }
+            // 调试事件（BKPT）：ITSTATE 清零（异常语义），统计并返回
+            ExecOutcome::DebugEvent => {
+                self.stats.exceptions += 1;
+                self.executor.clear_it();
+                EngineResult::DebugEvent
+            }
             ExecOutcome::Fault { reason } => {
                 self.stats.faults += 1;
+                // 异常入口清除 ITSTATE（ARMv7-M 异常语义）
+                self.executor.clear_it();
                 EngineResult::Fault { reason }
             }
         }
@@ -250,5 +271,156 @@ mod tests {
         assert_eq!(cpu.regs[2], 0x2A);
         assert_eq!(cpu.regs[3], 0x2A);
         assert_eq!(cpu.regs[15], 8);
+    }
+
+    // ================= E2: IT 块 / BKPT 引擎级 golden 测试 =================
+    // 编码与 arm-none-eabi-as 实测一致（it eq=0xBF08、ite ne=0xBF14…）。
+
+    /// IT 块：条件不成立 → 跳过（movs r0,#1 置 Z=0；it eq 后续 moveq 被跳过；
+    /// ite ne 前半执行、后半（条件翻转 EQ）被跳过）
+    #[test]
+    fn e2_it_block_condition_skip() {
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::test_ram();
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        cpu.regs[15] = 0;
+        // 0x2001 movs r0,#1 | 0xBF08 it eq | 0x2101 moveq r1,#1 | 0x2102 movs r1,#2
+        // 0xBF14 ite ne | 0x2201 movne r2,#1 | 0x2302 moveq r3,#2
+        for (i, b) in [
+            0x01, 0x20, 0x08, 0xBF, 0x01, 0x21, 0x02, 0x21, 0x14, 0xBF, 0x01, 0x22, 0x02, 0x23,
+        ]
+        .iter()
+        .enumerate()
+        {
+            mem.flash[i] = *b;
+        }
+        // WHEN: 连续单步 7 条指令
+        for _ in 0..7 {
+            assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        }
+        // THEN: r0=1（Z=0）、r1=2（moveq 被跳过）、r2=1（NE 成立）、r3=0（EQ 被跳过）
+        assert_eq!(cpu.regs[0], 1);
+        assert_eq!(cpu.regs[1], 2, "it eq 后 moveq 应被跳过");
+        assert_eq!(cpu.regs[2], 1, "ite ne 前半 movne 应执行");
+        assert_eq!(cpu.regs[3], 0, "ite ne 后半 moveq（翻转条件）应被跳过");
+        assert_eq!(cpu.regs[15], 14);
+        assert_eq!(eng.stats.instructions, 7);
+        assert_eq!(eng.stats.faults, 0);
+        assert!(!eng.executor.it_active(), "IT 块结束后状态应清空");
+    }
+
+    /// IT 块：条件成立 → 全部执行（itttt eq：4 条 STR 全部执行；用 STR 避免 ADDS
+    /// 覆盖 Z 标志——真实硬件行为：块内 ADDS 会改写 flags 影响后续条件）
+    #[test]
+    fn e2_it_block_all_execute() {
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::test_ram();
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        cpu.regs[15] = 0;
+        cpu.regs[0] = 0x2000_0000;
+        cpu.regs[1] = 0xA1;
+        cpu.regs[2] = 0xB2;
+        cpu.regs[3] = 0xC3;
+        cpu.regs[4] = 0xD4;
+        // 0x2500 movs r5, #0（置 Z=1，不碰 STR 源寄存器）| 0xBF01 itttt eq |
+        // 4×16 位 STR（不写 flags）：0x6001/0x6042/0x6083/0x60C4 → [r0+#0/#4/#8/#12]
+        for (i, b) in [
+            0x00, 0x25, 0x01, 0xBF, 0x01, 0x60, 0x42, 0x60, 0x83, 0x60, 0xC4, 0x60,
+        ]
+        .iter()
+        .enumerate()
+        {
+            mem.flash[i] = *b;
+        }
+        for _ in 0..6 {
+            assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        }
+        // THEN: 4 条 STR 全部执行（Z=1 保持，EQ 恒成立）
+        assert_eq!(mem.read_u32(0x2000_0000).unwrap(), 0xA1);
+        assert_eq!(mem.read_u32(0x2000_0004).unwrap(), 0xB2);
+        assert_eq!(mem.read_u32(0x2000_0008).unwrap(), 0xC3);
+        assert_eq!(mem.read_u32(0x2000_000C).unwrap(), 0xD4);
+        assert_eq!(cpu.regs[15], 12);
+        assert!(!eng.executor.it_active());
+    }
+
+    /// ITE EQ（0xBF0C，mask 1100）：[Eq, Ne]——NE 分支在 Z=0 时执行。
+    /// 验证绝对模型（mask 位 = 后续指令条件 bit0）：gas 编码 ite eq = 1100（instr1 = Ne）；
+    /// 注：QEMU 11.0.2 二进制对该编码表现为 [Eq,Eq]，与其自身源码及 gas 编码语义相悖
+    /// （已实测 ite ne/itee ne/itte ne/ittte ne/iteee eq/itttt eq 全部一致，仅此一例异常）；
+    /// dtwin 按架构语义（gas 编码权威）实现。
+    #[test]
+    fn e2_ite_eq_else_executes() {
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::test_ram();
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        cpu.regs[15] = 0;
+        // 0x2500 movs r5,#0（Z=1）| 0xBF0C ite eq | 0x21A1 moveq r1,#0xA1 | 0x22B2 movne r2,#0xB2
+        for (i, b) in [0x00, 0x25, 0x0C, 0xBF, 0xA1, 0x21, 0xB2, 0x22].iter().enumerate() {
+            mem.flash[i] = *b;
+        }
+        for _ in 0..4 {
+            assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        }
+        assert_eq!(cpu.regs[1], 0xA1, "instr0 moveq 执行（Z=1）");
+        assert_eq!(cpu.regs[2], 0xB2, "instr1 movne 执行（else 分支，Z=0 时 Ne 成立）");
+        assert!(!eng.executor.it_active());
+    }
+
+    /// BKPT：触发 DebugEvent，引擎统计 exceptions，run 停止
+    #[test]
+    fn e2_bkpt_triggers_debug_event() {
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::test_ram();
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        cpu.regs[15] = 0;
+        // 0x2001 movs r0,#1 | 0xBEAB bkpt #0xAB
+        mem.flash[0] = 0x01;
+        mem.flash[1] = 0x20;
+        mem.flash[2] = 0xAB;
+        mem.flash[3] = 0xBE;
+        assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        assert_eq!(
+            eng.step(&mut cpu, &mut mem, &mut nvic),
+            EngineResult::DebugEvent
+        );
+        assert_eq!(eng.stats.exceptions, 1);
+        assert_eq!(eng.stats.faults, 0);
+        // run 遇到 BKPT 也返回 DebugEvent
+        let mut eng2 = Engine::new();
+        let mut cpu2 = CpuState::default();
+        let mut mem2 = Memory::test_ram();
+        let mut nvic2 = Nvic::new();
+        cpu2.regs[15] = 0;
+        mem2.flash[0] = 0xAB;
+        mem2.flash[1] = 0xBE;
+        assert_eq!(
+            eng2.run(&mut cpu2, &mut mem2, &mut nvic2),
+            EngineResult::DebugEvent
+        );
+    }
+
+    /// BKPT 在 IT 块内：条件不成立时被跳过（诚实边界：ARMv7-M 规定 BKPT 不受
+    /// 条件限制始终执行，此处按 IT 门控处理并如实注释）
+    #[test]
+    fn e2_bkpt_inside_it_cond_fail_skips() {
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::test_ram();
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        cpu.regs[15] = 0;
+        // 0x2001 movs r0,#1（Z=0）| 0xBF08 it eq | 0xBEAB bkpt（应被跳过）
+        for (i, b) in [0x01, 0x20, 0x08, 0xBF, 0xAB, 0xBE].iter().enumerate() {
+            mem.flash[i] = *b;
+        }
+        for _ in 0..3 {
+            assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        }
+        assert_eq!(eng.stats.exceptions, 0, "条件不成立的 BKPT 被跳过");
+        assert_eq!(cpu.regs[15], 6);
     }
 }

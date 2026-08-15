@@ -16,8 +16,13 @@ pub enum InstrWidth {
 pub enum Instruction {
     /// NOP / 提示指令
     Nop,
-    /// 数据传送: MOV Rd, #imm / MOV Rd, Rm
-    Mov { rd: u8, rm: u8, imm: Option<u32> },
+    /// 数据传送: MOV Rd, #imm / MOV Rd, Rm（flags=true 时更新 N/Z，即 16 位 MOVS 形式）
+    Mov {
+        rd: u8,
+        rm: u8,
+        imm: Option<u32>,
+        flags: bool,
+    },
     /// 32 位立即数高半字: MOVW/MOVT
     MovImm32 { rd: u8, imm16: u16, top: bool },
     /// 加法: ADD Rd, Rn, Rm/imm
@@ -122,6 +127,8 @@ pub enum Instruction {
     Branch { cond: Option<Cond>, target: u32 },
     /// 分支+链接
     BranchLink { target: u32 },
+    /// 分支+链接+交换（立即数形式，32-bit BLX）
+    BranchLinkExchangeImm { target: u32 },
     /// 分支+交换: BX Rm
     BranchExchange { rm: u8 },
     /// 分支+链接+交换: BLX Rm
@@ -165,6 +172,10 @@ pub enum Instruction {
     },
     /// 软件中断: SVC
     Svc { imm8: u8 },
+    /// 调试断点: BKPT #imm8
+    Breakpoint { imm8: u8 },
+    /// If-Then 条件块: IT{cond} mask（ITSTATE 状态机，后续 1-4 条指令按条件执行）
+    It { cond: Cond, mask: u8 },
     /// 异常返回: BX LR 特殊形式
     ExceptionReturn,
 
@@ -476,6 +487,27 @@ impl Cond {
             _ => return None,
         })
     }
+
+    /// 条件码数值（与 from_bits 互逆）
+    pub fn to_bits(self) -> u8 {
+        match self {
+            Cond::Eq => 0,
+            Cond::Ne => 1,
+            Cond::Cs => 2,
+            Cond::Cc => 3,
+            Cond::Mi => 4,
+            Cond::Pl => 5,
+            Cond::Vs => 6,
+            Cond::Vc => 7,
+            Cond::Hi => 8,
+            Cond::Ls => 9,
+            Cond::Ge => 10,
+            Cond::Lt => 11,
+            Cond::Gt => 12,
+            Cond::Le => 13,
+            Cond::Al => 14,
+        }
+    }
 }
 
 /// 加载/存储偏移
@@ -595,6 +627,10 @@ impl Decoder {
         // BL（11110 S imm10 → 11111 J1 J2 imm11）。BLX 低半字为 11110 开头，未建模 → Unimplemented
         if (top & 0xF800) == 0xF000 && (bits & 0xF800) == 0xF800 {
             return self.decode_bl(bits, pc);
+        }
+        // BLX 32-bit（11110 S imm10 → 1110 1 imm11[10:0]）：低半字 11101 开头
+        if (top & 0xF800) == 0xF000 && (bits & 0xF800) == 0xE800 {
+            return self.decode_blx(bits, pc);
         }
 
         // ---- Phase 3: DSP ----
@@ -1537,11 +1573,12 @@ impl Decoder {
                     rm: Some(rm),
                     imm: None,
                 },
-                // MOV
+                // MOV（高寄存器形式不更新标志）
                 2 => Instruction::Mov {
                     rd,
                     rm,
                     imm: None,
+                    flags: false,
                 },
                 // BX / BLX（bit7=0 → BX，bit7=1 → BLX；Rm = H2:bits[5:3]）
                 _ => {
@@ -1652,19 +1689,25 @@ impl Decoder {
                 regs: (bits & 0xFF) as u16,
                 pc: true,
             },
-            // BKPT（0xBE00）
-            6 => Instruction::Unimplemented {
-                bits: bits as u32,
+            // BKPT #imm8（0xBE00-0xBEFF，imm8 = bits[7:0]）→ 调试事件
+            6 => Instruction::Breakpoint {
+                imm8: (bits & 0xFF) as u8,
             },
-            // 0xBF00-0xBFFF：IT 或提示指令
+            // 0xBF00-0xBFFF：提示指令或 IT 条件块
             7 => {
                 if bits & 0xF == 0 {
                     // 提示指令：NOP/WFI/WFE/SEV/YIELD（无副作用，WFI 建模为 NOP）
                     Instruction::Nop
                 } else {
-                    // IT 条件执行块未建模 → 诚实 Unimplemented
-                    Instruction::Unimplemented {
-                        bits: bits as u32,
+                    // IT：firstcond = bits[7:4]，mask = bits[3:0]
+                    let cond_bits = ((bits >> 4) & 0xF) as u8;
+                    let mask = (bits & 0xF) as u8;
+                    match Cond::from_bits(cond_bits) {
+                        // AL/NV 作为 IT 条件 UNPREDICTABLE；mask 非法（非前导 1 后 0 模式）按 Invalid
+                        Some(cond) if mask != 0 && cond != Cond::Al => {
+                            Instruction::It { cond, mask }
+                        }
+                        _ => Instruction::Invalid { address: pc },
                     }
                 }
             }
@@ -1681,10 +1724,12 @@ impl Decoder {
         let imm = (bits & 0xFF) as u32;
         let op = (bits >> 11) & 0x3;
         match op {
+            // 000: MOVS Rd, #imm8（Thumb-1 立即数传送，更新 N/Z）
             0 => Instruction::Mov {
                 rd,
                 rm: 0,
                 imm: Some(imm),
+                flags: true,
             },
             1 => Instruction::Cmp {
                 rn,
@@ -1776,6 +1821,36 @@ impl Decoder {
         Instruction::BranchLink { target }
     }
 
+    /// 32-bit BLX: 11110 S imm10 → 1110 1 imm11[10:0]
+    ///
+    /// imm22 = S:imm10:imm11（22 位有符号），目标 = Align(PC,4) + 4 + (imm22 << 1)，
+    /// LR = (PC+4)|1。编码位布局经 GNU as 19 个样本实测（含正/负/远偏移）：
+    /// 低半字固定 11101 开头（区别于 BL 的 11111），imm11 = bits[10:0]，
+    /// 无独立 J1/J2 位（A-profile BLX T2 布局；binutils 实测如此）。
+    /// 诚实注：BLX(立即数) 仅 A-profile 有效，ARMv7-M 上该编码空间 UNDEF
+    /// （QEMU translate.c 注释确认），此处建模供完整性/工具链使用；目标 bit0
+    /// 恒清（引擎仅 Thumb 态）。
+    fn decode_blx(&self, bits: u32, pc: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let low = bits as u16;
+        let s = ((top >> 10) & 1) as u32;
+        let imm10 = (top & 0x3FF) as u32;
+        let imm11 = (low & 0x7FF) as u32;
+        // 22 位有符号 → 32 位符号扩展
+        let imm22 = (s << 21) | (imm10 << 11) | imm11;
+        let offset = if imm22 & (1 << 21) != 0 {
+            (imm22 | 0xFFC0_0000) as i32
+        } else {
+            imm22 as i32
+        };
+        // 目标 = Align(PC,4) + 4 + (imm22 << 1)；清 bit0（Thumb 态）
+        let target = (pc & !3)
+            .wrapping_add(4)
+            .wrapping_add((offset.wrapping_shl(1)) as u32)
+            & !1;
+        Instruction::BranchLinkExchangeImm { target }
+    }
+
     /// 32-bit 数据处理（修改立即数）: 11110 i 0 op4 S Rn / 0 imm3 Rd imm8
     ///
     /// op4：0=AND、1=BIC、2=ORR（Rn=1111 → MOV）、3=ORN（Rn=1111 → MVN）、
@@ -1813,6 +1888,7 @@ impl Decoder {
                 rd,
                 rm: 0,
                 imm: Some(imm),
+                flags: false,
             },
             0x2 => Instruction::Orr {
                 rd,
@@ -2470,6 +2546,7 @@ fn decode_high_register_mov() {
             rd: 13,
             rm: 7,
             imm: None,
+            flags: false,
         }
     );
     assert_eq!(
@@ -2478,6 +2555,7 @@ fn decode_high_register_mov() {
             rd: 0,
             rm: 3,
             imm: None,
+            flags: false,
         }
     );
     assert_eq!(
@@ -2486,6 +2564,7 @@ fn decode_high_register_mov() {
             rd: 3,
             rm: 0,
             imm: None,
+            flags: false,
         }
     );
 }
@@ -2629,11 +2708,19 @@ fn decode_hints() {
     let mut d = Decoder::new();
     assert_eq!(d.decode_halfword(0xBF00, 0), Instruction::Nop);
     assert_eq!(d.decode_halfword(0xBF30, 0), Instruction::Nop);
-    // IT 指令（bits[3:0] != 0）诚实 Unimplemented
-    assert!(matches!(
+    // IT 指令（bits[3:0] != 0）→ It 解码：0xBF08 = it eq（cond=0000，mask=1000）
+    assert_eq!(
         d.decode_halfword(0xBF08, 0),
-        Instruction::Unimplemented { .. }
-    ));
+        Instruction::It {
+            cond: Cond::Eq,
+            mask: 0x8,
+        }
+    );
+    // BKPT #imm8（0xBEAB → imm8=0xAB）
+    assert_eq!(
+        d.decode_halfword(0xBEAB, 0),
+        Instruction::Breakpoint { imm8: 0xAB }
+    );
 }
 
 /// 分支符号扩展：0xD1F9 @0x45A → bne.n 0x450（向后）；0xE7FE → b.n 自身
@@ -2702,6 +2789,7 @@ fn decode_data_proc_imm() {
             rd: 2,
             rm: 0,
             imm: Some(115200),
+            flags: false,
         }
     );
     // and.w r3, r3, #1（0xF003 0x0301）
