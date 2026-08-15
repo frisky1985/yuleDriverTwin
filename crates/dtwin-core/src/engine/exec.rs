@@ -544,7 +544,7 @@ impl Executor {
                 for i in 0..8 {
                     if regs & (1 << i) != 0 {
                         let val = cpu.regs[i];
-                        if let Err(f) = memory.write_u32(addr, val) {
+                        if let Err(_f) = memory.write_u32(addr, val) {
                             return ExecOutcome::Fault {
                                 reason: super::FaultReason::MemManage { address: addr },
                             };
@@ -567,7 +567,7 @@ impl Executor {
             Instruction::Pop { regs, pc } => {
                 // POP {reglist} — 出栈并递增 SP；含 pc 时以 Branch 语义设置 PC
                 // （避免引擎 Continue 路径在 PC 上再 +width）
-                let mut sp = cpu.regs[13];
+                let sp = cpu.regs[13];
                 let mut addr = sp;
                 for i in 0..8 {
                     if regs & (1 << i) != 0 {

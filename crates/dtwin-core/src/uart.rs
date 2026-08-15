@@ -259,7 +259,10 @@ mod tests {
 /// LPUART STAT 寄存器位（S32K312.h：LPUART_STAT_TDRE/TC/RDRF/RAF）
 const STAT_TDRE: u32 = 0x0080_0000;
 const STAT_TC: u32 = 0x0100_0000;
+/// RDRF/RAF 当前无 RX 模型，仅测试断言引用（lib 构建未使用，保留语义参考）
+#[allow(dead_code)]
 const STAT_RDRF: u32 = 0x0200_0000;
+#[allow(dead_code)]
 const STAT_RAF: u32 = 0x0400_0000;
 /// LPUART 寄存器偏移（S32K312.h：LPUART_*_OFF）
 const LPUART_GLOBAL_OFF: u32 = 0x08;
@@ -268,6 +271,8 @@ const LPUART_STAT_OFF: u32 = 0x14;
 const LPUART_CTRL_OFF: u32 = 0x18;
 const LPUART_DATA_OFF: u32 = 0x1C;
 /// CTRL 位（S32K312.h：LPUART_CTRL_RE/TE）
+/// RE 仅测试断言引用（lib 构建未使用，保留语义参考）
+#[allow(dead_code)]
 const CTRL_RE: u32 = 0x4;
 const CTRL_TE: u32 = 0x8;
 /// 寄存器窗口（0x000-0x02F）

@@ -185,11 +185,6 @@ impl Memory {
         self.regions.iter().find(|r| r.contains(addr))
     }
 
-    /// 区域存储切片（可变）
-    fn storage_mut(&mut self, region: &MemoryRegion) -> Option<&mut Vec<u8>> {
-        self.storage_mut_by_type(region.region_type)
-    }
-
     /// 按区域类型取可变存储（避免借用冲突：不持有 &MemoryRegion 引用）
     fn storage_mut_by_type(&mut self, region_type: MemoryRegionType) -> Option<&mut Vec<u8>> {
         match region_type {

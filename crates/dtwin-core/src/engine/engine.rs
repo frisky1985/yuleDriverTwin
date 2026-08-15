@@ -54,7 +54,7 @@ impl Engine {
     }
 
     /// 单步执行一条指令（供调试器使用）
-    pub fn step(&mut self, cpu: &mut CpuState, mem: &mut Memory, nvic: &mut Nvic) -> EngineResult {
+    pub fn step(&mut self, cpu: &mut CpuState, mem: &mut Memory, _nvic: &mut Nvic) -> EngineResult {
         // 取指
         let pc = cpu.regs[15];
         let raw = match mem.read_u16(pc) {
