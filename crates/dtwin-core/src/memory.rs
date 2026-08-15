@@ -3,8 +3,10 @@
 //! 采用扁平地址空间 + 区域表模型：
 //! - Flash（只读代码区，支持擦写仿真）
 //! - SRAM（可读可写）
-//! - 外设区（读返回 0，写忽略，可挂回调）
+//! - 外设区（读返回 0，写忽略，可挂总线设备回调，见 `peripheral.rs`/`uart.rs`）
 //! - 越界访问 → BusFault；MPU 违反 → MemManage；非对齐 → UsageFault
+
+use crate::peripheral::BusDevice;
 
 /// Cortex-M 标准内存区域
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +122,8 @@ pub struct Memory {
     /// 总线访问周期统计
     pub read_count: u64,
     pub write_count: u64,
+    /// 外设区挂接的总线设备（读写路由：命中设备 → 设备处理，否则读 0 / 写忽略）
+    pub peripherals: Vec<Box<dyn BusDevice>>,
 }
 
 impl Default for Memory {
@@ -150,6 +154,7 @@ impl Memory {
             flash_erase_required: true,
             read_count: 0,
             write_count: 0,
+            peripherals: Vec::new(),
         }
     }
 
@@ -171,6 +176,7 @@ impl Memory {
             flash_erase_required: true,
             read_count: 0,
             write_count: 0,
+            peripherals: Vec::new(),
         }
     }
 
@@ -268,6 +274,9 @@ impl Memory {
         self.check_access(addr, 1, false)?;
         self.check_watchpoint(addr, 1, false);
         self.read_count += 1;
+        if let Some(v) = self.peripheral_read(addr, 1) {
+            return Ok(v as u8);
+        }
         let region = self.region_at(addr).unwrap();
         match self.storage(region) {
             Some(s) => Ok(s[Self::offset_in(region, addr)]),
@@ -280,6 +289,9 @@ impl Memory {
         self.check_access(addr, 2, false)?;
         self.check_watchpoint(addr, 2, false);
         self.read_count += 1;
+        if let Some(v) = self.peripheral_read(addr, 2) {
+            return Ok(v as u16);
+        }
         let region = self.region_at(addr).unwrap();
         let off = Self::offset_in(region, addr);
         match self.storage(region) {
@@ -293,6 +305,9 @@ impl Memory {
         self.check_access(addr, 4, false)?;
         self.check_watchpoint(addr, 4, false);
         self.read_count += 1;
+        if let Some(v) = self.peripheral_read(addr, 4) {
+            return Ok(v);
+        }
         let region = self.region_at(addr).unwrap();
         let off = Self::offset_in(region, addr);
         match self.storage(region) {
@@ -306,6 +321,9 @@ impl Memory {
         self.check_access(addr, 1, true)?;
         self.check_watchpoint(addr, 1, true);
         self.write_count += 1;
+        if self.peripheral_write(addr, 1, val as u32) {
+            return Ok(());
+        }
         let region_type = self.region_at(addr).map(|r| r.region_type).unwrap_or(MemoryRegionType::System);
         let off = self.region_at(addr).map(|r| Self::offset_in(r, addr)).unwrap_or(0);
         match self.storage_mut_by_type(region_type) {
@@ -322,6 +340,9 @@ impl Memory {
         self.check_access(addr, 2, true)?;
         self.check_watchpoint(addr, 2, true);
         self.write_count += 1;
+        if self.peripheral_write(addr, 2, val as u32) {
+            return Ok(());
+        }
         let region_type = self.region_at(addr).map(|r| r.region_type).unwrap_or(MemoryRegionType::System);
         let off = self.region_at(addr).map(|r| Self::offset_in(r, addr)).unwrap_or(0);
         let bytes = val.to_le_bytes();
@@ -341,6 +362,9 @@ impl Memory {
         self.check_access(addr, 4, true)?;
         self.check_watchpoint(addr, 4, true);
         self.write_count += 1;
+        if self.peripheral_write(addr, 4, val) {
+            return Ok(());
+        }
         let region_type = self.region_at(addr).map(|r| r.region_type).unwrap_or(MemoryRegionType::System);
         let off = self.region_at(addr).map(|r| Self::offset_in(r, addr)).unwrap_or(0);
         let bytes = val.to_le_bytes();
@@ -435,6 +459,55 @@ impl Memory {
         self.watchpoint_hit = None;
         self.mpu_regions.clear();
         self.mpu_enabled = false;
+    }
+
+    // ==================== 外设总线设备挂接 ====================
+
+    /// 挂接一个总线设备（如 UART）到外设区；地址窗口命中后读写由设备处理
+    pub fn attach_peripheral(&mut self, dev: impl BusDevice + 'static) {
+        self.peripherals.push(Box::new(dev));
+    }
+
+    /// 外设区读：命中已挂接设备则返回 `Some(value)`（值已按 width 屏蔽），否则 `None`
+    fn peripheral_read(&mut self, addr: u32, width: u32) -> Option<u32> {
+        let is_periph = matches!(
+            self.region_at(addr).map(|r| r.region_type),
+            Some(MemoryRegionType::Peripheral)
+        );
+        if !is_periph {
+            return None;
+        }
+        let dev = self.peripherals.iter_mut().find(|d| {
+            addr >= d.base_address() && addr < d.base_address().wrapping_add(d.window_size())
+        })?;
+        Some(dev.read(addr, width))
+    }
+
+    /// 外设区写：命中设备则写入并返回 `true`，否则 `false`（调用方回落写忽略）
+    fn peripheral_write(&mut self, addr: u32, width: u32, val: u32) -> bool {
+        let is_periph = matches!(
+            self.region_at(addr).map(|r| r.region_type),
+            Some(MemoryRegionType::Peripheral)
+        );
+        if !is_periph {
+            return false;
+        }
+        if let Some(dev) = self.peripherals.iter_mut().find(|d| {
+            addr >= d.base_address() && addr < d.base_address().wrapping_add(d.window_size())
+        }) {
+            dev.write(addr, width, val);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 按名称获取已挂接外设的类型擦除引用（供外部 downcast 到具体模型）
+    pub fn peripheral_mut_by_name(&mut self, name: &str) -> Option<&mut dyn std::any::Any> {
+        self.peripherals
+            .iter_mut()
+            .find(|d| d.name() == name)
+            .map(|d| d.as_any_mut())
     }
 }
 
@@ -556,6 +629,38 @@ mod tests {
         let mut m = Memory::m4f_default();
         assert_eq!(m.read_u32(0x4002_1000).unwrap(), 0);
         m.write_u32(0x4002_1000, 0x1234).unwrap(); // 写忽略
+        assert_eq!(m.read_u32(0x4002_1000).unwrap(), 0);
+    }
+
+    #[test]
+    fn peripheral_routes_to_attached_uart() {
+        use crate::uart::CmsdkUart;
+        let mut m = Memory::m4f_default();
+        m.attach_peripheral(CmsdkUart::new(0x4000_4000));
+
+        // uart_init 序列 + 输出一个字符
+        m.write_u32(0x4000_4008, 0).unwrap();
+        m.write_u32(0x4000_4010, 115200).unwrap();
+        m.write_u32(0x4000_4008, 0x3).unwrap();
+        m.write_u32(0x4000_4000, b'A' as u32).unwrap();
+
+        // 窗口内读回（路由到设备）
+        assert_eq!(m.read_u32(0x4000_4008).unwrap(), 0x3);
+        assert_eq!(m.read_u32(0x4000_4010).unwrap(), 115200);
+        assert_eq!(m.read_u32(0x4000_4004).unwrap(), 0); // STATE
+
+        // 捕获输出可经 downcast 查询
+        let uart = m
+            .peripheral_mut_by_name("CMSDK-APB-UART")
+            .unwrap()
+            .downcast_mut::<CmsdkUart>()
+            .unwrap();
+        assert_eq!(uart.output(), b"A");
+        assert_eq!(uart.tx_count(), 1);
+
+        // 窗口外外设区仍为默认读 0 / 写忽略
+        assert_eq!(m.read_u32(0x4002_1000).unwrap(), 0);
+        m.write_u32(0x4002_1000, 0x1234).unwrap();
         assert_eq!(m.read_u32(0x4002_1000).unwrap(), 0);
     }
 }

@@ -8,6 +8,8 @@ pub mod engine;
 pub mod exec;
 pub mod fpu;
 
+pub use engine::{Engine, EngineResult, EngineStats};
+
 #[cfg(test)]
 mod test_util;
 
