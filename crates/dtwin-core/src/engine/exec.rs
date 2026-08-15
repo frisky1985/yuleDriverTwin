@@ -760,6 +760,32 @@ impl Executor {
                     },
                 }
             }
+            Instruction::LdrD { rt, rt2, rn, imm } => {
+                // LDRD Rt, Rt2, [Rn, #imm]：加载 64 位（小端，低字到 Rt）
+                let addr = cpu.regs[*rn as usize].wrapping_add(*imm);
+                match (memory.read_u32(addr), memory.read_u32(addr + 4)) {
+                    (Ok(lo), Ok(hi)) => {
+                        cpu.regs[*rt as usize] = lo;
+                        cpu.regs[*rt2 as usize] = hi;
+                        ExecOutcome::Continue
+                    }
+                    _ => ExecOutcome::Fault {
+                        reason: super::FaultReason::BusFault { address: addr },
+                    },
+                }
+            }
+            Instruction::StrD { rt, rt2, rn, imm } => {
+                let addr = cpu.regs[*rn as usize].wrapping_add(*imm);
+                match (
+                    memory.write_u32(addr, cpu.regs[*rt as usize]),
+                    memory.write_u32(addr + 4, cpu.regs[*rt2 as usize]),
+                ) {
+                    (Ok(()), Ok(())) => ExecOutcome::Continue,
+                    _ => ExecOutcome::Fault {
+                        reason: super::FaultReason::BusFault { address: addr },
+                    },
+                }
+            }
             Instruction::MsrMrs { rt, reg, read } => {
                 if *read {
                     // MRS：特殊寄存器 → 核心寄存器
@@ -2214,6 +2240,104 @@ mod tests {
             ExecOutcome::Continue
         );
         assert_eq!(cpu.msp, 0x2000_0FFC, "PUSH 后 SP 同步到 msp");
+    }
+
+    /// A8：32-bit LDR/STR 家族 golden（编码经 arm-none-eabi-as 实测）
+    #[test]
+    fn golden_32bit_ldr_str_family() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        let mut dec = Decoder::new();
+        cpu.regs[1] = 0x2000_0000;
+        // LDR.W r0, [r1, #4]（0xF8D1 0004）
+        mem.write_u32(0x2000_0004, 0x1122_3344).unwrap();
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF8D1_0004, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[0], 0x1122_3344);
+        // STR.W r0, [r1, #8]（0xF8C1 0008）
+        cpu.regs[0] = 0xAABB_CCDD;
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF8C1_0008, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u32(0x2000_0008).unwrap(), 0xAABB_CCDD);
+        // LDRH.W r0, [r1, #2]（0xF8B1 0002）
+        mem.write_u16(0x2000_0002, 0xABCD).unwrap();
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF8B1_0002, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[0], 0xABCD);
+        // STRH.W r0, [r1, #6]（0xF8A1 0006）
+        cpu.regs[0] = 0x1234;
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF8A1_0006, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u16(0x2000_0006).unwrap(), 0x1234);
+        // LDRB.W r0, [r1, #1]（0xF891 0001）
+        mem.write_u8(0x2000_0001, 0x7F).unwrap();
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF891_0001, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[0], 0x7F);
+        // STRB.W r0, [r1, #3]（0xF881 0003）
+        cpu.regs[0] = 0x9A;
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF881_0003, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u8(0x2000_0003).unwrap(), 0x9A);
+        // LDRSH.W r0, [r1, #4]（0xF9B1 0004）——0xFFFF → 符号扩展 -1
+        mem.write_u16(0x2000_0004, 0xFFFF).unwrap();
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF9B1_0004, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[0], 0xFFFF_FFFF);
+        // LDRSB.W r0, [r1, #5]（0xF991 0005）——0xFF → 符号扩展 -1
+        mem.write_u8(0x2000_0005, 0xFF).unwrap();
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF991_0005, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[0], 0xFFFF_FFFF);
+        // LDR.W r0, [r1, r2]（0xF851 0002，寄存器偏移）
+        cpu.regs[2] = 0x10;
+        mem.write_u32(0x2000_0010, 0xCAFE_BABE).unwrap();
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF851_0002, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[0], 0xCAFE_BABE);
+        // STR.W r0, [r1, r2]（0xF841 0002）
+        cpu.regs[0] = 0xDEAD_BEEF;
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xF841_0002, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u32(0x2000_0010).unwrap(), 0xDEAD_BEEF);
+        // LDRD r0, r1, [r2, #8]（0xE9D2 0102）
+        cpu.regs[2] = 0x2000_0000;
+        mem.write_u32(0x2000_0008, 0x1111_1111).unwrap();
+        mem.write_u32(0x2000_000C, 0x2222_2222).unwrap();
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xE9D2_0102, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[0], 0x1111_1111);
+        assert_eq!(cpu.regs[1], 0x2222_2222);
+        // STRD r0, r1, [r2, #8]（0xE9C2 0102）
+        cpu.regs[0] = 0xAAAA_AAAA;
+        cpu.regs[1] = 0xBBBB_BBBB;
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &dec.decode_word(0xE9C2_0102, 0)),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u32(0x2000_0008).unwrap(), 0xAAAA_AAAA);
+        assert_eq!(mem.read_u32(0x2000_000C).unwrap(), 0xBBBB_BBBB);
     }
 
     // ============ P1-补：16-bit LDR/STR golden（编码经 arm-none-eabi-as 实测） ============

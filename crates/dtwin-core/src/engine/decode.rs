@@ -182,6 +182,10 @@ pub enum Instruction {
     },
     /// 加载 PC 相对
     LdrLiteral { rt: u8, imm: u32 },
+    /// 双字加载: LDRD Rt, Rt2, [Rn, #imm8×4]
+    LdrD { rt: u8, rt2: u8, rn: u8, imm: u32 },
+    /// 双字存储: STRD Rt, Rt2, [Rn, #imm8×4]
+    StrD { rt: u8, rt2: u8, rn: u8, imm: u32 },
     /// 特殊寄存器访问: MRS/MSR
     MsrMrs {
         /// 核心寄存器（MRS 的 Rd / MSR 的 Rn）
@@ -707,6 +711,21 @@ impl Decoder {
             return self.decode_pkh(bits);
         }
 
+        // ---- 32-bit LDR/STR 家族（A8：真实固件刚需）----
+        // 编码（arm-none-eabi-as 实测）：
+        //   LDR.W/STR.W imm12: 0xF8D0/0xF8C0 + Rn；LDRH/STRH: 0xF8B0/0xF8A0；
+        //   LDRB/STRB: 0xF890/0xF880；LDRSH/LDRSB: 0xF9B0/0xF990；
+        //   LDR/STR reg 偏移: 0xF850/0xF840；LDR literal: 0xF8DF；LDRD/STRD: 0xE9D0/0xE9C0
+        if (top & 0xF800) == 0xF800 {
+            if let Some(instr) = self.try_decode_ldr_str_32(bits) {
+                return instr;
+            }
+        }
+        // LDRD/STRD（0xE9D0/0xE9C0）
+        if (top & 0xFFF0) == 0xE9D0 || (top & 0xFFF0) == 0xE9C0 {
+            return self.decode_ldrd_strd(bits);
+        }
+
         // ---- 32-bit 数据处理（修改立即数）: 11110 i 0 op4 S Rn / 0 imm3 Rd imm8 ----
         if (top & 0xFA00) == 0xF000 && (bits & 0x8000) == 0 {
             return self.decode_data_proc_imm(bits);
@@ -744,6 +763,117 @@ impl Decoder {
         }
 
         Instruction::Unimplemented { bits }
+    }
+
+    /// 32-bit LDR/STR 家族解码（A8）
+    /// 编码（arm-none-eabi-as 实测）：
+    ///   LDR.W imm12: 0xF8D0+rn | rt imm12；STR.W: 0xF8C0+rn
+    ///   LDRH.W: 0xF8B0+rn；STRH.W: 0xF8A0+rn；LDRB.W: 0xF890+rn；STRB.W: 0xF880+rn
+    ///   LDRSH.W: 0xF9B0+rn；LDRSB.W: 0xF990+rn（符号扩展）
+    ///   LDR/STR reg 偏移: 0xF850/0xF840+rn | rt imm2 rm
+    ///   LDR literal: 0xF8DF（Rn=1111）| rt imm12
+    fn try_decode_ldr_str_32(&self, bits: u32) -> Option<Instruction> {
+        let top = (bits >> 16) as u16;
+        let rt = ((bits >> 12) & 0xF) as u8;
+        let rn = (top & 0xF) as u8;
+        let imm12 = bits & 0xFFF;
+        // 寄存器偏移形式：top & 0x0FF0 == 0x0850(LDR)/0x0840(STR)
+        // （imm12 形式为 0x08D0/0x08C0/0x08B0/0x08A0/0x0890/0x0880/0x09B0/0x0990，勿误判）
+        let is_reg_offset = (top & 0x0FF0) == 0x0850 || (top & 0x0FF0) == 0x0840;
+        if is_reg_offset {
+            let rm = (bits & 0xF) as u8;
+            let is_load = (top & 0x0010) != 0;
+            let offset = LoadStoreOffset::Register(rm);
+            return Some(if is_load {
+                Instruction::Ldr {
+                    rt,
+                    rn,
+                    offset,
+                    width: AccessWidth::Word,
+                }
+            } else {
+                Instruction::Str {
+                    rt,
+                    rn,
+                    offset,
+                    width: AccessWidth::Word,
+                }
+            });
+        }
+        match top & 0xFFF0 {
+            // LDR.W (imm12)；Rn=1111 → LDR literal
+            0xF8D0 if rn == 0xF => Some(Instruction::LdrLiteral { rt, imm: imm12 }),
+            0xF8D0 => Some(Instruction::Ldr {
+                rt,
+                rn,
+                offset: LoadStoreOffset::Immediate(imm12),
+                width: AccessWidth::Word,
+            }),
+            // STR.W
+            0xF8C0 => Some(Instruction::Str {
+                rt,
+                rn,
+                offset: LoadStoreOffset::Immediate(imm12),
+                width: AccessWidth::Word,
+            }),
+            // LDRH.W
+            0xF8B0 => Some(Instruction::Ldr {
+                rt,
+                rn,
+                offset: LoadStoreOffset::Immediate(imm12),
+                width: AccessWidth::HalfWord,
+            }),
+            // STRH.W
+            0xF8A0 => Some(Instruction::Str {
+                rt,
+                rn,
+                offset: LoadStoreOffset::Immediate(imm12),
+                width: AccessWidth::HalfWord,
+            }),
+            // LDRB.W
+            0xF890 => Some(Instruction::Ldr {
+                rt,
+                rn,
+                offset: LoadStoreOffset::Immediate(imm12),
+                width: AccessWidth::Byte,
+            }),
+            // STRB.W
+            0xF880 => Some(Instruction::Str {
+                rt,
+                rn,
+                offset: LoadStoreOffset::Immediate(imm12),
+                width: AccessWidth::Byte,
+            }),
+            // LDRSH.W（符号扩展半字）
+            0xF9B0 => Some(Instruction::LdrSignExtend {
+                rt,
+                rn,
+                offset: LoadStoreOffset::Immediate(imm12),
+                width: AccessWidth::HalfWord,
+            }),
+            // LDRSB.W（符号扩展字节）
+            0xF990 => Some(Instruction::LdrSignExtend {
+                rt,
+                rn,
+                offset: LoadStoreOffset::Immediate(imm12),
+                width: AccessWidth::Byte,
+            }),
+            _ => None,
+        }
+    }
+
+    /// LDRD/STRD 双字（0xE9D0/0xE9C0 + rn | rt rt2 imm8×4）
+    fn decode_ldrd_strd(&self, bits: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let rn = (top & 0xF) as u8;
+        let rt = ((bits >> 12) & 0xF) as u8;
+        let rt2 = ((bits >> 8) & 0xF) as u8;
+        let imm = ((bits & 0xFF) as u32) * 4;
+        if (top & 0xFFF0) == 0xE9D0 {
+            Instruction::LdrD { rt, rt2, rn, imm }
+        } else {
+            Instruction::StrD { rt, rt2, rn, imm }
+        }
     }
 
     /// 解码 MRS（0xF3EF，低半字 10R0 Rd 0000 0000 SYSm）
