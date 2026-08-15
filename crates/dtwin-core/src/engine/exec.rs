@@ -4,10 +4,11 @@
 //! Phase 1: 核心整数指令（数据传送/算术逻辑/移位/分支/压栈）
 
 use super::decode::{
-    AccessWidth, Cond, DspShiftKind, Instruction, LoadStoreOffset, QAddKind, ShiftAmount, ShiftKind,
+    AccessWidth, Cond, DspShiftKind, FpArithOp, FpCvtOp, FpUnaryOp, Instruction, LoadStoreOffset,
+    QAddKind, ShiftAmount, ShiftKind,
 };
-use super::dsp;
-use crate::memory::Memory;
+use super::{dsp, fpu};
+use crate::memory::{Memory, MemoryFault};
 use crate::CpuState;
 
 /// 执行结果
@@ -641,6 +642,365 @@ impl Executor {
                 ExecOutcome::Continue
             }
 
+            // ================= Phase 4: FPU =================
+            Instruction::FpVmovReg { sd, sm, double } => {
+                let fpu = &mut cpu.fpu;
+                if *double {
+                    let v = fpu.read_d(*sm as usize);
+                    fpu.write_d(*sd as usize, v);
+                } else {
+                    let v = fpu.read_s(*sm as usize);
+                    fpu.write_s(*sd as usize, v);
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::FpVmovCore { rt, sn, to_core } => {
+                if *to_core {
+                    cpu.regs[*rt as usize] = cpu.fpu.read_s(*sn as usize);
+                } else {
+                    cpu.fpu.write_s(*sn as usize, cpu.regs[*rt as usize]);
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::FpVmovCoreD {
+                rt,
+                rt2,
+                dn,
+                to_core,
+            } => {
+                if *to_core {
+                    let v = cpu.fpu.read_d(*dn as usize);
+                    cpu.regs[*rt as usize] = v as u32;
+                    cpu.regs[*rt2 as usize] = (v >> 32) as u32;
+                } else {
+                    let v =
+                        (cpu.regs[*rt as usize] as u64) | ((cpu.regs[*rt2 as usize] as u64) << 32);
+                    cpu.fpu.write_d(*dn as usize, v);
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::FpVmovImm { sd, imm, double } => {
+                if *double {
+                    cpu.fpu.write_d(*sd as usize, *imm);
+                } else {
+                    cpu.fpu.write_s(*sd as usize, *imm as u32);
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::FpArith3 {
+                op,
+                vd,
+                vn,
+                vm,
+                double,
+            } => {
+                let fpu = &mut cpu.fpu;
+                if *double {
+                    let a = fpu.read_d(*vn as usize);
+                    let b = fpu.read_d(*vm as usize);
+                    let c = fpu.read_d(*vd as usize);
+                    let (res, flags) = match op {
+                        FpArithOp::Vadd => fpu::f64_add(fpu, a, b),
+                        FpArithOp::Vsub => fpu::f64_sub(fpu, a, b),
+                        FpArithOp::Vmul => fpu::f64_mul(fpu, a, b),
+                        FpArithOp::Vnmul => {
+                            let (r, f) = fpu::f64_mul(fpu, a, b);
+                            (r ^ (1 << 63), f)
+                        }
+                        FpArithOp::Vdiv => fpu::f64_div(fpu, a, b),
+                        FpArithOp::Vmla => fpu::f64_mul_add(fpu, a, b, c, false, false),
+                        FpArithOp::Vmls => fpu::f64_mul_add(fpu, a, b, c, true, false),
+                        FpArithOp::Vnmls => fpu::f64_mul_add(fpu, a, b, c, true, true),
+                        FpArithOp::Vnmla => fpu::f64_mul_add(fpu, a, b, c, false, true),
+                    };
+                    self.apply_fpu_flags(fpu, &flags);
+                    fpu.write_d(*vd as usize, res);
+                } else {
+                    let a = fpu.read_s(*vn as usize);
+                    let b = fpu.read_s(*vm as usize);
+                    let c = fpu.read_s(*vd as usize);
+                    let (res, flags) = match op {
+                        FpArithOp::Vadd => fpu::f32_add(fpu, a, b),
+                        FpArithOp::Vsub => fpu::f32_sub(fpu, a, b),
+                        FpArithOp::Vmul => fpu::f32_mul(fpu, a, b),
+                        FpArithOp::Vnmul => {
+                            let (r, f) = fpu::f32_mul(fpu, a, b);
+                            (r ^ (1 << 31), f)
+                        }
+                        FpArithOp::Vdiv => fpu::f32_div(fpu, a, b),
+                        FpArithOp::Vmla => fpu::f32_mul_add(fpu, a, b, c, false, false),
+                        FpArithOp::Vmls => fpu::f32_mul_add(fpu, a, b, c, true, false),
+                        FpArithOp::Vnmls => fpu::f32_mul_add(fpu, a, b, c, true, true),
+                        FpArithOp::Vnmla => fpu::f32_mul_add(fpu, a, b, c, false, true),
+                    };
+                    self.apply_fpu_flags(fpu, &flags);
+                    fpu.write_s(*vd as usize, res);
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::FpUnary { op, vd, vm, double } => {
+                let fpu = &mut cpu.fpu;
+                if *double {
+                    let v = fpu.read_d(*vm as usize);
+                    match op {
+                        FpUnaryOp::Vabs => fpu.write_d(*vd as usize, v & !(1 << 63)),
+                        FpUnaryOp::Vneg => fpu.write_d(*vd as usize, v ^ (1 << 63)),
+                        FpUnaryOp::Vsqrt => {
+                            let f = f64::from_bits(v);
+                            if f.is_nan() {
+                                // NaN 传播（安静化），无异常
+                                fpu.write_d(*vd as usize, v | 0x0008_0000_0000_0000);
+                            } else if f < 0.0 {
+                                // 负数开方 → 默认 NaN + IOC
+                                self.apply_fpu_flags(
+                                    fpu,
+                                    &fpu::FpOpFlags {
+                                        ioc: true,
+                                        ..Default::default()
+                                    },
+                                );
+                                fpu.write_d(*vd as usize, fpu::DEFAULT_NAN_F64);
+                            } else {
+                                let r = f.sqrt();
+                                let mut flags = fpu::FpOpFlags::default();
+                                if fpu::is_denormal_f64(r.to_bits()) {
+                                    flags.ufc = true;
+                                    flags.ixc = true;
+                                }
+                                self.apply_fpu_flags(fpu, &flags);
+                                fpu.write_d(*vd as usize, r.to_bits());
+                            }
+                        }
+                    }
+                } else {
+                    let v = fpu.read_s(*vm as usize);
+                    match op {
+                        FpUnaryOp::Vabs => fpu.write_s(*vd as usize, v & !(1 << 31)),
+                        FpUnaryOp::Vneg => fpu.write_s(*vd as usize, v ^ (1 << 31)),
+                        FpUnaryOp::Vsqrt => {
+                            let f = f32::from_bits(v);
+                            if f.is_nan() {
+                                fpu.write_s(*vd as usize, fpu::quiet_nan(v));
+                            } else if f < 0.0 {
+                                self.apply_fpu_flags(
+                                    fpu,
+                                    &fpu::FpOpFlags {
+                                        ioc: true,
+                                        ..Default::default()
+                                    },
+                                );
+                                fpu.write_s(*vd as usize, fpu::DEFAULT_NAN_F32);
+                            } else {
+                                let r = f.sqrt();
+                                let mut flags = fpu::FpOpFlags::default();
+                                if fpu::is_denormal_f32(r.to_bits()) {
+                                    flags.ufc = true;
+                                    flags.ixc = true;
+                                }
+                                self.apply_fpu_flags(fpu, &flags);
+                                fpu.write_s(*vd as usize, r.to_bits());
+                            }
+                        }
+                    }
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::FpCmp {
+                vd,
+                vm,
+                double,
+                e,
+                zero,
+            } => {
+                let fpu = &mut cpu.fpu;
+                if *double {
+                    let a = fpu.read_d(*vd as usize);
+                    let b = if *zero { 0 } else { fpu.read_d(*vm as usize) };
+                    let (n, z, c, v, ioc) = self.fpu_compare_f64(a, b, *e);
+                    fpu.set_nzcv(n, z, c, v);
+                    if ioc {
+                        self.apply_fpu_flags(
+                            fpu,
+                            &fpu::FpOpFlags {
+                                ioc: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                } else {
+                    let a = fpu.read_s(*vd as usize);
+                    let b = if *zero { 0 } else { fpu.read_s(*vm as usize) };
+                    let (n, z, c, v, ioc) = self.fpu_compare_f32(a, b, *e);
+                    fpu.set_nzcv(n, z, c, v);
+                    if ioc {
+                        self.apply_fpu_flags(
+                            fpu,
+                            &fpu::FpOpFlags {
+                                ioc: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::FpCvt { op, vd, vm } => {
+                let fpu = &mut cpu.fpu;
+                match op {
+                    FpCvtOp::S32ToF32 => {
+                        let x = fpu.read_s(*vm as usize) as i32 as i64;
+                        let r = fpu::cvt_int_to_f32(fpu, x);
+                        fpu.write_s(*vd as usize, r.to_bits());
+                    }
+                    FpCvtOp::U32ToF32 => {
+                        let x = fpu.read_s(*vm as usize) as i64;
+                        let r = fpu::cvt_int_to_f32(fpu, x);
+                        fpu.write_s(*vd as usize, r.to_bits());
+                    }
+                    FpCvtOp::F32ToS32 => {
+                        let (r, flags) =
+                            fpu::cvt_f32_to_int(fpu, fpu.read_s(*vm as usize), true, false);
+                        self.apply_fpu_flags(fpu, &flags);
+                        fpu.write_s(*vd as usize, r);
+                    }
+                    FpCvtOp::F32ToU32 => {
+                        let (r, flags) =
+                            fpu::cvt_f32_to_int(fpu, fpu.read_s(*vm as usize), false, false);
+                        self.apply_fpu_flags(fpu, &flags);
+                        fpu.write_s(*vd as usize, r);
+                    }
+                    FpCvtOp::F32ToS32R => {
+                        let (r, flags) =
+                            fpu::cvt_f32_to_int(fpu, fpu.read_s(*vm as usize), true, true);
+                        self.apply_fpu_flags(fpu, &flags);
+                        fpu.write_s(*vd as usize, r);
+                    }
+                    FpCvtOp::F32ToU32R => {
+                        let (r, flags) =
+                            fpu::cvt_f32_to_int(fpu, fpu.read_s(*vm as usize), false, true);
+                        self.apply_fpu_flags(fpu, &flags);
+                        fpu.write_s(*vd as usize, r);
+                    }
+                    FpCvtOp::F32ToF64 => {
+                        // VCVT.F32.F64 Sd, Dm：源 Dm（f64），目标 Sd（f32）
+                        let v = fpu.read_d(*vm as usize);
+                        let (r, flags) = fpu::cvt_f64_to_f32(fpu, v);
+                        self.apply_fpu_flags(fpu, &flags);
+                        fpu.write_s(*vd as usize, r);
+                    }
+                    FpCvtOp::F64ToF32 => {
+                        // VCVT.F64.F32 Dd, Sm：源 Sm（f32），目标 Dd（f64，精确）
+                        let v = fpu.read_s(*vm as usize);
+                        let r = (f32::from_bits(v) as f64).to_bits();
+                        fpu.write_d(*vd as usize, r);
+                    }
+                    FpCvtOp::S32ToF64 => {
+                        let x = fpu.read_s(*vm as usize) as i32 as i64;
+                        let r = fpu::cvt_int_to_f64(x);
+                        fpu.write_d(*vd as usize, r.to_bits());
+                    }
+                    FpCvtOp::U32ToF64 => {
+                        let x = fpu.read_s(*vm as usize) as i64;
+                        let r = fpu::cvt_int_to_f64(x);
+                        fpu.write_d(*vd as usize, r.to_bits());
+                    }
+                    FpCvtOp::F64ToS32 => {
+                        let (r, flags) =
+                            fpu::cvt_f64_to_int(fpu, fpu.read_d(*vm as usize), true, false);
+                        self.apply_fpu_flags(fpu, &flags);
+                        fpu.write_s(*vd as usize, r);
+                    }
+                    FpCvtOp::F64ToU32 => {
+                        let (r, flags) =
+                            fpu::cvt_f64_to_int(fpu, fpu.read_d(*vm as usize), false, false);
+                        self.apply_fpu_flags(fpu, &flags);
+                        fpu.write_s(*vd as usize, r);
+                    }
+                    FpCvtOp::F64ToS32R => {
+                        let (r, flags) =
+                            fpu::cvt_f64_to_int(fpu, fpu.read_d(*vm as usize), true, true);
+                        self.apply_fpu_flags(fpu, &flags);
+                        fpu.write_s(*vd as usize, r);
+                    }
+                    FpCvtOp::F64ToU32R => {
+                        let (r, flags) =
+                            fpu::cvt_f64_to_int(fpu, fpu.read_d(*vm as usize), false, true);
+                        self.apply_fpu_flags(fpu, &flags);
+                        fpu.write_s(*vd as usize, r);
+                    }
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::FpLoadStore {
+                rt,
+                rn,
+                offset,
+                load,
+                double,
+            } => {
+                let base = cpu.regs[*rn as usize];
+                let addr = base.wrapping_add(*offset);
+                let fpu = &mut cpu.fpu;
+                // 对齐：单精度 4 字节，双精度 8 字节
+                let align = if *double { 7 } else { 3 };
+                if addr & align != 0 {
+                    return ExecOutcome::Fault {
+                        reason: super::FaultReason::UnalignedAccess { address: addr },
+                    };
+                }
+                if *double {
+                    if *load {
+                        let lo = match memory.read_u32(addr) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return ExecOutcome::Fault {
+                                    reason: self.map_mem_fault(e),
+                                }
+                            }
+                        };
+                        let hi = match memory.read_u32(addr + 4) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return ExecOutcome::Fault {
+                                    reason: self.map_mem_fault(e),
+                                }
+                            }
+                        };
+                        fpu.write_d(*rt as usize, (lo as u64) | ((hi as u64) << 32));
+                    } else {
+                        let v = fpu.read_d(*rt as usize);
+                        if let Err(e) = memory.write_u32(addr, v as u32) {
+                            return ExecOutcome::Fault {
+                                reason: self.map_mem_fault(e),
+                            };
+                        }
+                        if let Err(e) = memory.write_u32(addr + 4, (v >> 32) as u32) {
+                            return ExecOutcome::Fault {
+                                reason: self.map_mem_fault(e),
+                            };
+                        }
+                    }
+                } else if *load {
+                    match memory.read_u32(addr) {
+                        Ok(v) => fpu.write_s(*rt as usize, v),
+                        Err(e) => {
+                            return ExecOutcome::Fault {
+                                reason: self.map_mem_fault(e),
+                            }
+                        }
+                    }
+                } else {
+                    match memory.write_u32(addr, fpu.read_s(*rt as usize)) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            return ExecOutcome::Fault {
+                                reason: self.map_mem_fault(e),
+                            }
+                        }
+                    }
+                }
+                ExecOutcome::Continue
+            }
             Instruction::Unimplemented { .. } => ExecOutcome::Fault {
                 reason: super::FaultReason::UnimplementedInstr,
             },
@@ -653,6 +1013,61 @@ impl Executor {
     /// 置位 DSP Q 标志（APSR bit27，粘性）
     fn set_q(&self, cpu: &mut CpuState) {
         cpu.xpsr |= 1 << 27;
+    }
+
+    /// 汇总 FPU 累积异常标志到 FPSCR
+    fn apply_fpu_flags(&self, fpu: &mut super::fpu::FpuRegisters, flags: &super::fpu::FpOpFlags) {
+        fpu.set_cumulative(
+            flags.ioc, flags.dzc, flags.ofc, flags.ufc, flags.ixc, flags.idc,
+        );
+        if flags.qc {
+            fpu.set_qc();
+        }
+    }
+
+    /// f32 比较（VCMP/VCMPE）：返回 (N, Z, C, V, IOC)
+    fn fpu_compare_f32(&self, a: u32, b: u32, e: bool) -> (bool, bool, bool, bool, bool) {
+        let (af, bf) = (f32::from_bits(a), f32::from_bits(b));
+        if af.is_nan() || bf.is_nan() {
+            // 无序：C=1, V=1；VCMPE 或信号 NaN → IOC
+            let snan = fpu::is_signaling_nan_f32(a) || fpu::is_signaling_nan_f32(b);
+            return (false, false, true, true, e || snan);
+        }
+        if af == bf {
+            (false, true, true, false, false)
+        } else if af < bf {
+            (true, false, false, false, false)
+        } else {
+            (false, false, true, false, false)
+        }
+    }
+
+    /// f64 比较
+    fn fpu_compare_f64(&self, a: u64, b: u64, e: bool) -> (bool, bool, bool, bool, bool) {
+        let (af, bf) = (f64::from_bits(a), f64::from_bits(b));
+        if af.is_nan() || bf.is_nan() {
+            let snan = fpu::is_signaling_nan_f64(a) || fpu::is_signaling_nan_f64(b);
+            return (false, false, true, true, e || snan);
+        }
+        if af == bf {
+            (false, true, true, false, false)
+        } else if af < bf {
+            (true, false, false, false, false)
+        } else {
+            (false, false, true, false, false)
+        }
+    }
+
+    /// 内存故障 → 引擎故障
+    fn map_mem_fault(&self, f: MemoryFault) -> super::FaultReason {
+        match f {
+            MemoryFault::UnalignedAccess { address } => {
+                super::FaultReason::UnalignedAccess { address }
+            }
+            MemoryFault::MemManage { address } => super::FaultReason::MemManage { address },
+            MemoryFault::BusFault { address } => super::FaultReason::BusFault { address },
+            MemoryFault::ReadOnlyWrite { address } => super::FaultReason::MemManage { address },
+        }
     }
 
     /// 移位计算

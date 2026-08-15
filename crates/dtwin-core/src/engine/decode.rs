@@ -186,6 +186,57 @@ pub enum Instruction {
         shift_imm: u8,
     },
 
+    // ================= Phase 4: FPU (VFPv4-SP + F64 骨架) =================
+    /// VMOV Sd, Sm / Dd, Dm（寄存器间传送）
+    FpVmovReg { sd: u8, sm: u8, double: bool },
+    /// VMOV Sn, Rt / Rt, Sn（核心寄存器与单精度互传）
+    FpVmovCore { rt: u8, sn: u8, to_core: bool },
+    /// VMOV Dd, Rt, Rt2 / Rt, Rt2, Dd（双精度与两个核心寄存器）
+    FpVmovCoreD {
+        rt: u8,
+        rt2: u8,
+        dn: u8,
+        to_core: bool,
+    },
+    /// VMOV.F32/F64 Sd, #imm（已展开为位模式）
+    FpVmovImm { sd: u8, imm: u64, double: bool },
+    /// VFP 三寄存器运算（VADD/VSUB/VMUL/VDIV/VMLA/VMLS/VNMLS/VNMLA）
+    FpArith3 {
+        op: FpArithOp,
+        vd: u8,
+        vn: u8,
+        vm: u8,
+        double: bool,
+    },
+    /// VFP 二寄存器一元运算（VABS/VNEG/VSQRT）
+    FpUnary {
+        op: FpUnaryOp,
+        vd: u8,
+        vm: u8,
+        double: bool,
+    },
+    /// VCMP/VCMPE（含 #0.0 形式），写 FPSCR N/Z/C/V
+    FpCmp {
+        vd: u8,
+        vm: u8,
+        double: bool,
+        /// VCMPE（对 NaN 触发 Invalid Operation）
+        e: bool,
+        /// 与 +0.0 比较
+        zero: bool,
+    },
+    /// VCVT 转换（S32/U32/F32/F64 之间）
+    FpCvt { op: FpCvtOp, vd: u8, vm: u8 },
+    /// VLDR/VSTR: 内存访问
+    FpLoadStore {
+        rt: u8,
+        rn: u8,
+        /// 已按符号展开的字节偏移
+        offset: u32,
+        load: bool,
+        double: bool,
+    },
+
     /// 未实现指令
     Unimplemented { bits: u32 },
     /// 非法指令
@@ -223,6 +274,60 @@ pub enum Simd16Kind {
     Sub16,
 }
 
+/// VFP 三寄存器运算种类
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpArithOp {
+    Vmla,
+    Vmls,
+    Vnmls,
+    Vnmla,
+    Vmul,
+    Vnmul,
+    Vadd,
+    Vsub,
+    Vdiv,
+}
+
+/// VFP 一元运算种类
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpUnaryOp {
+    Vabs,
+    Vneg,
+    Vsqrt,
+}
+
+/// VCVT 转换种类（vd/vm 已按方向解码为正确索引）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpCvtOp {
+    /// 有符号 32 位整数 → F32（按 FPSCR 舍入模式）
+    S32ToF32,
+    /// 无符号 32 位整数 → F32
+    U32ToF32,
+    /// F32 → 有符号 32 位整数（朝零舍入）
+    F32ToS32,
+    /// F32 → 无符号 32 位整数（朝零舍入）
+    F32ToU32,
+    /// F32 → 有符号 32 位整数（就近舍入，VCVTR）
+    F32ToS32R,
+    /// F32 → 无符号 32 位整数（就近舍入，VCVTR）
+    F32ToU32R,
+    /// F64 → F32
+    F64ToF32,
+    /// F32 → F64（精确）
+    F32ToF64,
+    /// 有符号 32 位整数 → F64
+    S32ToF64,
+    /// 无符号 32 位整数 → F64
+    U32ToF64,
+    /// F64 → 有符号 32 位整数（朝零舍入）
+    F64ToS32,
+    /// F64 → 无符号 32 位整数（朝零舍入）
+    F64ToU32,
+    /// F64 → 有符号 32 位整数（就近舍入）
+    F64ToS32R,
+    /// F64 → 无符号 32 位整数（就近舍入）
+    F64ToU32R,
+}
 
 /// 移位类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,6 +525,30 @@ impl Decoder {
             return self.decode_pkh(bits);
         }
 
+        // ---- Phase 4: FPU ----
+        if (top & 0xFF00) == 0xEE00 {
+            if let Some(instr) = self.try_decode_fpu(bits) {
+                return instr;
+            }
+        }
+        // VLDR/VSTR（0xED00，bit21=0）
+        if (top & 0xFF00) == 0xED00
+            && (top & 0x20) == 0
+            && (bits & 0x0E00) == 0x0A00
+            && (bits & 0x00F0) == 0
+        {
+            return self.decode_fpu_loadstore(bits);
+        }
+        // VMOV Dd, Rt, Rt2 / Rt, Rt2, Dd（0xEC4x/0xEC5x）
+        if (top & 0xFF00) == 0xEC00
+            && (top & 0x20) == 0
+            && (bits & 0x0F00) == 0x0B00
+            && (bits & 0x10) == 0x10
+            && (bits & 0x60) == 0
+        {
+            return self.decode_vmov_core_d(bits);
+        }
+
         Instruction::Unimplemented { bits }
     }
 
@@ -568,6 +697,277 @@ impl Decoder {
             rm,
             tb,
             shift_imm: imm5 as u8,
+        }
+    }
+
+    /// 解码 VFP 指令（top 0xEE00 家族），返回 None 表示非 VFP/未实现
+    fn try_decode_fpu(&self, bits: u32) -> Option<Instruction> {
+        let top = (bits >> 16) as u16;
+        let low = bits as u16;
+        let sz = (low >> 8) & 1; // X = size: 0=SP, 1=DP
+        let sz_is_double = sz == 1;
+
+        // ---- VMOV Sn, Rt / Rt, Sn（核心寄存器互传）：top bit21=0，低半字 bit4=1 ----
+        if (top & 0x20) == 0 && (low & 0x10) != 0 && (low & 0x60) == 0 && (low & 0x0E00) == 0x0A00 {
+            let rt = ((low >> 12) & 0xF) as u8;
+            let sn = (((top & 0xF) as u8) << 1) | ((low >> 7) & 1) as u8;
+            let to_core = (top & 0x10) != 0;
+            return Some(Instruction::FpVmovCore { rt, sn, to_core });
+        }
+
+        let opc = (((top >> 7) & 1) << 2) | (((top >> 5) & 1) << 1) | ((top >> 4) & 1);
+        // ---- 三寄存器运算（VMLA..VDIV）：低半字 bit4=0，bits[11:9]=101 ----
+        if (low & 0x10) == 0 && (low & 0x0E00) == 0x0A00 {
+            match opc {
+                0..=3 => {
+                    // 单精度: Vd=(bits[15:12]<<1)|bit22, Vn=(bits[19:16]<<1)|bit7, Vm=(bits[3:0]<<1)|bit5
+                    let vd = if sz_is_double {
+                        ((low >> 12) & 0xF) as u8
+                    } else {
+                        (((low >> 12) as u8) << 1) | ((top >> 6) & 1) as u8
+                    };
+                    let vn = if sz_is_double {
+                        (top & 0xF) as u8
+                    } else {
+                        (((top & 0xF) as u8) << 1) | ((low >> 7) & 1) as u8
+                    };
+                    let vm = if sz_is_double {
+                        (low & 0xF) as u8
+                    } else {
+                        (((low & 0xF) as u8) << 1) | ((low >> 5) & 1) as u8
+                    };
+                    let sub = (low & 0x40) != 0;
+                    let op = match (opc, sub) {
+                        (0, false) => FpArithOp::Vmla,
+                        (0, true) => FpArithOp::Vmls,
+                        (1, false) => FpArithOp::Vnmls,
+                        (1, true) => FpArithOp::Vnmla,
+                        (2, false) => FpArithOp::Vmul,
+                        (2, true) => FpArithOp::Vnmul,
+                        (3, false) => FpArithOp::Vadd,
+                        _ => FpArithOp::Vsub,
+                    };
+                    return Some(Instruction::FpArith3 {
+                        op,
+                        vd,
+                        vn,
+                        vm,
+                        double: sz_is_double,
+                    });
+                }
+                4 if (top & 0x30) == 0 => {
+                    // VDIV（bit23=1，bits[21:20]=00）
+                    let vd = if sz_is_double {
+                        ((low >> 12) & 0xF) as u8
+                    } else {
+                        (((low >> 12) as u8) << 1) | ((top >> 6) & 1) as u8
+                    };
+                    let vn = if sz_is_double {
+                        (top & 0xF) as u8
+                    } else {
+                        (((top & 0xF) as u8) << 1) | ((low >> 7) & 1) as u8
+                    };
+                    let vm = if sz_is_double {
+                        (low & 0xF) as u8
+                    } else {
+                        (((low & 0xF) as u8) << 1) | ((low >> 5) & 1) as u8
+                    };
+                    return Some(Instruction::FpArith3 {
+                        op: FpArithOp::Vdiv,
+                        vd,
+                        vn,
+                        vm,
+                        double: sz_is_double,
+                    });
+                }
+                7 if (top & 0x30) == 0x30 => {
+                    // ---- 二寄存器家族（VMOV/VABS/VNEG/VSQRT/VCMP/VCVT/VMOV-imm）----
+                    return Some(self.decode_fpu_2reg(bits));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// 解码 VFP 二寄存器指令（top 0xEEB0+，bits[21:20]=11）
+    fn decode_fpu_2reg(&self, bits: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let low = bits as u16;
+        let sz = (low >> 8) & 1;
+        let sz_is_double = sz == 1;
+        // opc5 = bits[19:16] + bit7
+        let op5 = (((top & 0xF) as u8) << 1) | ((low >> 7) & 1) as u8;
+        // 单精度寄存器解码
+        let sp_vd = |w: u32| (((w >> 12) & 0xF) as u8) << 1 | ((w >> 22) & 1) as u8;
+        let sp_vm = |w: u32| (((w & 0xF) as u8) << 1) | ((w >> 5) & 1) as u8;
+        let dp_vd = |w: u32| ((w >> 12) & 0xF) as u8;
+        let dp_vm = |w: u32| (w & 0xF) as u8;
+        let (vd, vm) = if sz_is_double {
+            (dp_vd(bits), dp_vm(bits))
+        } else {
+            (sp_vd(bits), sp_vm(bits))
+        };
+
+        match op5 {
+            _ if (low & 0xF0) == 0 => {
+                // VMOV（立即数）：bits[7:4]=0000，imm8 = bits[19:16]<<4 | bits[3:0]
+                let imm8 = (((top & 0xF) << 4) | (low & 0xF)) as u8;
+                let imm = crate::engine::fpu::vfp_expand_imm(imm8, sz_is_double);
+                Instruction::FpVmovImm {
+                    sd: vd,
+                    imm,
+                    double: sz_is_double,
+                }
+            }
+            0b00000 => Instruction::FpVmovReg {
+                sd: vd,
+                sm: vm,
+                double: sz_is_double,
+            },
+            0b00001 => Instruction::FpUnary {
+                op: FpUnaryOp::Vabs,
+                vd,
+                vm,
+                double: sz_is_double,
+            },
+            0b00010 => Instruction::FpUnary {
+                op: FpUnaryOp::Vneg,
+                vd,
+                vm,
+                double: sz_is_double,
+            },
+            0b00011 => Instruction::FpUnary {
+                op: FpUnaryOp::Vsqrt,
+                vd,
+                vm,
+                double: sz_is_double,
+            },
+            0b01000 => Instruction::FpCmp {
+                vd,
+                vm,
+                double: sz_is_double,
+                e: false,
+                zero: false,
+            },
+            0b01001 => Instruction::FpCmp {
+                vd,
+                vm,
+                double: sz_is_double,
+                e: true,
+                zero: false,
+            },
+            0b01010 => Instruction::FpCmp {
+                vd,
+                vm,
+                double: sz_is_double,
+                e: false,
+                zero: true,
+            },
+            0b01011 => Instruction::FpCmp {
+                vd,
+                vm,
+                double: sz_is_double,
+                e: true,
+                zero: true,
+            },
+            0b01111 => {
+                // VCVT F64↔F32：sz 决定方向；目标寄存器字段也随方向变化
+                if sz_is_double {
+                    // VCVT.F32.F64 Sd, Dm
+                    let sd = sp_vd(bits);
+                    let dm = dp_vm(bits);
+                    Instruction::FpCvt {
+                        op: FpCvtOp::F32ToF64,
+                        vd: sd,
+                        vm: dm,
+                    }
+                } else {
+                    // VCVT.F64.F32 Dd, Sm
+                    let dd = dp_vd(bits);
+                    let sm = sp_vm(bits);
+                    Instruction::FpCvt {
+                        op: FpCvtOp::F64ToF32,
+                        vd: dd,
+                        vm: sm,
+                    }
+                }
+            }
+            0b10000 | 0b10001 | 0b11000 | 0b11001 | 0b11010 | 0b11011 => {
+                // VCVT 整数↔浮点（1100x = U32，1101x = S32）
+                if sz_is_double {
+                    // 整数→F64: Dd ← Sm；F64→整数: Sd ← Dm
+                    if op5 == 0b10000 || op5 == 0b10001 {
+                        let dd = dp_vd(bits);
+                        let sm = sp_vm(bits);
+                        let op = if op5 == 0b10000 {
+                            FpCvtOp::U32ToF64
+                        } else {
+                            FpCvtOp::S32ToF64
+                        };
+                        Instruction::FpCvt { op, vd: dd, vm: sm }
+                    } else {
+                        let sd = sp_vd(bits);
+                        let dm = dp_vm(bits);
+                        let op = match op5 {
+                            0b11000 => FpCvtOp::F64ToU32R,
+                            0b11001 => FpCvtOp::F64ToU32,
+                            0b11010 => FpCvtOp::F64ToS32R,
+                            _ => FpCvtOp::F64ToS32,
+                        };
+                        Instruction::FpCvt { op, vd: sd, vm: dm }
+                    }
+                } else {
+                    let op = match op5 {
+                        0b10000 => FpCvtOp::U32ToF32,
+                        0b10001 => FpCvtOp::S32ToF32,
+                        0b11000 => FpCvtOp::F32ToU32R,
+                        0b11001 => FpCvtOp::F32ToU32,
+                        0b11010 => FpCvtOp::F32ToS32R,
+                        _ => FpCvtOp::F32ToS32,
+                    };
+                    Instruction::FpCvt { op, vd, vm }
+                }
+            }
+            _ => Instruction::Unimplemented { bits },
+        }
+    }
+
+    /// 解码 VLDR/VSTR
+    fn decode_fpu_loadstore(&self, bits: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let sz = (bits >> 8) & 1;
+        let u = (top >> 7) & 1; // bit23: 偏移符号
+        let load = (top >> 4) & 1 == 1; // bit20: L
+        let rn = (top & 0xF) as u8;
+        let imm = (bits & 0xFF) as u32 * 4; // imm8 × 4（单/双精度一致）
+        let offset = if u == 1 { imm } else { imm.wrapping_neg() };
+        let rt = if sz == 1 {
+            ((bits >> 12) & 0xF) as u8
+        } else {
+            (((bits >> 12) & 0xF) as u8) << 1 | ((top >> 6) & 1) as u8
+        };
+        Instruction::FpLoadStore {
+            rt,
+            rn,
+            offset,
+            load,
+            double: sz == 1,
+        }
+    }
+
+    /// 解码 VMOV Dd, Rt, Rt2 / Rt, Rt2, Dd
+    fn decode_vmov_core_d(&self, bits: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let rt = ((bits >> 12) & 0xF) as u8;
+        let rt2 = (top & 0xF) as u8;
+        let dn = ((((top >> 6) & 1) as u8) << 4) | ((bits & 0xF) as u8); // D:bits[3:0]
+        let to_core = (top & 0x10) != 0;
+        Instruction::FpVmovCoreD {
+            rt,
+            rt2,
+            dn,
+            to_core,
         }
     }
 

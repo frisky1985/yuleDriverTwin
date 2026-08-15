@@ -1,7 +1,14 @@
-//! FPU — Cortex-M4F 浮点单元（单/双精度）
+//! FPU — Cortex-M4F 浮点单元（单精度为主 + 双精度骨架）
 //!
-//! Phase 4 实现：寄存器文件 S0-S31 + FPSCR + 浮点指令。
-//! Phase 1 先提供寄存器文件与状态管理骨架。
+//! Phase 4 实现：寄存器文件 S0-S31/D0-D15 别名、FPSCR 状态位、VFP 立即数展开、
+//! 浮点运算语义（含异常标志 IOC/DZC/OFC/UFC/IXC）。
+//!
+//! 说明：
+//! - 双精度为骨架级支持（硬件 M4F 仅 VFPv4-SP），Dn 与 S(2n):S(2n+1) 别名。
+//! - 舍入模式：RN（默认）用原生 f32/f64 运算；RZ/RP/RM 通过 f64 中间量近似
+//!   （双精度定向舍入为骨架近似，见 `round_f64_per_mode` 注释）。
+//! - IXC（不精确）检测：单精度用 f64 精确中间量比对；双精度用 u128 尾数分解
+//!   判断结果是否可无舍入表示（加法/减法/乘法精确可判，除法用整除性近似）。
 
 /// FPU 寄存器文件（S0-S31 单精度 / D0-D15 双精度别名）
 #[derive(Debug, Default, Clone)]
@@ -52,9 +59,1281 @@ impl FpuRegisters {
         )
     }
 
+    /// 写入 N/Z/C/V 标志（VCMP 结果）
+    pub fn set_nzcv(&mut self, n: bool, z: bool, c: bool, v: bool) {
+        let mask = 0xF << 28;
+        let val = ((n as u32) << 31) | ((z as u32) << 30) | ((c as u32) << 29) | ((v as u32) << 28);
+        self.fpscr = (self.fpscr & !mask) | val;
+    }
+
+    /// 置位累积异常标志（IOC/DZC/OFC/UFC/IXC/IDC，均为粘性置位）
+    pub fn set_cumulative(
+        &mut self,
+        ioc: bool,
+        dzc: bool,
+        ofc: bool,
+        ufc: bool,
+        ixc: bool,
+        idc: bool,
+    ) {
+        let mut flags = 0u32;
+        if ioc {
+            flags |= 1 << 0;
+        }
+        if dzc {
+            flags |= 1 << 1;
+        }
+        if ofc {
+            flags |= 1 << 2;
+        }
+        if ufc {
+            flags |= 1 << 3;
+        }
+        if ixc {
+            flags |= 1 << 4;
+        }
+        if idc {
+            flags |= 1 << 7;
+        }
+        self.fpscr |= flags;
+    }
+
+    /// 置位 QC（累积饱和标志，粘性）
+    pub fn set_qc(&mut self) {
+        self.fpscr |= 1 << 27;
+    }
+
+    /// 读取 QC 标志
+    pub fn qc(&self) -> bool {
+        self.fpscr & (1 << 27) != 0
+    }
+
+    /// 当前舍入模式（FPSCR[23:22]）
+    pub fn rounding_mode(&self) -> FpRounding {
+        match (self.fpscr >> 22) & 0x3 {
+            0 => FpRounding::Nearest,
+            1 => FpRounding::PlusInf,
+            2 => FpRounding::MinusInf,
+            _ => FpRounding::Zero,
+        }
+    }
+
+    /// 刷新到零模式（FPSCR[24] FZ）
+    pub fn flush_to_zero(&self) -> bool {
+        self.fpscr & (1 << 24) != 0
+    }
+
     /// 复位 FPU 状态
     pub fn reset(&mut self) {
         self.s = [0; 32];
         self.fpscr = 0;
+    }
+}
+
+/// FPSCR 舍入模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpRounding {
+    /// 就近舍入（偶数，默认）
+    Nearest,
+    /// 向 +∞ 舍入
+    PlusInf,
+    /// 向 −∞ 舍入
+    MinusInf,
+    /// 向零舍入
+    Zero,
+}
+
+/// VFP 立即数展开（ARM ARM VFPExpandImm，位模式匹配 QEMU vfp_expand_imm）
+///
+/// imm8 布局：bit7 = 符号，bit6 = 指数基选择（1 → 0x7C/0x3FE 基，0 → 0x80/0x400 基），
+/// bit5:4 = 指数低 2 位，bit3:0 = 尾数高 4 位。
+pub fn vfp_expand_imm(imm8: u8, double: bool) -> u64 {
+    let sign = (imm8 & 0x80) as u64;
+    let exp_base: u64 = if imm8 & 0x40 != 0 {
+        if double {
+            0x3FE
+        } else {
+            0x7C
+        }
+    } else {
+        if double {
+            0x400
+        } else {
+            0x80
+        }
+    };
+    let exp = exp_base | (((imm8 >> 5) & 1) as u64) << 1 | (((imm8 >> 4) & 1) as u64);
+    if double {
+        (sign << 56) | (exp << 52) | (((imm8 & 0xF) as u64) << 48)
+    } else {
+        (sign << 24) | (exp << 23) | (((imm8 & 0xF) as u64) << 19)
+    }
+}
+
+/// 单精度 f32 运算标志（供 exec 汇总到 FPSCR）
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FpOpFlags {
+    pub ioc: bool,
+    pub dzc: bool,
+    pub ofc: bool,
+    pub ufc: bool,
+    pub ixc: bool,
+    pub idc: bool,
+    /// 饱和（VCVT 范围溢出 → FPSCR.QC）
+    pub qc: bool,
+}
+
+impl FpOpFlags {
+    /// 判断输入是否含次正规数（输入非正规 → IDC）
+    fn probe_inputs_f32(&mut self, a: u32, b: u32) {
+        self.idc = is_denormal_f32(a) || is_denormal_f32(b);
+    }
+    fn probe_inputs_f64(&mut self, a: u64, b: u64) {
+        self.idc = is_denormal_f64(a) || is_denormal_f64(b);
+    }
+}
+
+/// 判断 f32 位模式是否为次正规数（指数域全 0 且尾数非 0）
+pub fn is_denormal_f32(bits: u32) -> bool {
+    bits & 0x7F80_0000 == 0 && bits & 0x007F_FFFF != 0
+}
+
+/// 判断 f64 位模式是否为次正规数
+pub fn is_denormal_f64(bits: u64) -> bool {
+    bits & 0x7FF0_0000_0000_0000 == 0 && bits & 0x000F_FFFF_FFFF_FFFF != 0
+}
+
+/// 判断 f32 是否为 NaN（安静或信号）
+pub fn is_nan_f32(bits: u32) -> bool {
+    bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x007F_FFFF != 0
+}
+
+/// 判断 f64 是否为 NaN
+pub fn is_nan_f64(bits: u64) -> bool {
+    bits & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000 && bits & 0x000F_FFFF_FFFF_FFFF != 0
+}
+
+/// 安静化 NaN（置尾数最高位）
+pub fn quiet_nan(bits: u32) -> u32 {
+    bits | 0x0040_0000
+}
+
+/// 判断 f32 是否为信号 NaN（尾数最高位为 0）
+pub fn is_signaling_nan_f32(bits: u32) -> bool {
+    is_nan_f32(bits) && bits & 0x0040_0000 == 0
+}
+
+/// 判断 f64 是否为信号 NaN
+pub fn is_signaling_nan_f64(bits: u64) -> bool {
+    is_nan_f64(bits) && bits & 0x0008_0000_0000_0000 == 0
+}
+
+/// 安静化 NaN（f64）
+fn quiet_nan_f64(bits: u64) -> u64 {
+    bits | 0x0008_0000_0000_0000
+}
+
+/// 默认 NaN（VSQRT 负数、DN=1 时使用）
+pub const DEFAULT_NAN_F32: u32 = 0x7FC0_0000;
+pub const DEFAULT_NAN_F64: u64 = 0x7FF8_0000_0000_0000;
+
+/// f32 加法（含 FPSCR 舍入模式与异常标志）
+pub fn f32_add(fpu: &FpuRegisters, a: u32, b: u32) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f32(a, b);
+    if is_nan_f32(a) || is_nan_f32(b) {
+        flags.ioc = true;
+        let nan = if is_nan_f32(a) { a } else { b };
+        return (quiet_nan(nan), flags);
+    }
+    let ra = f32::from_bits(a);
+    let rb = f32::from_bits(b);
+    let res = f32_binop_rounded(fpu, |x, y| x + y, |x, y| x + y, ra, rb, &mut flags);
+    (res.to_bits(), flags)
+}
+
+/// f32 减法
+pub fn f32_sub(fpu: &FpuRegisters, a: u32, b: u32) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f32(a, b);
+    if is_nan_f32(a) || is_nan_f32(b) {
+        flags.ioc = true;
+        let nan = if is_nan_f32(a) { a } else { b };
+        return (quiet_nan(nan), flags);
+    }
+    let ra = f32::from_bits(a);
+    let rb = f32::from_bits(b);
+    let res = f32_binop_rounded(fpu, |x, y| x - y, |x, y| x - y, ra, rb, &mut flags);
+    (res.to_bits(), flags)
+}
+
+/// f32 乘法
+pub fn f32_mul(fpu: &FpuRegisters, a: u32, b: u32) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f32(a, b);
+    if is_nan_f32(a) || is_nan_f32(b) {
+        flags.ioc = true;
+        let nan = if is_nan_f32(a) { a } else { b };
+        return (quiet_nan(nan), flags);
+    }
+    let ra = f32::from_bits(a);
+    let rb = f32::from_bits(b);
+    let res = f32_binop_rounded(fpu, |x, y| x * y, |x, y| x * y, ra, rb, &mut flags);
+    (res.to_bits(), flags)
+}
+
+/// f32 除法（除零 → DZC）
+pub fn f32_div(fpu: &FpuRegisters, a: u32, b: u32) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f32(a, b);
+    if is_nan_f32(a) || is_nan_f32(b) {
+        flags.ioc = true;
+        let nan = if is_nan_f32(a) { a } else { b };
+        return (quiet_nan(nan), flags);
+    }
+    let ra = f32::from_bits(a);
+    let rb = f32::from_bits(b);
+    if rb == 0.0 && ra != 0.0 {
+        flags.dzc = true;
+        let res = if ra > 0.0 {
+            f32::INFINITY
+        } else {
+            f32::NEG_INFINITY
+        };
+        // 除零结果按 ARM 语义为 ±Inf（被除数为 0/0 时由 NaN 分支处理）
+        return (res.to_bits(), flags);
+    }
+    let res = f32_binop_rounded(fpu, |x, y| x / y, |x, y| x / y, ra, rb, &mut flags);
+    (res.to_bits(), flags)
+}
+
+/// 按 FPSCR 舍入模式计算 f32 二元运算
+///
+/// - RN（默认）：原生 f32 运算（正确舍入）。
+/// - RZ/RP/RM：经 f64 精确中间量再定向舍入（常规指数范围内 f32 二元运算
+///   在 f64 中可精确表示，无双重舍入；极端指数差场景为骨架近似）。
+fn f32_binop_rounded<FN, FW>(
+    fpu: &FpuRegisters,
+    op_narrow: FN,
+    op_wide: FW,
+    a: f32,
+    b: f32,
+    flags: &mut FpOpFlags,
+) -> f32
+where
+    FN: Fn(f32, f32) -> f32,
+    FW: Fn(f64, f64) -> f64,
+{
+    let wide = op_wide(a as f64, b as f64);
+    let res = if fpu.rounding_mode() == FpRounding::Nearest {
+        op_narrow(a, b)
+    } else {
+        round_f64_per_mode_f32(fpu.rounding_mode(), wide)
+    };
+    f32_flags_common(a, b, res, wide, flags);
+    if fpu.flush_to_zero() && is_denormal_f32(res.to_bits()) {
+        return 0.0;
+    }
+    res
+}
+
+/// f32 运算通用标志（溢出/次正规/不精确）
+///
+/// 不精确判定：f32 结果与 f64 中间量比对。常规指数范围内 f64 对 f32 二元运算
+/// 精确，判定可靠；除法 f64 商本身可能已舍入，属骨架近似（正常测试值可靠）。
+fn f32_flags_common(a: f32, b: f32, res: f32, wide: f64, flags: &mut FpOpFlags) {
+    if res.is_infinite() && !a.is_infinite() && !b.is_infinite() {
+        flags.ofc = true;
+        flags.ixc = true;
+    }
+    if is_denormal_f32(res.to_bits()) {
+        flags.ufc = true;
+        flags.ixc = true;
+    }
+    if (res as f64) != wide {
+        flags.ixc = true;
+    }
+}
+
+/// 从 f64 按舍入模式取 f32（next_up/next_down 逐位调整）
+fn round_f64_per_mode_f32(mode: FpRounding, v: f64) -> f32 {
+    let r = v as f32; // 先 RN
+    match mode {
+        FpRounding::Nearest => r,
+        FpRounding::Zero => {
+            if v >= 0.0 {
+                if r > v as f32 {
+                    next_down_f32(r)
+                } else {
+                    r
+                }
+            } else if r < v as f32 {
+                next_up_f32(r)
+            } else {
+                r
+            }
+        }
+        FpRounding::PlusInf => {
+            if r < v as f32 {
+                next_up_f32(r)
+            } else {
+                r
+            }
+        }
+        FpRounding::MinusInf => {
+            if r > v as f32 {
+                next_down_f32(r)
+            } else {
+                r
+            }
+        }
+    }
+}
+
+/// 下一个（向 +∞ 方向）可表示的 f32
+fn next_up_f32(f: f32) -> f32 {
+    if f.is_nan() || f == f32::INFINITY {
+        return f;
+    }
+    if f == 0.0 {
+        return f32::from_bits(1); // +最小次正规
+    }
+    if f.is_sign_negative() {
+        f32::from_bits(f.to_bits() - 1)
+    } else {
+        f32::from_bits(f.to_bits() + 1)
+    }
+}
+
+/// 下一个（向 −∞ 方向）可表示的 f32
+fn next_down_f32(f: f32) -> f32 {
+    if f.is_nan() || f == f32::NEG_INFINITY {
+        return f;
+    }
+    if f == 0.0 {
+        return f32::from_bits(0x8000_0001); // −最小次正规
+    }
+    if f.is_sign_negative() {
+        f32::from_bits(f.to_bits() + 1)
+    } else {
+        f32::from_bits(f.to_bits() - 1)
+    }
+}
+
+/// f32 乘加（VMLA/VMLS 等，融合单舍入）
+pub fn f32_mul_add(
+    fpu: &FpuRegisters,
+    a: u32,
+    b: u32,
+    c: u32,
+    neg_prod: bool,
+    neg_acc: bool,
+) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f32(a, b);
+    flags.probe_inputs_f32(c, 0);
+    let ra = f32::from_bits(a);
+    let rb = f32::from_bits(b);
+    let rc = f32::from_bits(c);
+    if is_nan_f32(a) || is_nan_f32(b) || is_nan_f32(c) {
+        flags.ioc = true;
+        let nan = if is_nan_f32(a) {
+            a
+        } else if is_nan_f32(b) {
+            b
+        } else {
+            c
+        };
+        return (quiet_nan(nan), flags);
+    }
+    // 融合乘加：Rust mul_add 即 fused（单舍入）
+    let (pa, pb) = if neg_prod { (-ra, rb) } else { (ra, rb) };
+    let res = pa.mul_add(pb, rc);
+    let res = if neg_acc { -res } else { res };
+    // 溢出/次正规/不精确：mul_add 的精确结果可通过 f64 对比近似（f32 融合乘加在常规范围）
+    if res.is_infinite() && !ra.is_infinite() && !rb.is_infinite() && !rc.is_infinite() {
+        flags.ofc = true;
+        flags.ixc = true;
+    }
+    if is_denormal_f32(res.to_bits()) {
+        flags.ufc = true;
+        flags.ixc = true;
+    }
+    if fpu.flush_to_zero() && is_denormal_f32(res.to_bits()) {
+        return (0.0f32.to_bits(), flags);
+    }
+    (res.to_bits(), flags)
+}
+
+// ==================== 双精度（骨架） ====================
+
+/// f64 加法
+pub fn f64_add(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f64(a, b);
+    if is_nan_f64(a) || is_nan_f64(b) {
+        flags.ioc = true;
+        let nan = if is_nan_f64(a) { a } else { b };
+        return (quiet_nan_f64(nan), flags);
+    }
+    let ra = f64::from_bits(a);
+    let rb = f64::from_bits(b);
+    let res = ra + rb;
+    f64_common_flags(ra, rb, res, &mut flags, BinOp::Add);
+    (res.to_bits(), flags)
+}
+
+/// f64 减法
+pub fn f64_sub(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f64(a, b);
+    if is_nan_f64(a) || is_nan_f64(b) {
+        flags.ioc = true;
+        let nan = if is_nan_f64(a) { a } else { b };
+        return (quiet_nan_f64(nan), flags);
+    }
+    let ra = f64::from_bits(a);
+    let rb = f64::from_bits(b);
+    let res = ra - rb;
+    f64_common_flags(ra, rb, res, &mut flags, BinOp::Sub);
+    (res.to_bits(), flags)
+}
+
+/// f64 乘法
+pub fn f64_mul(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f64(a, b);
+    if is_nan_f64(a) || is_nan_f64(b) {
+        flags.ioc = true;
+        let nan = if is_nan_f64(a) { a } else { b };
+        return (quiet_nan_f64(nan), flags);
+    }
+    let ra = f64::from_bits(a);
+    let rb = f64::from_bits(b);
+    let res = ra * rb;
+    f64_common_flags(ra, rb, res, &mut flags, BinOp::Mul);
+    (res.to_bits(), flags)
+}
+
+/// f64 除法
+pub fn f64_div(_fpu: &FpuRegisters, a: u64, b: u64) -> (u64, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f64(a, b);
+    if is_nan_f64(a) || is_nan_f64(b) {
+        flags.ioc = true;
+        let nan = if is_nan_f64(a) { a } else { b };
+        return (quiet_nan_f64(nan), flags);
+    }
+    let ra = f64::from_bits(a);
+    let rb = f64::from_bits(b);
+    if rb == 0.0 && ra != 0.0 {
+        flags.dzc = true;
+        let res = if ra > 0.0 {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        };
+        return (res.to_bits(), flags);
+    }
+    let res = ra / rb;
+    f64_common_flags(ra, rb, res, &mut flags, BinOp::Div);
+    (res.to_bits(), flags)
+}
+
+/// f64 乘加（融合单舍入）
+pub fn f64_mul_add(
+    _fpu: &FpuRegisters,
+    a: u64,
+    b: u64,
+    c: u64,
+    neg_prod: bool,
+    neg_acc: bool,
+) -> (u64, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    flags.probe_inputs_f64(a, b);
+    flags.probe_inputs_f64(c, 0);
+    let ra = f64::from_bits(a);
+    let rb = f64::from_bits(b);
+    let rc = f64::from_bits(c);
+    if is_nan_f64(a) || is_nan_f64(b) || is_nan_f64(c) {
+        flags.ioc = true;
+        let nan = if is_nan_f64(a) {
+            a
+        } else if is_nan_f64(b) {
+            b
+        } else {
+            c
+        };
+        return (quiet_nan_f64(nan), flags);
+    }
+    let (pa, pb) = if neg_prod { (-ra, rb) } else { (ra, rb) };
+    let res = pa.mul_add(pb, rc);
+    let res = if neg_acc { -res } else { res };
+    if res.is_infinite() && !ra.is_infinite() && !rb.is_infinite() && !rc.is_infinite() {
+        flags.ofc = true;
+        flags.ixc = true;
+    }
+    if is_denormal_f64(res.to_bits()) {
+        flags.ufc = true;
+        flags.ixc = true;
+    }
+    (res.to_bits(), flags)
+}
+
+#[derive(Clone, Copy)]
+enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// 汇总 f64 二元运算通用标志（含精确性判定）
+fn f64_common_flags(a: f64, b: f64, res: f64, flags: &mut FpOpFlags, op: BinOp) {
+    if res.is_infinite() && !a.is_infinite() && !b.is_infinite() {
+        flags.ofc = true;
+        flags.ixc = true;
+    }
+    if is_denormal_f64(res.to_bits()) {
+        flags.ufc = true;
+        flags.ixc = true;
+    }
+    // 精确性判定：u128 尾数分解（加法/减法/乘法精确可判；除法用整除性近似）
+    let exact = match op {
+        BinOp::Add => f64_add_exact(a, b),
+        BinOp::Sub => f64_add_exact(a, -b),
+        BinOp::Mul => f64_mul_exact(a, b),
+        BinOp::Div => f64_div_exact(a, b),
+    };
+    if !exact {
+        flags.ixc = true;
+    }
+}
+
+/// 分解 f64 为 (尾数, 无偏指数)；零与次正规按 ARM 语义简化处理
+fn f64_decompose(v: f64) -> (u64, i32) {
+    let bits = v.to_bits();
+    let exp = ((bits >> 52) & 0x7FF) as i32;
+    let frac = bits & 0xF_FFFF_FFFF_FFFF;
+    if exp == 0 {
+        // 次正规/零：尾数无隐含位
+        (frac, -1022)
+    } else {
+        (frac | (1 << 52), exp - 1023)
+    }
+}
+
+/// f64 加法/减法精确性：结果可无舍入表示（u128 尾数算术）
+fn f64_add_exact(a: f64, b: f64) -> bool {
+    if a == 0.0 || b == 0.0 {
+        return true;
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return true; // 无穷结果由 OFC 处理，不算舍入
+    }
+    let (ma, ea) = f64_decompose(a);
+    let (mb, eb) = f64_decompose(b);
+    // 统一到较大指数
+    let (big_m, big_e, small_m, small_e) = if ea >= eb {
+        (ma, ea, mb, eb)
+    } else {
+        (mb, eb, ma, ea)
+    };
+    let diff = (big_e - small_e) as u32;
+    if diff > 52 {
+        // 小操作数完全落在目标 LSB 之下 → 结果需要舍入（除非被吸收为 0）
+        return false;
+    }
+    // 尾数符号：以 f64 符号分离处理
+    let sign_a = a.is_sign_negative();
+    let sign_b = b.is_sign_negative();
+    // 对齐：小尾数右移 diff，移出位记 sticky
+    let shifted = if diff >= 64 {
+        (0u128, small_m != 0)
+    } else {
+        let sm = small_m as u128;
+        (sm >> diff, (sm & ((1u128 << diff) - 1)) != 0)
+    };
+    if shifted.1 {
+        return false; // 移出非零位 → 必然舍入
+    }
+    let (mut m_big, mut m_small) = (big_m as u128, shifted.0);
+    if sign_a != (ea >= eb) {
+        m_big = m_big.wrapping_neg();
+    }
+    if sign_b != (ea < eb) {
+        m_small = m_small.wrapping_neg();
+    }
+    let sum = m_big.wrapping_add(m_small);
+    // 归一化后有效位数 ≤ 53 且无被移出的非零位 → 精确
+    sig_bits_u128(sum) <= 53
+}
+
+/// f64 乘法精确性：尾数乘积的有效位数 ≤ 53
+fn f64_mul_exact(a: f64, b: f64) -> bool {
+    if a == 0.0 || b == 0.0 {
+        return true;
+    }
+    if a.is_infinite() || b.is_infinite() {
+        return true;
+    }
+    let (ma, _ea) = f64_decompose(a);
+    let (mb, _eb) = f64_decompose(b);
+    let p = (ma as u128) * (mb as u128);
+    if p == 0 {
+        return true;
+    }
+    sig_bits_u128(p) <= 53
+}
+
+/// f64 除法精确性近似：约分后分母为 2 的幂且商有效位数 ≤ 53
+fn f64_div_exact(a: f64, b: f64) -> bool {
+    if a == 0.0 {
+        return true;
+    }
+    if b.is_infinite() || a.is_infinite() {
+        return true;
+    }
+    let (ma, ea) = f64_decompose(a);
+    let (mb, eb) = f64_decompose(b);
+    let g = gcd_u64(ma, mb);
+    let m1 = ma / g;
+    let m2 = mb / g;
+    if !m2.is_power_of_two() {
+        return false; // 分母含奇因子 → 二进制无限循环 → 不精确
+    }
+    let shift = m2.trailing_zeros();
+    // 商 = m1 × 2^(ea - eb - shift)：需归一化后有效位数 ≤ 53
+    let sig = sig_bits_u64(m1);
+    if sig > 53 {
+        return false;
+    }
+    // 指数范围检查（正规结果可表示性；次正规除法近似认为不精确）
+    let exp = ea - eb - shift as i32;
+    (-1021..=1024).contains(&exp)
+}
+
+/// 有效位数（bit_length − 尾随零），0 返回 0
+fn sig_bits_u128(x: u128) -> usize {
+    if x == 0 {
+        0
+    } else {
+        (128 - x.leading_zeros() - x.trailing_zeros()) as usize
+    }
+}
+
+/// 有效位数（u64）
+fn sig_bits_u64(x: u64) -> usize {
+    if x == 0 {
+        0
+    } else {
+        (64 - x.leading_zeros() - x.trailing_zeros()) as usize
+    }
+}
+
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+// ==================== VCVT 转换（整数 ↔ 浮点） ====================
+
+/// 整数 → f32（按 FPSCR 舍入模式；整数在 f64 中精确，无双重舍入）
+pub fn cvt_int_to_f32(fpu: &FpuRegisters, x: i64) -> f32 {
+    round_f64_per_mode_f32(fpu.rounding_mode(), x as f64)
+}
+
+/// 整数 → f64（i32/u32 在 f64 中精确）
+pub fn cvt_int_to_f64(x: i64) -> f64 {
+    x as f64
+}
+
+/// f32 → 有符号/无符号 32 位整数
+///
+/// `round_nearest`：true = VCVTR（就近舍入），false = VCVT（朝零舍入）。
+/// 语义：NaN → 0 + IOC；越界 → 饱和 + QC；舍入发生 → IXC。
+pub fn cvt_f32_to_int(
+    _fpu: &FpuRegisters,
+    bits: u32,
+    signed: bool,
+    round_nearest: bool,
+) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    let f = f32::from_bits(bits);
+    if f.is_nan() {
+        flags.ioc = true;
+        return (0, flags);
+    }
+    let fv = f as f64;
+    let rounded = if round_nearest {
+        f.round_ties_even() as f64
+    } else {
+        f.trunc() as f64
+    };
+    if signed {
+        if fv > 2147483647.0 || (f.is_infinite() && f > 0.0) {
+            flags.qc = true;
+            return (0x7FFF_FFFF, flags);
+        }
+        if fv < -2147483648.0 || (f.is_infinite() && f < 0.0) {
+            flags.qc = true;
+            return (0x8000_0000, flags);
+        }
+        if rounded != fv {
+            flags.ixc = true;
+        }
+        (rounded as i64 as u32, flags)
+    } else {
+        if fv > 4294967295.0 || (f.is_infinite() && f > 0.0) {
+            flags.qc = true;
+            return (0xFFFF_FFFF, flags);
+        }
+        if fv < 0.0 {
+            flags.qc = true;
+            return (0, flags);
+        }
+        if rounded != fv {
+            flags.ixc = true;
+        }
+        (rounded as u64 as u32, flags)
+    }
+}
+
+/// f64 → 有符号/无符号 32 位整数
+pub fn cvt_f64_to_int(
+    _fpu: &FpuRegisters,
+    bits: u64,
+    signed: bool,
+    round_nearest: bool,
+) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    let f = f64::from_bits(bits);
+    if f.is_nan() {
+        flags.ioc = true;
+        return (0, flags);
+    }
+    let fv = f;
+    let rounded = if round_nearest {
+        f.round_ties_even()
+    } else {
+        f.trunc()
+    };
+    if signed {
+        if fv > 2147483647.0 || (f.is_infinite() && f > 0.0) {
+            flags.qc = true;
+            return (0x7FFF_FFFF, flags);
+        }
+        if fv < -2147483648.0 || (f.is_infinite() && f < 0.0) {
+            flags.qc = true;
+            return (0x8000_0000, flags);
+        }
+        if rounded != fv {
+            flags.ixc = true;
+        }
+        (rounded as i64 as u32, flags)
+    } else {
+        if fv > 4294967295.0 || (f.is_infinite() && f > 0.0) {
+            flags.qc = true;
+            return (0xFFFF_FFFF, flags);
+        }
+        if fv < 0.0 {
+            flags.qc = true;
+            return (0, flags);
+        }
+        if rounded != fv {
+            flags.ixc = true;
+        }
+        (rounded as u64 as u32, flags)
+    }
+}
+
+/// f64 → f32（按 FPSCR 舍入模式；NaN 传播无异常）
+pub fn cvt_f64_to_f32(fpu: &FpuRegisters, bits: u64) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    let f = f64::from_bits(bits);
+    if f.is_nan() {
+        // NaN 传播（安静化），无异常标志
+        let q = quiet_nan_f64(bits);
+        return ((q >> 32) as u32 | 0x0040_0000, flags);
+    }
+    if is_denormal_f64(bits) {
+        flags.idc = true;
+    }
+    let wide = f;
+    let res = round_f64_per_mode_f32(fpu.rounding_mode(), wide);
+    if res.is_infinite() && !f.is_infinite() {
+        flags.ofc = true;
+        flags.ixc = true;
+    }
+    if is_denormal_f32(res.to_bits()) {
+        flags.ufc = true;
+        flags.ixc = true;
+    }
+    if (res as f64) != wide {
+        flags.ixc = true;
+    }
+    (res.to_bits(), flags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// VFP 立即数展开 golden（与汇编器输出一致）
+    #[test]
+    fn vfp_expand_imm_golden() {
+        // 1.0 / 0.5 / 2.0 / 3.0 / 1.5 / 0.75 / -1.0 / -2.5
+        assert_eq!(vfp_expand_imm(0x70, false), 0x3F80_0000);
+        assert_eq!(vfp_expand_imm(0x60, false), 0x3F00_0000);
+        assert_eq!(vfp_expand_imm(0x00, false), 0x4000_0000);
+        assert_eq!(vfp_expand_imm(0x08, false), 0x4040_0000);
+        assert_eq!(vfp_expand_imm(0x78, false), 0x3FC0_0000);
+        assert_eq!(vfp_expand_imm(0x68, false), 0x3F40_0000);
+        assert_eq!(vfp_expand_imm(0xF0, false), 0xBF80_0000);
+        assert_eq!(vfp_expand_imm(0x84, false), 0xC020_0000);
+        // 双精度 1.0 / -2.5
+        assert_eq!(vfp_expand_imm(0x70, true), 0x3FF0_0000_0000_0000);
+        assert_eq!(vfp_expand_imm(0x84, true), 0xC004_0000_0000_0000);
+    }
+
+    #[test]
+    fn fpu_register_file_alias() {
+        let mut fpu = FpuRegisters::new();
+        fpu.write_d(3, 0x0123_4567_89AB_CDEF);
+        assert_eq!(fpu.read_s(6), 0x89AB_CDEF); // D3 = S6:S7
+        assert_eq!(fpu.read_s(7), 0x0123_4567);
+        assert_eq!(fpu.read_d(3), 0x0123_4567_89AB_CDEF);
+        fpu.write_s(6, 0xFFFF_FFFF);
+        assert_eq!(fpu.read_d(3) & 0xFFFF_FFFF, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn f32_add_flags() {
+        let fpu = FpuRegisters::new();
+        // 1.0 + 2.0 = 3.0（精确，无标志）
+        let (res, flags) = f32_add(&fpu, 0x3F80_0000, 0x4000_0000);
+        assert_eq!(res, 0x4040_0000);
+        assert!(!flags.ioc && !flags.ixc && !flags.ofc && !flags.ufc && !flags.dzc);
+        // NaN 输入 → IOC
+        let (res, flags) = f32_add(&fpu, 0x7FC0_0000, 0x3F80_0000);
+        assert!(is_nan_f32(res));
+        assert!(flags.ioc);
+        // 溢出：MAX + MAX → Inf + OFC + IXC
+        let (res, flags) = f32_add(&fpu, 0x7F7F_FFFF, 0x7F7F_FFFF);
+        assert!(res == f32::INFINITY.to_bits());
+        assert!(flags.ofc && flags.ixc);
+    }
+
+    #[test]
+    fn f32_div_zero() {
+        let fpu = FpuRegisters::new();
+        let (res, flags) = f32_div(&fpu, 0x3F80_0000, 0x0000_0000);
+        assert_eq!(res, f32::INFINITY.to_bits());
+        assert!(flags.dzc);
+    }
+
+    #[test]
+    fn f64_exactness_helpers() {
+        // 1.0 + 2.0 = 3.0 精确
+        assert!(f64_add_exact(1.0, 2.0));
+        // 1.0 + 2^-53 不精确
+        assert!(!f64_add_exact(1.0, 2f64.powi(-53)));
+        // 1.5 × 2.0 = 3.0 精确
+        assert!(f64_mul_exact(1.5, 2.0));
+        // 0.1 × 0.2 不精确
+        assert!(!f64_mul_exact(0.1, 0.2));
+        // 1.0 / 4.0 精确
+        assert!(f64_div_exact(1.0, 4.0));
+        // 1.0 / 3.0 不精确
+        assert!(!f64_div_exact(1.0, 3.0));
+    }
+
+    #[test]
+    fn f64_add_flags() {
+        let fpu = FpuRegisters::new();
+        let (res, flags) = f64_add(&fpu, 0x3FF0_0000_0000_0000, 0x4000_0000_0000_0000);
+        assert_eq!(res, 0x4008_0000_0000_0000); // 1.0 + 2.0 = 3.0
+        assert!(!flags.ioc && !flags.ixc && !flags.ofc && !flags.ufc && !flags.dzc);
+        // 1.0 + 2^-53 → 不精确
+        let (_, flags) = f64_add(&fpu, 1.0f64.to_bits(), (2f64.powi(-53)).to_bits());
+        assert!(flags.ixc);
+    }
+
+    #[test]
+    fn rounding_mode_helpers() {
+        let mut fpu = FpuRegisters::new();
+        assert_eq!(fpu.rounding_mode(), FpRounding::Nearest);
+        fpu.fpscr |= 3 << 22;
+        assert_eq!(fpu.rounding_mode(), FpRounding::Zero);
+    }
+
+    // ==================== 指令级 golden 测试（GIVEN/WHEN/THEN） ====================
+    // 编码均由 arm-none-eabi-as -mcpu=cortex-m4/-m7 汇编验证
+
+    use crate::engine::exec::ExecOutcome;
+    use crate::engine::test_util::Harness;
+
+    fn f32(v: f32) -> u32 {
+        v.to_bits()
+    }
+
+    #[test]
+    fn golden_vmov_reg() {
+        // GIVEN: S1 = 1.5
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(1, f32(1.5));
+        // WHEN: VMOV.F32 S0, S1（0xEEB0 0A60）
+        assert_eq!(h.exec_word(0xEEB0_0A60), ExecOutcome::Continue);
+        // THEN: S0 = 1.5
+        assert_eq!(h.cpu.fpu.read_s(0), f32(1.5));
+        // 高寄存器：VMOV.F32 S16, S17（0xEEB0 8A68）
+        h.cpu.fpu.write_s(17, f32(-2.25));
+        assert_eq!(h.exec_word(0xEEB0_8A68), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(16), f32(-2.25));
+    }
+
+    #[test]
+    fn golden_vmov_core_roundtrip() {
+        // GIVEN: R1 = 0x3F80_0000（1.0 的位模式）
+        let mut h = Harness::new();
+        h.cpu.regs[1] = f32(1.0);
+        // WHEN: VMOV S0, R1（0xEE00 1A10）
+        assert_eq!(h.exec_word(0xEE00_1A10), ExecOutcome::Continue);
+        // THEN: S0 = 1.0
+        assert_eq!(h.cpu.fpu.read_s(0), f32(1.0));
+        // WHEN: VMOV R2, S0（0xEE10 2A10）
+        assert_eq!(h.exec_word(0xEE10_2A10), ExecOutcome::Continue);
+        // THEN: R2 = 1.0 位模式
+        assert_eq!(h.cpu.regs[2], f32(1.0));
+        // 高寄存器：VMOV R3, S16（0xEE18 3A10）
+        h.cpu.fpu.write_s(16, f32(3.5));
+        assert_eq!(h.exec_word(0xEE18_3A10), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[3], f32(3.5));
+    }
+
+    #[test]
+    fn golden_vmov_imm() {
+        // GIVEN: 空
+        let mut h = Harness::new();
+        // WHEN: VMOV.F32 S0, #1.0（0xEEB7 0A00）
+        assert_eq!(h.exec_word(0xEEB7_0A00), ExecOutcome::Continue);
+        // THEN: S0 = 1.0
+        assert_eq!(h.cpu.fpu.read_s(0), f32(1.0));
+        // WHEN: VMOV.F32 S1, #-2.5（0xEEF8 0A04：imm8=0x84，Vd=S1）
+        assert_eq!(h.exec_word(0xEEF8_0A04), ExecOutcome::Continue);
+        // THEN: S1 = -2.5
+        assert_eq!(h.cpu.fpu.read_s(1), f32(-2.5));
+        // 高寄存器：VMOV.F32 S16, #1.0（0xEEB7 8A00）
+        assert_eq!(h.exec_word(0xEEB7_8A00), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(16), f32(1.0));
+    }
+
+    #[test]
+    fn golden_vadd_f32() {
+        // GIVEN: S1 = 1.0，S2 = 2.0
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(1, f32(1.0));
+        h.cpu.fpu.write_s(2, f32(2.0));
+        // WHEN: VADD.F32 S0, S1, S2（0xEE30 0A81）
+        assert_eq!(h.exec_word(0xEE30_0A81), ExecOutcome::Continue);
+        // THEN: S0 = 3.0，无异常标志
+        assert_eq!(h.cpu.fpu.read_s(0), f32(3.0));
+        assert_eq!(h.cpu.fpu.fpscr & 0xFF, 0);
+    }
+
+    #[test]
+    fn golden_vsub_vmul_vdiv_f32() {
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(1, f32(1.5));
+        h.cpu.fpu.write_s(2, f32(2.0));
+        // WHEN: VSUB.F32 S0, S1, S2（0xEE30 0AC1）→ 1.5 − 2.0 = −0.5
+        assert_eq!(h.exec_word(0xEE30_0AC1), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(-0.5));
+        // WHEN: VMUL.F32 S0, S1, S2（0xEE20 0A81）→ 1.5 × 2.0 = 3.0
+        assert_eq!(h.exec_word(0xEE20_0A81), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(3.0));
+        // WHEN: VDIV.F32 S0, S1, S2（0xEE80 0A81）→ 1.5 / 2.0 = 0.75
+        assert_eq!(h.exec_word(0xEE80_0A81), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(0.75));
+    }
+
+    #[test]
+    fn golden_vdiv_by_zero_sets_dzc() {
+        // GIVEN: S1 = 1.0，S2 = 0.0
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(1, f32(1.0));
+        h.cpu.fpu.write_s(2, f32(0.0));
+        // WHEN: VDIV.F32 S0, S1, S2
+        assert_eq!(h.exec_word(0xEE80_0A81), ExecOutcome::Continue);
+        // THEN: S0 = +Inf，FPSCR.DZC（bit1）置位
+        assert_eq!(h.cpu.fpu.read_s(0), f32::INFINITY.to_bits());
+        assert_ne!(h.cpu.fpu.fpscr & (1 << 1), 0);
+    }
+
+    #[test]
+    fn golden_vmla_fused() {
+        // GIVEN: S0 = 10.0，S1 = 1.5，S2 = 2.0
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(0, f32(10.0));
+        h.cpu.fpu.write_s(1, f32(1.5));
+        h.cpu.fpu.write_s(2, f32(2.0));
+        // WHEN: VMLA.F32 S0, S1, S2（0xEE00 0A81）→ 10 + 1.5×2 = 13
+        assert_eq!(h.exec_word(0xEE00_0A81), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(13.0));
+        // WHEN: VMLS.F32 S0, S1, S2（0xEE00 0AC1）→ 13 − 3 = 10
+        assert_eq!(h.exec_word(0xEE00_0AC1), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(10.0));
+    }
+
+    #[test]
+    fn golden_vnmla_vnmls_vnmul() {
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(0, f32(4.0));
+        h.cpu.fpu.write_s(1, f32(1.5));
+        h.cpu.fpu.write_s(2, f32(2.0));
+        // WHEN: VNMLA.F32 S0, S1, S2（0xEE10 0AC1）→ −(4 + 3) = −7
+        assert_eq!(h.exec_word(0xEE10_0AC1), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(-7.0));
+        // WHEN: VNMLS.F32 S0, S1, S2（0xEE10 0A81）→ −(S0 − 3) = −(−7 − 3) = 10
+        assert_eq!(h.exec_word(0xEE10_0A81), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(10.0));
+        // WHEN: VNMUL.F32 S0, S1, S2（0xEE20 0AC1）→ −(1.5 × 2) = −3
+        assert_eq!(h.exec_word(0xEE20_0AC1), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(-3.0));
+    }
+
+    #[test]
+    fn golden_vabs_vneg_vsqrt() {
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(1, f32(-4.0));
+        // WHEN: VABS.F32 S0, S1（0xEEB0 0AE0）
+        assert_eq!(h.exec_word(0xEEB0_0AE0), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(4.0));
+        // WHEN: VNEG.F32 S0, S1（0xEEB1 0A60）
+        assert_eq!(h.exec_word(0xEEB1_0A60), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(4.0)); // −(−4) = 4
+                                                   // WHEN: VSQRT.F32 S0, S1（0xEEB1 0AE0，S1 = +4.0）→ sqrt(4) = 2
+        h.cpu.fpu.write_s(1, f32(4.0));
+        assert_eq!(h.exec_word(0xEEB1_0AE0), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(2.0));
+        // 负数开方 → 默认 NaN + IOC（bit0）
+        h.cpu.fpu.write_s(1, f32(-1.0));
+        assert_eq!(h.exec_word(0xEEB1_0AE0), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), DEFAULT_NAN_F32);
+        assert_ne!(h.cpu.fpu.fpscr & 1, 0);
+    }
+
+    #[test]
+    fn golden_vcmp_flags() {
+        let mut h = Harness::new();
+        // GIVEN: S0 = 1.0，S1 = 2.0
+        h.cpu.fpu.write_s(0, f32(1.0));
+        h.cpu.fpu.write_s(1, f32(2.0));
+        // WHEN: VCMP.F32 S0, S1（0xEEB4 0A60）
+        assert_eq!(h.exec_word(0xEEB4_0A60), ExecOutcome::Continue);
+        // THEN: S0 < S1 → N=1，Z=C=V=0
+        assert_eq!(h.cpu.fpu.fpscr & (0xF << 28), 1 << 31);
+        // WHEN: VCMP.F32 S0, S0 → 相等 → Z=1, C=1
+        assert_eq!(h.exec_word(0xEEB4_0A60), ExecOutcome::Continue); // S1 仍为 2.0？改 S0=S1 重比
+        h.cpu.fpu.write_s(1, f32(1.0));
+        assert_eq!(h.exec_word(0xEEB4_0A60), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.fpscr & (0xF << 28), (0b0110) << 28); // Z=1, C=1
+                                                                   // WHEN: VCMP.F32 S0, #0.0（0xEEB5 0A40）→ 1.0 > 0.0 → C=1
+        assert_eq!(h.exec_word(0xEEB5_0A40), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.fpscr & (0xF << 28), (0b0010) << 28); // C=1
+    }
+
+    #[test]
+    fn golden_vcmpe_nan_sets_ioc() {
+        // GIVEN: S0 = NaN，S1 = 1.0
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(0, 0x7FC0_0000);
+        h.cpu.fpu.write_s(1, f32(1.0));
+        // WHEN: VCMPE.F32 S0, S1（0xEEB4 0AE0）
+        assert_eq!(h.exec_word(0xEEB4_0AE0), ExecOutcome::Continue);
+        // THEN: 无序 → C=1, V=1；IOC（bit0）置位
+        assert_eq!(h.cpu.fpu.fpscr & (0xF << 28), (0b0011) << 28);
+        assert_ne!(h.cpu.fpu.fpscr & 1, 0);
+    }
+
+    #[test]
+    fn golden_vcvt_s32_f32() {
+        let mut h = Harness::new();
+        // GIVEN: S1 = 1.9
+        h.cpu.fpu.write_s(1, f32(1.9));
+        // WHEN: VCVT.S32.F32 S0, S1（0xEEBD 0AE0，朝零舍入）
+        assert_eq!(h.exec_word(0xEEBD_0AE0), ExecOutcome::Continue);
+        // THEN: S0 = 1（位模式），IXC 置位（舍入发生）
+        assert_eq!(h.cpu.fpu.read_s(0), 1);
+        assert_ne!(h.cpu.fpu.fpscr & (1 << 4), 0);
+        // WHEN: VCVTR.S32.F32 S0, S1（0xEEBD 0A60，就近舍入）→ 1.9 → 2
+        assert_eq!(h.exec_word(0xEEBD_0A60), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), 2);
+        // WHEN: VCVT.F32.S32 S0, S1（0xEEB8 0AE0：S1 持有整数 5）
+        h.cpu.fpu.write_s(1, 5);
+        assert_eq!(h.exec_word(0xEEB8_0AE0), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(5.0));
+    }
+
+    #[test]
+    fn golden_vcvt_u32_saturation() {
+        // GIVEN: S1 = -1.0
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(1, f32(-1.0));
+        // WHEN: VCVT.U32.F32 S0, S1（0xEEBC 0AE0）
+        assert_eq!(h.exec_word(0xEEBC_0AE0), ExecOutcome::Continue);
+        // THEN: S0 = 0，QC（bit27）置位
+        assert_eq!(h.cpu.fpu.read_s(0), 0);
+        assert!(h.cpu.fpu.qc());
+        // 大正数 → 饱和 0xFFFF_FFFF
+        h.cpu.fpu.write_s(1, f32(5e9));
+        assert_eq!(h.exec_word(0xEEBC_0AE0), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn golden_vcvt_nan_sets_ioc() {
+        // GIVEN: S1 = NaN
+        let mut h = Harness::new();
+        h.cpu.fpu.write_s(1, 0x7FC0_0000);
+        // WHEN: VCVT.S32.F32 S0, S1
+        assert_eq!(h.exec_word(0xEEBD_0AE0), ExecOutcome::Continue);
+        // THEN: S0 = 0，IOC 置位
+        assert_eq!(h.cpu.fpu.read_s(0), 0);
+        assert_ne!(h.cpu.fpu.fpscr & 1, 0);
+    }
+
+    #[test]
+    fn golden_vcvt_f32_f64() {
+        let mut h = Harness::new();
+        // GIVEN: D1 = 1.5
+        h.cpu.fpu.write_d(1, 1.5f64.to_bits());
+        // WHEN: VCVT.F32.F64 S0, D1（0xEEB7 0BC1）
+        assert_eq!(h.exec_word(0xEEB7_0BC1), ExecOutcome::Continue);
+        // THEN: S0 = 1.5
+        assert_eq!(h.cpu.fpu.read_s(0), f32(1.5));
+        // WHEN: VCVT.F64.F32 D2, S3（0xEEB7 2AE1）
+        h.cpu.fpu.write_s(3, f32(2.25));
+        assert_eq!(h.exec_word(0xEEB7_2AE1), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(2), 2.25f64.to_bits());
+    }
+
+    #[test]
+    fn golden_f64_arith() {
+        let mut h = Harness::new();
+        // GIVEN: D1 = 1.5，D2 = 2.0
+        h.cpu.fpu.write_d(1, 1.5f64.to_bits());
+        h.cpu.fpu.write_d(2, 2.0f64.to_bits());
+        // WHEN: VADD.F64 D0, D1, D2（0xEE31 0B02）→ 3.5
+        assert_eq!(h.exec_word(0xEE31_0B02), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(0), 3.5f64.to_bits());
+        // WHEN: VMUL.F64 D0, D1, D2（0xEE21 0B02）→ 3.0
+        assert_eq!(h.exec_word(0xEE21_0B02), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(0), 3.0f64.to_bits());
+        // WHEN: VSUB.F64 D0, D1, D2（0xEE31 0B42）→ −0.5
+        assert_eq!(h.exec_word(0xEE31_0B42), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(0), (-0.5f64).to_bits());
+        // WHEN: VDIV.F64 D0, D1, D2（0xEE81 0B02）→ 0.75
+        assert_eq!(h.exec_word(0xEE81_0B02), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(0), 0.75f64.to_bits());
+    }
+
+    #[test]
+    fn golden_f64_mla_vmov_cmp() {
+        let mut h = Harness::new();
+        h.cpu.fpu.write_d(0, 10.0f64.to_bits());
+        h.cpu.fpu.write_d(1, 1.5f64.to_bits());
+        h.cpu.fpu.write_d(2, 2.0f64.to_bits());
+        // WHEN: VMLA.F64 D0, D1, D2（0xEE01 0B02）→ 10 + 3 = 13
+        assert_eq!(h.exec_word(0xEE01_0B02), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(0), 13.0f64.to_bits());
+        // WHEN: VMOV.F64 D3, D0（0xEEB0 3B40）
+        assert_eq!(h.exec_word(0xEEB0_3B40), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(3), 13.0f64.to_bits());
+        // WHEN: VCMP.F64 D0, D2（0xEEB4 0B41）→ 13 > 2 → C=1
+        assert_eq!(h.exec_word(0xEEB4_0B41), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.fpscr & (0xF << 28), (0b0010) << 28);
+    }
+
+    #[test]
+    fn golden_vldr_vstr_roundtrip() {
+        // GIVEN: R1 = 0x2000_0000（SRAM），S1 = 1.25
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x2000_0000;
+        h.cpu.fpu.write_s(1, f32(1.25));
+        // WHEN: VSTR S1, [R1, #4]（0xEDC1 0A01：S1 → bit22=1）
+        assert_eq!(h.exec_word(0xEDC1_0A01), ExecOutcome::Continue);
+        // THEN: 内存 [0x2000_0004] = 1.25 位模式
+        assert_eq!(h.mem.read_u32(0x2000_0004).unwrap(), f32(1.25));
+        // WHEN: VLDR S0, [R1, #4]（0xED91 0A01）
+        assert_eq!(h.exec_word(0xED91_0A01), ExecOutcome::Continue);
+        // THEN: S0 = 1.25
+        assert_eq!(h.cpu.fpu.read_s(0), f32(1.25));
+        // 负偏移：VLDR S16, [R2, #-8]（0xED12 8A02）
+        h.cpu.regs[2] = 0x2000_000C;
+        h.mem.write_u32(0x2000_0004, f32(-3.5)).unwrap();
+        assert_eq!(h.exec_word(0xED12_8A02), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(16), f32(-3.5));
+    }
+
+    #[test]
+    fn golden_vldr_double() {
+        // GIVEN: R1 = 0x2000_0000
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x2000_0000;
+        h.cpu.fpu.write_d(0, 2.5f64.to_bits());
+        // WHEN: VSTR D0, [R1, #8]（0xED81 0B02）
+        assert_eq!(h.exec_word(0xED81_0B02), ExecOutcome::Continue);
+        // THEN: 内存低字 = D0 低 32 位，高字 = 高 32 位
+        assert_eq!(
+            h.mem.read_u32(0x2000_0008).unwrap(),
+            2.5f64.to_bits() as u32
+        );
+        assert_eq!(
+            h.mem.read_u32(0x2000_000C).unwrap(),
+            (2.5f64.to_bits() >> 32) as u32
+        );
+        // WHEN: VLDR D2, [R1, #8]（0xED91 2B02）
+        assert_eq!(h.exec_word(0xED91_2B02), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(2), 2.5f64.to_bits());
+    }
+
+    #[test]
+    fn golden_vmov_core_double() {
+        // GIVEN: R1 = 0x89AB_CDEF，R2 = 0x0123_4567
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x89AB_CDEF;
+        h.cpu.regs[2] = 0x0123_4567;
+        // WHEN: VMOV D0, R1, R2（0xEC42 1B10）
+        assert_eq!(h.exec_word(0xEC42_1B10), ExecOutcome::Continue);
+        // THEN: D0 = 0x0123_4567_89AB_CDEF
+        assert_eq!(h.cpu.fpu.read_d(0), 0x0123_4567_89AB_CDEF);
+        // WHEN: VMOV R3, R4, D0（0xEC54 3B10：Rt2=R4）
+        assert_eq!(h.exec_word(0xEC54_3B10), ExecOutcome::Continue);
+        // THEN: R3 = 低 32 位，R4 = 高 32 位
+        assert_eq!(h.cpu.regs[3], 0x89AB_CDEF);
+        assert_eq!(h.cpu.regs[4], 0x0123_4567);
+    }
+
+    #[test]
+    fn golden_vldr_unaligned_faults() {
+        // GIVEN: R1 = 0x2000_0002（非 4 字节对齐）
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x2000_0002;
+        // WHEN: VLDR S0, [R1]（0xED91 0A00）
+        let outcome = h.exec_word(0xED91_0A00);
+        // THEN: UnalignedAccess 故障，S0 不变
+        assert_eq!(
+            outcome,
+            ExecOutcome::Fault {
+                reason: crate::engine::FaultReason::UnalignedAccess {
+                    address: 0x2000_0002
+                }
+            }
+        );
     }
 }

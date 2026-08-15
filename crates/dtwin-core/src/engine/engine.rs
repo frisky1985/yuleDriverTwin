@@ -170,32 +170,46 @@ mod tests {
         assert_eq!(eng.stats.instructions, 1);
     }
 
-    /// 取指→解码→执行 全链路：SSAT 饱和运算（DSP）
+    /// 取指→解码→执行 全链路：SSAT 饱和运算 + VADD.F32 浮点加法
     #[test]
-    fn engine_full_pipeline_dsp() {
-        // GIVEN: 内存中放置 SSAT R0, #8, R1（0xF301 0007，R1 = 200 → 饱和 127）
+    fn engine_full_pipeline_dsp_and_fpu() {
+        // GIVEN: 内存中依次放置
+        //   SSAT R0, #8, R1（0xF301 0007，R1 = 200 → 饱和 127）
+        //   VADD.F32 S0, S1, S2（0xEE30 0A81，S1=1.0, S2=2.0 → 3.0）
         let mut cpu = CpuState::default();
         let mut mem = Memory::test_ram();
         let mut nvic = Nvic::new();
         let mut eng = Engine::new();
         cpu.regs[15] = 0;
         cpu.regs[1] = 200;
-        // 半字 0xF301 在前（低位地址），小端字节序
+        cpu.fpu.write_s(1, 1.0f32.to_bits());
+        cpu.fpu.write_s(2, 2.0f32.to_bits());
+        // SSAT 编码 0xF301_0007：半字 0xF301 在前（低位地址），小端字节序
         mem.flash[0] = 0x01;
         mem.flash[1] = 0xF3;
         mem.flash[2] = 0x07;
         mem.flash[3] = 0x00;
+        // VADD.F32 编码 0xEE30_0A81
+        mem.flash[4] = 0x30;
+        mem.flash[5] = 0xEE;
+        mem.flash[6] = 0x81;
+        mem.flash[7] = 0x0A;
 
-        // WHEN: 单步执行
+        // WHEN: 连续单步执行两条指令
+        assert_eq!(
+            eng.step(&mut cpu, &mut mem, &mut nvic),
+            EngineResult::Halted
+        );
         assert_eq!(
             eng.step(&mut cpu, &mut mem, &mut nvic),
             EngineResult::Halted
         );
 
-        // THEN: R0 = 127（SSAT 饱和），Q 置位
+        // THEN: R0 = 127（SSAT 饱和），Q 置位；S0 = 3.0（VADD）
         assert_eq!(cpu.regs[0], 127);
         assert_ne!(cpu.xpsr & (1 << 27), 0);
-        assert_eq!(cpu.regs[15], 4);
-        assert_eq!(eng.stats.instructions, 1);
+        assert_eq!(cpu.fpu.read_s(0), 3.0f32.to_bits());
+        assert_eq!(cpu.regs[15], 8);
+        assert_eq!(eng.stats.instructions, 2);
     }
 }

@@ -11,6 +11,8 @@ pub mod nvic;
 pub mod peripheral;
 pub mod register;
 
+use engine::fpu::FpuRegisters;
+
 /// 支持的 Cortex-M 内核型号
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreType {
@@ -54,6 +56,8 @@ pub struct CpuState {
     pub faultmask: u8,
     pub basepri: u8,
     pub control: u8,
+    /// FPU 寄存器文件（S0-S31/D0-D15 + FPSCR）
+    pub fpu: FpuRegisters,
 }
 
 #[cfg(test)]
