@@ -99,7 +99,12 @@ impl Executor {
                 imm,
                 flags,
             } => {
-                let a = cpu.regs[*rn as usize];
+                let a = if *rn == 15 {
+                    // ADR 语义：Rn=PC 时基址 = Align(PC+4, 4)
+                    (cpu.regs[15].wrapping_add(4)) & !3
+                } else {
+                    cpu.regs[*rn as usize]
+                };
                 let b = match (rm, imm) {
                     (Some(r), _) => cpu.regs[*r as usize],
                     (_, Some(v)) => *v,
@@ -132,32 +137,76 @@ impl Executor {
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
             }
-            Instruction::And { rd, rn, rm, flags } => {
-                let result = cpu.regs[*rn as usize] & cpu.regs[*rm as usize];
+            Instruction::And {
+                rd,
+                rn,
+                rm,
+                imm,
+                flags,
+            } => {
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
+                let result = cpu.regs[*rn as usize] & b;
                 if *flags {
                     self.update_flags_logical(cpu, result);
                 }
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
             }
-            Instruction::Orr { rd, rn, rm, flags } => {
-                let result = cpu.regs[*rn as usize] | cpu.regs[*rm as usize];
+            Instruction::Orr {
+                rd,
+                rn,
+                rm,
+                imm,
+                flags,
+            } => {
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
+                let result = cpu.regs[*rn as usize] | b;
                 if *flags {
                     self.update_flags_logical(cpu, result);
                 }
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
             }
-            Instruction::Eor { rd, rn, rm, flags } => {
-                let result = cpu.regs[*rn as usize] ^ cpu.regs[*rm as usize];
+            Instruction::Eor {
+                rd,
+                rn,
+                rm,
+                imm,
+                flags,
+            } => {
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
+                let result = cpu.regs[*rn as usize] ^ b;
                 if *flags {
                     self.update_flags_logical(cpu, result);
                 }
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
             }
-            Instruction::Bic { rd, rn, rm, flags } => {
-                let result = cpu.regs[*rn as usize] & !cpu.regs[*rm as usize];
+            Instruction::Bic {
+                rd,
+                rn,
+                rm,
+                imm,
+                flags,
+            } => {
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
+                let result = cpu.regs[*rn as usize] & !b;
                 if *flags {
                     self.update_flags_logical(cpu, result);
                 }
@@ -245,7 +294,8 @@ impl Executor {
                 }
             }
             Instruction::BranchLink { target } => {
-                cpu.regs[14] = cpu.regs[15] - 1; // LR = PC | 1 (Thumb)
+                // LR = 下一条指令地址 | Thumb 位（PC 尚未递增，BL 恒为 32 位）
+                cpu.regs[14] = cpu.regs[15].wrapping_add(4) | 1;
                 ExecOutcome::Branch { target: *target }
             }
             Instruction::BranchExchange { rm } => {
@@ -262,7 +312,8 @@ impl Executor {
             }
             Instruction::BranchLinkExchange { rm } => {
                 let target = cpu.regs[*rm as usize];
-                cpu.regs[14] = cpu.regs[15] - 1;
+                // LR = 下一条指令地址 | Thumb 位
+                cpu.regs[14] = cpu.regs[15].wrapping_add(4) | 1;
                 if target & 1 == 0 {
                     ExecOutcome::Fault {
                         reason: super::FaultReason::UsageFault { address: target },
@@ -321,7 +372,8 @@ impl Executor {
                 ExecOutcome::Continue
             }
             Instruction::Pop { regs, pc } => {
-                // POP {reglist} — 出栈并递增 SP
+                // POP {reglist} — 出栈并递增 SP；含 pc 时以 Branch 语义设置 PC
+                // （避免引擎 Continue 路径在 PC 上再 +width）
                 let mut sp = cpu.regs[13];
                 let mut addr = sp;
                 for i in 0..8 {
@@ -353,8 +405,8 @@ impl Executor {
                             }
                         }
                     };
-                    cpu.regs[15] = val & !1; // 清 Thumb 位
-                    count += 1;
+                    cpu.regs[13] = sp.wrapping_add((count + 1) * 4);
+                    return ExecOutcome::Branch { target: val & !1 }; // 清 Thumb 位
                 }
                 cpu.regs[13] = sp.wrapping_add(count * 4);
                 ExecOutcome::Continue
@@ -366,6 +418,7 @@ impl Executor {
             } => {
                 let mut addr = cpu.regs[*rn as usize];
                 let mut last = 0u32;
+                let mut pc_val: Option<u32> = None;
                 for i in 0..16 {
                     if regs & (1 << i) != 0 {
                         let val = match memory.read_u32(addr) {
@@ -376,7 +429,12 @@ impl Executor {
                                 }
                             }
                         };
-                        cpu.regs[i] = val;
+                        if i == 15 {
+                            // LDM {.., pc}：以 Branch 语义设置 PC（避免 +width）
+                            pc_val = Some(val & !1);
+                        } else {
+                            cpu.regs[i] = val;
+                        }
                         addr += 4;
                         last = addr;
                     }
@@ -384,7 +442,10 @@ impl Executor {
                 if *writeback {
                     cpu.regs[*rn as usize] = last;
                 }
-                ExecOutcome::Continue
+                match pc_val {
+                    Some(t) => ExecOutcome::Branch { target: t },
+                    None => ExecOutcome::Continue,
+                }
             }
             Instruction::Stm {
                 rn,
@@ -460,7 +521,9 @@ impl Executor {
                 }
             }
             Instruction::LdrLiteral { rt, imm } => {
-                let addr = cpu.regs[15].wrapping_add(*imm) & !3;
+                // LDR literal：addr = Align(PC+4, 4) + imm（PC = 当前指令地址）
+                let base = (cpu.regs[15].wrapping_add(4)) & !3;
+                let addr = base.wrapping_add(*imm);
                 match memory.read_u32(addr) {
                     Ok(v) => {
                         cpu.regs[*rt as usize] = v;
@@ -1441,7 +1504,7 @@ mod tests {
             ExecOutcome::Continue
         );
         assert_eq!(cpu.regs[13], 0x2000_0FF4); // SP -= 12
-                                               // POP {R0, R1, PC}
+                                               // POP {R0, R1, PC}：含 PC → Branch 语义（引擎不再 +width）
         cpu.regs[0] = 0;
         cpu.regs[1] = 0;
         let instr = Instruction::Pop {
@@ -1450,7 +1513,9 @@ mod tests {
         };
         assert_eq!(
             ex.execute(&mut cpu, &mut mem, &instr),
-            ExecOutcome::Continue
+            ExecOutcome::Branch {
+                target: 0x0800_0000
+            }
         );
         assert_eq!(cpu.regs[0], 0x1111_1111);
         assert_eq!(cpu.regs[1], 0x2222_2222);

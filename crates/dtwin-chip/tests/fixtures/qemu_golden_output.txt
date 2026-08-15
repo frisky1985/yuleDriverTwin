@@ -1,0 +1,65 @@
+
+========================================
+ yuleASR BSW -- QEMU Simulation (S32K312)
+ Target: ARM Cortex-M7 (S32K312 register map)
+ RegMap: S32K312.h (LPUART0 + SIUL2 + SRAM)
+========================================
+
+--- S32K312 Register Map ---
+ LPUART0:      0x40180000
+ SIUL2:        0x40290000
+ SIUL2_GPIO:   0x40810000
+ MCU(SCG/SIM):0x402A0000
+ STM0:         0x40120000
+ SWT:          0x40130000
+ CAN0:         0x40050000
+ ADC0:         0x400C0000
+ PIT:          0x400E0000
+ FTM0:         0x400D0000
+ WDOG:         0x40053000
+ Flash:        0x00000000
+ SRAM:         0x20000000
+
+--- S32K312.h Address Consistency Check ---
+[CHECK] LPUART0_BASE = 0x40180000: PASS
+[CHECK] SIUL2_BASE  = 0x40290000: PASS
+[CHECK] SRAM_BASE   = 0x20000000: PASS
+[CHECK] CAN0_BASE   = 0x40050000: PASS
+
+--- MCAL Module Checks ---
+[MCU] Mcu_Init: OK (QEMU stub)
+[MCU] Mcu_InitClock: OK (simulated)
+[MCU] Mcu_DistributePllClock: OK (simulated)
+[MCU] Mcu_SetMode: OK (QEMU stub)
+[MCU] All checks: PASS
+[PORT] Port_Init: OK (QEMU stub, SIUL2 @ 0x40290000)
+[PORT]  - Would configure SIUL2 MSCR[0]: ALT0+OBE
+[PORT]  - Would set SIUL2 GPIO port D dir: output
+[PORT] Port_SetPinDirection: OK (QEMU stub)
+[PORT] All checks: PASS
+[DIO] Dio_Init: SIUL2 GPIO @ 0x40810000 (S32K312)
+[DIO] Dio_WriteChannel: OK (QEMU stub)
+[DIO] All checks: PASS
+
+--- BSW Layer Check: Type System ---
+[BSW] Std_ReturnType size valid: PASS
+[BSW] Basic type sizes valid: PASS
+
+--- Memory Test ---
+[MEM] SRAM write/read (0x20001000): PASS
+
+--- Summary ---
+[PASS] S32K312.h register map consistency
+[PASS] MCU (QEMU stub via S32K312)
+[PASS] PORT (SIUL2 via S32K312)
+[PASS] DIO  (SIUL2 GPIO via S32K312)
+[PASS] BSW type system
+[PASS] SRAM memory access
+[PASS] LPUART0 console I/O via S32K312
+
+========================================
+ All QEMU tests PASSED
+ System running. Entering idle loop.
+========================================
+
+qemu-system-arm: terminating on signal 15 from pid 26219 (<unknown process>)
