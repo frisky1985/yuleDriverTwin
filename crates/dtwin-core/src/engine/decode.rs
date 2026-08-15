@@ -106,9 +106,12 @@ pub enum Instruction {
     LdrLiteral { rt: u8, imm: u32 },
     /// 特殊寄存器访问: MRS/MSR
     MsrMrs {
+        /// 核心寄存器（MRS 的 Rd / MSR 的 Rn）
+        rt: u8,
+        /// 目标特殊寄存器
         reg: SpecialReg,
-        from_psr: bool,
-        psr: bool,
+        /// true = MRS（特殊寄存器 → 核心寄存器）；false = MSR（核心寄存器 → 特殊寄存器）
+        read: bool,
     },
     /// 软件中断: SVC
     Svc { imm8: u8 },
@@ -404,7 +407,7 @@ pub enum AccessWidth {
     Word,
 }
 
-/// 特殊寄存器
+/// 特殊寄存器（MRS/MSR 目标）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecialReg {
     Msp,
@@ -412,7 +415,17 @@ pub enum SpecialReg {
     Primask,
     Faultmask,
     Basepri,
+    /// BASEPRI_MAX：写时仅当新值更小（提高屏蔽）生效
+    BasepriMax,
     Control,
+    /// APSR（NZCV+Q，xPSR bits[31:27]）
+    Apsr,
+    /// APSR_nzcvqg：NZCV+Q+GE（xPSR bits[31:27]+[19:16]）
+    ApsrGe,
+    /// IPSR（xPSR bits[8:0]，异常号）
+    Ipsr,
+    /// EPSR（xPSR bits[24:16]，T+GE）
+    Epsr,
 }
 
 /// 指令解码器
@@ -488,13 +501,13 @@ impl Decoder {
         }
 
         // ---- Phase 3: DSP ----
-        // MRS (0xF3EF) / MSR (0xF380, low bit15=1) 保持诚实 Unimplemented
-        if top == 0xF3EF || (top == 0xF380 && (bits & 0x8000) != 0) {
-            return Instruction::MsrMrs {
-                reg: SpecialReg::Control,
-                from_psr: false,
-                psr: false,
-            };
+        // MRS (0xF3EF，低半字 bit15=1)：读特殊寄存器到 Rd
+        if top == 0xF3EF && (bits & 0x8000) != 0 {
+            return self.decode_mrs(bits);
+        }
+        // MSR (0xF38x，低半字 bit15=1)：写特殊寄存器（Rn 在 top bits[3:0]）
+        if (top & 0xFFF0) == 0xF380 && (bits & 0x8000) != 0 {
+            return self.decode_msr(bits);
         }
         // SSAT (0xF30x/0xF32x) / USAT (0xF38x/0xF3Ax，low bit15=0)
         if (top & 0xFFD0) == 0xF300 || ((top & 0xFFD0) == 0xF380 && (bits & 0x8000) == 0) {
@@ -555,6 +568,55 @@ impl Decoder {
         Instruction::Unimplemented { bits }
     }
 
+    /// 解码 MRS（0xF3EF，低半字 10R0 Rd 0000 0000 SYSm）
+    /// SYSm 编码表（ARM DDI 0406C B3.3）：0x00=APSR、0x05=IPSR、0x06=EPSR、
+    /// 0x08=MSP、0x09=PSP、0x10=PRIMASK、0x11=BASEPRI、0x13=FAULTMASK、0x14=CONTROL。
+    /// 不支持的 SYSm（含 0x12 BASEPRI_MAX，读为 UNPREDICTABLE）→ 诚实 Unimplemented。
+    fn decode_mrs(&self, bits: u32) -> Instruction {
+        let rd = ((bits >> 8) & 0xF) as u8;
+        let sysm = (bits & 0xFF) as u8;
+        let reg = match sysm {
+            0x00 => SpecialReg::Apsr,
+            0x01 | 0x02 => SpecialReg::ApsrGe,
+            0x05 => SpecialReg::Ipsr,
+            0x06 => SpecialReg::Epsr,
+            0x08 => SpecialReg::Msp,
+            0x09 => SpecialReg::Psp,
+            0x10 => SpecialReg::Primask,
+            0x11 => SpecialReg::Basepri,
+            0x13 => SpecialReg::Faultmask,
+            0x14 => SpecialReg::Control,
+            _ => return Instruction::Unimplemented { bits },
+        };
+        Instruction::MsrMrs { rt: rd, reg, read: true }
+    }
+
+    /// 解码 MSR（0xF38x，低半字 10R0 Rn 0000 mask SYSm）
+    /// mask bit10（低半字 bit10）=1 时 APSR 同时写 GE（APSR_nzcvqg）。
+    fn decode_msr(&self, bits: u32) -> Instruction {
+        let rn = ((bits >> 16) & 0xF) as u8;
+        let sysm = (bits & 0xFF) as u8;
+        let ge = (bits & 0x0400) != 0;
+        let reg = match sysm {
+            0x00 => {
+                if ge {
+                    SpecialReg::ApsrGe
+                } else {
+                    SpecialReg::Apsr
+                }
+            }
+            0x08 => SpecialReg::Msp,
+            0x09 => SpecialReg::Psp,
+            0x10 => SpecialReg::Primask,
+            0x11 => SpecialReg::Basepri,
+            0x12 => SpecialReg::BasepriMax,
+            0x13 => SpecialReg::Faultmask,
+            0x14 => SpecialReg::Control,
+            _ => return Instruction::Unimplemented { bits },
+        };
+        Instruction::MsrMrs { rt: rn, reg, read: false }
+    }
+
     /// 解码 SSAT/USAT（0xF30x 有符号 / 0xF38x 无符号）
     fn decode_sat(&self, bits: u32) -> Instruction {
         let top = (bits >> 16) as u16;
@@ -583,9 +645,7 @@ impl Decoder {
             shift_kind,
             shift_imm: imm5 as u8,
         }
-    }
-
-    /// 解码 QADD/QSUB/QDADD/QDSUB（top=0xFA8x，低半字 bits[7:4]=1000-1011）
+    }    /// 解码 QADD/QSUB/QDADD/QDSUB（top=0xFA8x，低半字 bits[7:4]=1000-1011）
     /// 编码布局（汇编器验证）：top bits[3:0] = Rn，低半字 bits[3:0] = Rm
     fn decode_qaddsub(&self, bits: u32) -> Instruction {
         let rn = ((bits >> 16) & 0xF) as u8;
@@ -1405,6 +1465,167 @@ mod tests {
                 cond: Some(Cond::Ne),
                 target: 0x1000 + 4 + 12,
             }
+        );
+    }
+
+    // ============ P2-补：MRS/MSR 解码（编码经 arm-none-eabi-as 实测） ============
+
+    /// MRS 解码：APSR/IPSR/EPSR/PRIMASK/BASEPRI/FAULTMASK/CONTROL/MSP/PSP
+    #[test]
+    fn decode_mrs_variants() {
+        let mut d = Decoder::new();
+        // MRS r0, APSR = 0xF3EF 8000
+        assert_eq!(
+            d.decode_word(0xF3EF_8000, 0),
+            Instruction::MsrMrs {
+                rt: 0,
+                reg: SpecialReg::Apsr,
+                read: true,
+            }
+        );
+        // MRS r0, IPSR = 0xF3EF 8005
+        assert_eq!(
+            d.decode_word(0xF3EF_8005, 0),
+            Instruction::MsrMrs {
+                rt: 0,
+                reg: SpecialReg::Ipsr,
+                read: true,
+            }
+        );
+        // MRS r0, EPSR = 0xF3EF 8006
+        assert_eq!(
+            d.decode_word(0xF3EF_8006, 0),
+            Instruction::MsrMrs {
+                rt: 0,
+                reg: SpecialReg::Epsr,
+                read: true,
+            }
+        );
+        // MRS r0, PRIMASK = 0xF3EF 8010
+        assert_eq!(
+            d.decode_word(0xF3EF_8010, 0),
+            Instruction::MsrMrs {
+                rt: 0,
+                reg: SpecialReg::Primask,
+                read: true,
+            }
+        );
+        // MRS r3, CONTROL = 0xF3EF 8314（Rd = r3）
+        assert_eq!(
+            d.decode_word(0xF3EF_8314, 0),
+            Instruction::MsrMrs {
+                rt: 3,
+                reg: SpecialReg::Control,
+                read: true,
+            }
+        );
+        // MRS r0, MSP = 0xF3EF 8008
+        assert_eq!(
+            d.decode_word(0xF3EF_8008, 0),
+            Instruction::MsrMrs {
+                rt: 0,
+                reg: SpecialReg::Msp,
+                read: true,
+            }
+        );
+        // MRS r1, FAULTMASK = 0xF3EF 8113
+        assert_eq!(
+            d.decode_word(0xF3EF_8113, 0),
+            Instruction::MsrMrs {
+                rt: 1,
+                reg: SpecialReg::Faultmask,
+                read: true,
+            }
+        );
+    }
+
+    /// MSR 解码：寄存器形式（APSR/PRIMASK/BASEPRI/BASEPRI_MAX/FAULTMASK/CONTROL/MSP/PSP）
+    #[test]
+    fn decode_msr_variants() {
+        let mut d = Decoder::new();
+        // MSR APSR_nzcvq, r1 = 0xF381 8800
+        assert_eq!(
+            d.decode_word(0xF381_8800, 0),
+            Instruction::MsrMrs {
+                rt: 1,
+                reg: SpecialReg::Apsr,
+                read: false,
+            }
+        );
+        // MSR APSR_nzcvqg, r1 = 0xF381 8C00（mask bit10 → GE）
+        assert_eq!(
+            d.decode_word(0xF381_8C00, 0),
+            Instruction::MsrMrs {
+                rt: 1,
+                reg: SpecialReg::ApsrGe,
+                read: false,
+            }
+        );
+        // MSR PRIMASK, r2 = 0xF382 8810
+        assert_eq!(
+            d.decode_word(0xF382_8810, 0),
+            Instruction::MsrMrs {
+                rt: 2,
+                reg: SpecialReg::Primask,
+                read: false,
+            }
+        );
+        // MSR BASEPRI_MAX, r4 = 0xF384 8812
+        assert_eq!(
+            d.decode_word(0xF384_8812, 0),
+            Instruction::MsrMrs {
+                rt: 4,
+                reg: SpecialReg::BasepriMax,
+                read: false,
+            }
+        );
+        // MSR CONTROL, r6 = 0xF386 8814
+        assert_eq!(
+            d.decode_word(0xF386_8814, 0),
+            Instruction::MsrMrs {
+                rt: 6,
+                reg: SpecialReg::Control,
+                read: false,
+            }
+        );
+        // MSR MSP, r7 = 0xF387 8808
+        assert_eq!(
+            d.decode_word(0xF387_8808, 0),
+            Instruction::MsrMrs {
+                rt: 7,
+                reg: SpecialReg::Msp,
+                read: false,
+            }
+        );
+        // MSR PSP, r8 = 0xF388 8809
+        assert_eq!(
+            d.decode_word(0xF388_8809, 0),
+            Instruction::MsrMrs {
+                rt: 8,
+                reg: SpecialReg::Psp,
+                read: false,
+            }
+        );
+    }
+
+    /// 未知 SYSm → 诚实 Unimplemented（MRS 0x12 BASEPRI_MAX 读为 UNPREDICTABLE；MSR 未知字段）
+    #[test]
+    fn decode_mrs_msr_unknown_sysm() {
+        let mut d = Decoder::new();
+        // MRS r0, #0x99（未定义 SYSm）
+        assert_eq!(
+            d.decode_word(0xF3EF_8099, 0),
+            Instruction::Unimplemented { bits: 0xF3EF_8099 }
+        );
+        // MRS BASEPRI_MAX（0x12）：读为 UNPREDICTABLE → Unimplemented
+        assert_eq!(
+            d.decode_word(0xF3EF_8012, 0),
+            Instruction::Unimplemented { bits: 0xF3EF_8012 }
+        );
+        // MSR 未知 SYSm（0x20）
+        assert_eq!(
+            d.decode_word(0xF382_8820, 0),
+            Instruction::Unimplemented { bits: 0xF382_8820 }
         );
     }
 }

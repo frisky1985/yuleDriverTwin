@@ -5,7 +5,7 @@
 
 use super::decode::{
     AccessWidth, Cond, DspShiftKind, FpArithOp, FpCvtOp, FpUnaryOp, Instruction, LoadStoreOffset,
-    QAddKind, ShiftAmount, ShiftKind,
+    QAddKind, ShiftAmount, ShiftKind, SpecialReg,
 };
 use super::{dsp, fpu};
 use crate::memory::{Memory, MemoryFault};
@@ -445,11 +445,49 @@ impl Executor {
                     },
                 }
             }
-            Instruction::MsrMrs { .. } => {
-                // MRS/MSR 尚未在 decode 中实现（32-bit Thumb-2 0xF3EF/0xF380），保持诚实 Unimplemented
-                ExecOutcome::Fault {
-                    reason: super::FaultReason::UnimplementedInstr,
+            Instruction::MsrMrs { rt, reg, read } => {
+                if *read {
+                    // MRS：特殊寄存器 → 核心寄存器
+                    let v = match reg {
+                        SpecialReg::Apsr => cpu.xpsr & 0xF800_0000,
+                        SpecialReg::ApsrGe => cpu.xpsr & 0xF8FF_0000,
+                        SpecialReg::Ipsr => cpu.xpsr & 0x1FF,
+                        SpecialReg::Epsr => cpu.xpsr & 0x01FF_0000,
+                        SpecialReg::Msp => cpu.msp,
+                        SpecialReg::Psp => cpu.psp,
+                        SpecialReg::Primask => cpu.primask as u32,
+                        SpecialReg::Faultmask => cpu.faultmask as u32,
+                        SpecialReg::Basepri => cpu.basepri as u32,
+                        // BASEPRI_MAX 读为 UNPREDICTABLE（解码已拒绝，不可达）
+                        SpecialReg::BasepriMax => cpu.basepri as u32,
+                        SpecialReg::Control => cpu.control as u32,
+                    };
+                    cpu.regs[*rt as usize] = v;
+                } else {
+                    // MSR：核心寄存器 → 特殊寄存器
+                    let v = cpu.regs[*rt as usize];
+                    match reg {
+                        SpecialReg::Apsr => {
+                            cpu.xpsr = (cpu.xpsr & !0xF800_0000) | (v & 0xF800_0000)
+                        }
+                        SpecialReg::ApsrGe => {
+                            cpu.xpsr = (cpu.xpsr & !0xF8FF_0000) | (v & 0xF8FF_0000)
+                        }
+                        // IPSR/EPSR 只读：写被忽略（ARM 语义 UNPREDICTABLE，保守忽略）
+                        SpecialReg::Ipsr | SpecialReg::Epsr => {}
+                        SpecialReg::Msp => cpu.msp = v,
+                        SpecialReg::Psp => cpu.psp = v,
+                        SpecialReg::Primask => cpu.primask = (v & 1) as u8,
+                        SpecialReg::Faultmask => cpu.faultmask = (v & 1) as u8,
+                        SpecialReg::Basepri => cpu.basepri = (v & 0xFF) as u8,
+                        // BASEPRI_MAX：仅当新值更小（提高屏蔽）时生效 → min
+                        SpecialReg::BasepriMax => {
+                            cpu.basepri = cpu.basepri.min((v & 0xFF) as u8)
+                        }
+                        SpecialReg::Control => cpu.control = (v & 0x3) as u8,
+                    }
                 }
+                ExecOutcome::Continue
             }
             Instruction::Svc { imm8 } => {
                 // SVC → SVCall 异常（异常号 11）
@@ -1457,6 +1495,103 @@ mod tests {
         assert_eq!(
             ex.execute(&mut cpu, &mut mem, &instr),
             ExecOutcome::Continue
+        );
+    }
+
+    // ============ P2-补：MRS/MSR golden（编码经 arm-none-eabi-as 实测） ============
+
+    /// MSR PRIMASK → MRS 读回；MSR APSR → MRS APSR 读回标志位
+    #[test]
+    fn golden_msr_mrs_roundtrip() {
+        let mut h = crate::engine::test_util::Harness::new();
+        // GIVEN: R2 = 1（置 PRIMASK）
+        h.cpu.regs[2] = 1;
+        // WHEN: MSR PRIMASK, r2（0xF382 8810：Rn=r2，SYSm=0x10）
+        assert_eq!(h.exec_word(0xF382_8810), ExecOutcome::Continue);
+        // THEN: cpu.primask = 1
+        assert_eq!(h.cpu.primask, 1);
+        // WHEN: MRS r3, PRIMASK（0xF3EF 8310：Rd=r3，SYSm=0x10）
+        assert_eq!(h.exec_word(0xF3EF_8310), ExecOutcome::Continue);
+        // THEN: R3 = 1
+        assert_eq!(h.cpu.regs[3], 1);
+    }
+
+    /// MRS APSR 读回 NZCVQ 标志；MSR APSR 写入标志位
+    #[test]
+    fn golden_msr_mrs_apsr() {
+        let mut h = crate::engine::test_util::Harness::new();
+        // GIVEN: xPSR 置 N=1, Z=1
+        h.cpu.xpsr = (1 << 31) | (1 << 30);
+        // WHEN: MRS r0, APSR（0xF3EF 8000）
+        assert_eq!(h.exec_word(0xF3EF_8000), ExecOutcome::Continue);
+        // THEN: R0 = 0xC000_0000（NZCVQ 位）
+        assert_eq!(h.cpu.regs[0], 0xC000_0000);
+        // WHEN: MSR APSR_nzcvq, r1（0xF381 8800，R1 = 0x8000_0000 → 置 N）
+        h.cpu.regs[1] = 0x8000_0000;
+        h.cpu.xpsr = 0;
+        assert_eq!(h.exec_word(0xF381_8800), ExecOutcome::Continue);
+        // THEN: xPSR N 置位，低位不受影响
+        assert_eq!(h.cpu.xpsr, 0x8000_0000);
+        // MRS APSR_nzcvqgt（0xF3EF 8002）读回
+        h.cpu.xpsr = (1 << 27) | (0b1010 << 16); // Q + GE=1010
+        assert_eq!(h.exec_word(0xF3EF_8002), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], (1 << 27) | (0b1010 << 16));
+    }
+
+    /// MSR CONTROL / MSP / PSP / FAULTMASK / BASEPRI_MAX 语义
+    #[test]
+    fn golden_msr_special_regs() {
+        let mut h = crate::engine::test_util::Harness::new();
+        // MSR CONTROL, r6（0xF386 8814，R6 = 0x3）
+        h.cpu.regs[6] = 0x3;
+        assert_eq!(h.exec_word(0xF386_8814), ExecOutcome::Continue);
+        assert_eq!(h.cpu.control, 0x3);
+        // MSR MSP, r7（0xF387 8808，R7 = 0x2000_1000）
+        h.cpu.regs[7] = 0x2000_1000;
+        assert_eq!(h.exec_word(0xF387_8808), ExecOutcome::Continue);
+        assert_eq!(h.cpu.msp, 0x2000_1000);
+        // MRS r0, MSP（0xF3EF 8008）
+        assert_eq!(h.exec_word(0xF3EF_8008), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x2000_1000);
+        // MSR FAULTMASK, r5（0xF385 8813，R5 = 0x1）
+        h.cpu.regs[5] = 1;
+        assert_eq!(h.exec_word(0xF385_8813), ExecOutcome::Continue);
+        assert_eq!(h.cpu.faultmask, 1);
+        // MRS r4, FAULTMASK（0xF3EF 8413）
+        assert_eq!(h.exec_word(0xF3EF_8413), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[4], 1);
+    }
+
+    /// BASEPRI_MAX：只降不升（提高屏蔽），min 语义
+    #[test]
+    fn golden_basepri_max_semantics() {
+        let mut h = crate::engine::test_util::Harness::new();
+        // GIVEN: BASEPRI = 0x60（屏蔽较少）
+        h.cpu.basepri = 0x60;
+        // WHEN: MSR BASEPRI_MAX, r4（0xF384 8812，R4 = 0x50 → 更小 → 生效）
+        h.cpu.regs[4] = 0x50;
+        assert_eq!(h.exec_word(0xF384_8812), ExecOutcome::Continue);
+        // THEN: BASEPRI = 0x50
+        assert_eq!(h.cpu.basepri, 0x50);
+        // WHEN: 再次写 0x70（更大 → 忽略，不解除屏蔽）
+        h.cpu.regs[4] = 0x70;
+        assert_eq!(h.exec_word(0xF384_8812), ExecOutcome::Continue);
+        // THEN: BASEPRI 保持 0x50
+        assert_eq!(h.cpu.basepri, 0x50);
+    }
+
+    /// 未知 SYSm → 诚实 Unimplemented 故障（不假装实现）
+    #[test]
+    fn golden_mrs_unknown_sysm_faults() {
+        let mut h = crate::engine::test_util::Harness::new();
+        // WHEN: MRS r0, #0x99（0xF3EF 8099）
+        let out = h.exec_word(0xF3EF_8099);
+        // THEN: UnimplementedInstr 故障
+        assert_eq!(
+            out,
+            ExecOutcome::Fault {
+                reason: crate::engine::FaultReason::UnimplementedInstr,
+            }
         );
     }
 }
