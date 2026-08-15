@@ -68,6 +68,32 @@ pub enum Instruction {
         imm: Option<u32>,
         flags: bool,
     },
+    /// 带进位加法: ADC Rd, Rn, Rm（Rd = Rn + Rm + C）
+    Adc {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        flags: bool,
+    },
+    /// 带借位减法: SBC Rd, Rn, Rm（Rd = Rn - Rm - NOT(C)）
+    Sbc {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        flags: bool,
+    },
+    /// 取负: NEG Rd, Rm（= RSB Rd, Rm, #0，Rd = 0 - Rm）
+    Neg {
+        rd: u8,
+        rn: u8,
+        flags: bool,
+    },
+    /// 按位取反: MVN Rd, Rm（Rd = ~Rm）
+    Mvn {
+        rd: u8,
+        rm: u8,
+        flags: bool,
+    },
     /// 乘法
     Mul { rd: u8, rn: u8, rm: u8, flags: bool },
     /// 无符号除法
@@ -1373,15 +1399,124 @@ impl Decoder {
 
     /// 0x4000-0x47FF：寄存器数据处理（bit10=0）+ 高寄存器 ADD/CMP/MOV + BX/BLX（bit10=1）
     ///
+    /// bit10=0（0x4000-0x43FF）为真实 Thumb-1 寄存器数据处理组：
+    /// `010000 op[3:0] Rm Rd`（op = bits[9:6]），十六种操作：
+    ///   AND/EOR/LSL(reg)/LSR(reg)/ASR(reg)/ADC/SBC/ROR(reg)/TST/NEG/CMP/CMN/ORR/MUL/BIC/MVN
+    /// 除 MUL 外全部更新标志（ARMv7E-M 语义：MUL 不更新 flags；编码与 GNU as 实测一致）。
+    /// 寄存器移位（LSL/LSR/ASR/ROR reg 形式）的移位量 Rs = bits[5:3]，Rd 既是源也是目的。
+    ///
     /// bit10=1 时（0x4400-0x47FF）：
     ///   op = bits[9:8]：00=ADD、01=CMP、10=MOV（H1=bit7 / H2=bit6 扩展高位寄存器）、
     ///   11=BX（bit5=0）/ BLX（bit5=1）
     fn decode_data_proc_high(&self, bits: u16) -> Instruction {
         if (bits >> 10) & 1 == 0 {
-            // 0x4000-0x43FF：寄存器数据处理。保留原简化解码（MOV/CMP/ADD/SUB 组，
-            // 注释已注明局限：真实编码为 010000-011111 十六种按位/移位/比较操作，
-            // 引擎未完整建模；当前固件不涉及，见 tech-debt）
-            self.decode_mov_cmp_add_sub_reg(bits)
+            let rd = (bits & 0x7) as u8;
+            let rm = ((bits >> 3) & 0x7) as u8;
+            match ((bits >> 6) & 0xF) as u8 {
+                // 0000 ANDS Rd, Rd, Rm
+                0x0 => Instruction::And {
+                    rd,
+                    rn: rd,
+                    rm: Some(rm),
+                    imm: None,
+                    flags: true,
+                },
+                // 0001 EORS Rd, Rd, Rm
+                0x1 => Instruction::Eor {
+                    rd,
+                    rn: rd,
+                    rm: Some(rm),
+                    imm: None,
+                    flags: true,
+                },
+                // 0010 LSLS Rd, Rd, Rs（寄存器移位：Rd 同时是源与目的，Rs = bits[5:3]）
+                0x2 => Instruction::Shift {
+                    rd,
+                    rm: rd,
+                    kind: ShiftKind::Lsl,
+                    amount: ShiftAmount::Register(rm),
+                    flags: true,
+                },
+                // 0011 LSRS Rd, Rd, Rs
+                0x3 => Instruction::Shift {
+                    rd,
+                    rm: rd,
+                    kind: ShiftKind::Lsr,
+                    amount: ShiftAmount::Register(rm),
+                    flags: true,
+                },
+                // 0100 ASRS Rd, Rd, Rs
+                0x4 => Instruction::Shift {
+                    rd,
+                    rm: rd,
+                    kind: ShiftKind::Asr,
+                    amount: ShiftAmount::Register(rm),
+                    flags: true,
+                },
+                // 0101 ADCS Rd, Rd, Rm
+                0x5 => Instruction::Adc {
+                    rd,
+                    rn: rd,
+                    rm,
+                    flags: true,
+                },
+                // 0110 SBCS Rd, Rd, Rm
+                0x6 => Instruction::Sbc {
+                    rd,
+                    rn: rd,
+                    rm,
+                    flags: true,
+                },
+                // 0111 RORS Rd, Rd, Rs
+                0x7 => Instruction::Shift {
+                    rd,
+                    rm: rd,
+                    kind: ShiftKind::Ror,
+                    amount: ShiftAmount::Register(rm),
+                    flags: true,
+                },
+                // 1000 TST Rd, Rm
+                0x8 => Instruction::Tst { rn: rd, rm },
+                // 1001 NEGS Rd, Rm（= RSB Rd, Rm, #0）
+                0x9 => Instruction::Neg {
+                    rd,
+                    rn: rm,
+                    flags: true,
+                },
+                // 1010 CMP Rd, Rm
+                0xA => Instruction::Cmp {
+                    rn: rd,
+                    rm: Some(rm),
+                    imm: None,
+                },
+                // 1011 CMN Rd, Rm
+                0xB => Instruction::Cmn { rn: rd, rm },
+                // 1100 ORRS Rd, Rd, Rm
+                0xC => Instruction::Orr {
+                    rd,
+                    rn: rd,
+                    rm: Some(rm),
+                    imm: None,
+                    flags: true,
+                },
+                // 1101 MULS Rd, Rm, Rd（ARMv7E-M：不更新 flags）
+                0xD => Instruction::Mul {
+                    rd,
+                    rn: rd,
+                    rm,
+                    flags: false,
+                },
+                // 1110 BICS Rd, Rd, Rm
+                0xE => Instruction::Bic {
+                    rd,
+                    rn: rd,
+                    rm: Some(rm),
+                    imm: None,
+                    flags: true,
+                },
+                // 1111 MVNS Rd, Rm
+                _ => Instruction::Mvn { rd, rm, flags: true },
+            }
         } else {
             let h1 = (bits >> 7) & 1;
             let h2 = (bits >> 6) & 1;
@@ -1535,36 +1670,6 @@ impl Decoder {
             }
             _ => Instruction::Unimplemented {
                 bits: bits as u32,
-            },
-        }
-    }
-
-    /// MOV/CMP/ADD/SUB 寄存器: 010 0/1 xxxxx xxxxx
-    fn decode_mov_cmp_add_sub_reg(&self, bits: u16) -> Instruction {
-        let rd = (bits & 0x7) as u8;
-        let rn = rd;
-        let rm = ((bits >> 3) & 0x7) as u8;
-        let op = (bits >> 6) & 0x3;
-        match op {
-            0 => Instruction::Mov { rd, rm, imm: None },
-            1 => Instruction::Cmp {
-                rn,
-                rm: Some(rm),
-                imm: None,
-            },
-            2 => Instruction::Add {
-                rd,
-                rn,
-                rm: Some(rm),
-                imm: None,
-                flags: true,
-            },
-            _ => Instruction::Sub {
-                rd,
-                rn,
-                rm: Some(rm),
-                imm: None,
-                flags: true,
             },
         }
     }
@@ -2617,6 +2722,168 @@ fn decode_data_proc_imm() {
             rn: 3,
             rm: None,
             imm: Some(0xA5A5_A5A5),
+        }
+    );
+}
+
+/// 16-bit 寄存器数据处理组（0x4000-0x43FF）完整解码——十六种操作映射
+/// （编码与 arm-none-eabi-as 实测一致：0x401A=ANDS r2,r3 … 0x43DA=MVNS r2,r3）
+#[test]
+fn decode_data_proc_reg_16ops() {
+    let mut d = Decoder::new();
+    // 0000 ANDS r2, r3（0x401A）
+    assert_eq!(
+        d.decode_halfword(0x401A, 0),
+        Instruction::And {
+            rd: 2,
+            rn: 2,
+            rm: Some(3),
+            imm: None,
+            flags: true,
+        }
+    );
+    // 0001 EORS r2, r3（0x405A）
+    assert_eq!(
+        d.decode_halfword(0x405A, 0),
+        Instruction::Eor {
+            rd: 2,
+            rn: 2,
+            rm: Some(3),
+            imm: None,
+            flags: true,
+        }
+    );
+    // 0010 LSLS r2, r5（0x40AA：Rd=bits[2:0]=r2，Rs=bits[5:3]=r5，源=目的=r2）
+    assert_eq!(
+        d.decode_halfword(0x40AA, 0),
+        Instruction::Shift {
+            rd: 2,
+            rm: 2,
+            kind: ShiftKind::Lsl,
+            amount: ShiftAmount::Register(5),
+            flags: true,
+        }
+    );
+    // 0011 LSRS r2, r5（0x40EA）
+    assert_eq!(
+        d.decode_halfword(0x40EA, 0),
+        Instruction::Shift {
+            rd: 2,
+            rm: 2,
+            kind: ShiftKind::Lsr,
+            amount: ShiftAmount::Register(5),
+            flags: true,
+        }
+    );
+    // 0100 ASRS r2, r5（0x412A）
+    assert_eq!(
+        d.decode_halfword(0x412A, 0),
+        Instruction::Shift {
+            rd: 2,
+            rm: 2,
+            kind: ShiftKind::Asr,
+            amount: ShiftAmount::Register(5),
+            flags: true,
+        }
+    );
+    // 0101 ADCS r2, r3（0x415A）
+    assert_eq!(
+        d.decode_halfword(0x415A, 0),
+        Instruction::Adc {
+            rd: 2,
+            rn: 2,
+            rm: 3,
+            flags: true,
+        }
+    );
+    // 0110 SBCS r2, r3（0x419A）
+    assert_eq!(
+        d.decode_halfword(0x419A, 0),
+        Instruction::Sbc {
+            rd: 2,
+            rn: 2,
+            rm: 3,
+            flags: true,
+        }
+    );
+    // 0111 RORS r2, r5（0x41EA）
+    assert_eq!(
+        d.decode_halfword(0x41EA, 0),
+        Instruction::Shift {
+            rd: 2,
+            rm: 2,
+            kind: ShiftKind::Ror,
+            amount: ShiftAmount::Register(5),
+            flags: true,
+        }
+    );
+    // 1000 TST r2, r3（0x421A）
+    assert_eq!(
+        d.decode_halfword(0x421A, 0),
+        Instruction::Tst { rn: 2, rm: 3 }
+    );
+    // 1001 NEGS r2, r3（0x425A：Rd=bits[2:0]=r2，源 Rn=bits[5:3]=r3）
+    assert_eq!(
+        d.decode_halfword(0x425A, 0),
+        Instruction::Neg {
+            rd: 2,
+            rn: 3,
+            flags: true,
+        }
+    );
+    // 1010 CMP r2, r3（0x429A）
+    assert_eq!(
+        d.decode_halfword(0x429A, 0),
+        Instruction::Cmp {
+            rn: 2,
+            rm: Some(3),
+            imm: None,
+        }
+    );
+    // 1011 CMN r2, r3（0x42DA）
+    assert_eq!(
+        d.decode_halfword(0x42DA, 0),
+        Instruction::Cmn { rn: 2, rm: 3 }
+    );
+    // 1100 ORRS r2, r3（0x431A）
+    assert_eq!(
+        d.decode_halfword(0x431A, 0),
+        Instruction::Orr {
+            rd: 2,
+            rn: 2,
+            rm: Some(3),
+            imm: None,
+            flags: true,
+        }
+    );
+    // 1101 MULS r2, r3（0x435A：ARMv7E-M 不更新 flags）
+    assert_eq!(
+        d.decode_halfword(0x435A, 0),
+        Instruction::Mul {
+            rd: 2,
+            rn: 2,
+            rm: 3,
+            flags: false,
+        }
+    );
+    // 1110 BICS r2, r3（0x439A）
+    assert_eq!(
+        d.decode_halfword(0x439A, 0),
+        Instruction::Bic {
+            rd: 2,
+            rn: 2,
+            rm: Some(3),
+            imm: None,
+            flags: true,
+        }
+    );
+    // 1111 MVNS r2, r3（0x43DA）
+    assert_eq!(
+        d.decode_halfword(0x43DA, 0),
+        Instruction::Mvn {
+            rd: 2,
+            rm: 3,
+            flags: true,
         }
     );
 }

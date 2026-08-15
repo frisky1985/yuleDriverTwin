@@ -213,6 +213,73 @@ impl Executor {
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
             }
+            Instruction::Adc {
+                rd,
+                rn,
+                rm,
+                flags,
+            } => {
+                let a = cpu.regs[*rn as usize];
+                let b = cpu.regs[*rm as usize];
+                let cin = (cpu.xpsr >> 29) & 1; // APSR.C
+                // 33 位扩展精度：ext = a + b + C（精确值 0..2^33）
+                let ext = (a as u64) + (b as u64) + (cin as u64);
+                let result = (ext & 0xFFFF_FFFF) as u32;
+                if *flags {
+                    // C = 进位输出（bit32）；V = 进位进符号位(bit31) XOR 进位出符号位(bit32)
+                    self.update_flags_add3(cpu, a, b, ext, result);
+                }
+                cpu.regs[*rd as usize] = result;
+                ExecOutcome::Continue
+            }
+            Instruction::Sbc {
+                rd,
+                rn,
+                rm,
+                flags,
+            } => {
+                let a = cpu.regs[*rn as usize];
+                let b = cpu.regs[*rm as usize];
+                let cin = (cpu.xpsr >> 29) & 1; // APSR.C
+                let notc = 1 - cin; // SBC = a - b - NOT(C)
+                // 扩展精度有符号结果（a/b 解释为 i32）
+                let ext = (a as i64) - (b as i64) - (notc as i64);
+                let result = (ext & 0xFFFF_FFFF) as u32;
+                if *flags {
+                    self.update_flags_logical(cpu, result);
+                    // C = 无借位（无符号比较 a >= b + NOT(C)）
+                    if (a as u64) >= (b as u64) + (notc as u64) {
+                        cpu.xpsr |= 1 << 29;
+                    } else {
+                        cpu.xpsr &= !(1 << 29);
+                    }
+                    // V = 有符号结果超出 i32 范围
+                    if ext > i32::MAX as i64 || ext < i32::MIN as i64 {
+                        cpu.xpsr |= 1 << 28;
+                    } else {
+                        cpu.xpsr &= !(1 << 28);
+                    }
+                }
+                cpu.regs[*rd as usize] = result;
+                ExecOutcome::Continue
+            }
+            Instruction::Neg { rd, rn, flags } => {
+                let b = cpu.regs[*rn as usize];
+                let (result, borrow) = 0u32.overflowing_sub(b);
+                if *flags {
+                    self.update_flags_sub(cpu, 0, b, result, borrow);
+                }
+                cpu.regs[*rd as usize] = result;
+                ExecOutcome::Continue
+            }
+            Instruction::Mvn { rd, rm, flags } => {
+                let result = !cpu.regs[*rm as usize];
+                if *flags {
+                    self.update_flags_logical(cpu, result);
+                }
+                cpu.regs[*rd as usize] = result;
+                ExecOutcome::Continue
+            }
             Instruction::Mul { rd, rn, rm, flags } => {
                 let result = cpu.regs[*rn as usize].wrapping_mul(cpu.regs[*rm as usize]);
                 if *flags {
@@ -248,9 +315,9 @@ impl Executor {
             } => {
                 let val = cpu.regs[*rm as usize];
                 let result = match amount {
-                    ShiftAmount::Immediate(n) => self.shift_val(val, *kind, *n),
+                    ShiftAmount::Immediate(n) => self.shift_val(cpu, val, *kind, *n),
                     ShiftAmount::Register(r) => {
-                        self.shift_val(val, *kind, (cpu.regs[*r as usize] & 0xFF) as u8)
+                        self.shift_val(cpu, val, *kind, (cpu.regs[*r as usize] & 0xFF) as u8)
                     }
                 };
                 if *flags {
@@ -1336,15 +1403,15 @@ impl Executor {
         }
     }
 
-    /// 移位计算
-    fn shift_val(&self, val: u32, kind: ShiftKind, n: u8) -> u32 {
+    /// 移位计算（n 为已按 ARM 语义取模/限幅后的移位量）
+    fn shift_val(&self, cpu: &CpuState, val: u32, kind: ShiftKind, n: u8) -> u32 {
         let n = n & 0x1F;
         match kind {
             ShiftKind::Lsl => val.wrapping_shl(n as u32),
             ShiftKind::Lsr => val.wrapping_shr(n as u32),
             ShiftKind::Asr => ((val as i32) >> n) as u32,
             ShiftKind::Ror => val.rotate_right(n as u32),
-            ShiftKind::Rrx => (val >> 1) | ((self.carry_bit() as u32) << 31),
+            ShiftKind::Rrx => (val >> 1) | ((self.carry_bit(cpu) as u32) << 31),
         }
     }
 
@@ -1398,9 +1465,32 @@ impl Executor {
         }
     }
 
-    /// 读取进位标志
-    fn carry_bit(&self) -> bool {
-        false // 简化：RRX 的进位由 exec 状态管理，Phase 1 先置 false
+    /// 三操作数加法（a + b + C）更新标志：C = 进位输出，V = 进位进符号位 XOR 进位出符号位
+    ///
+    /// 推导：S（33 位）= a + b + C；sum_31 = a_31 ^ b_31 ^ carry_in31，
+    /// 故 carry_in31 = a_31 ^ b_31 ^ S_31；V = carry_in31 ^ S_32。
+    fn update_flags_add3(&self, cpu: &mut CpuState, a: u32, b: u32, ext: u64, result: u32) {
+        self.update_flags_logical(cpu, result);
+        // C = bit32（进位输出）
+        if ext & (1 << 32) != 0 {
+            cpu.xpsr |= 1 << 29;
+        } else {
+            cpu.xpsr &= !(1 << 29);
+        }
+        let s31 = ((ext >> 31) & 1) as u32;
+        let s32 = ((ext >> 32) & 1) as u32;
+        let carry_in31 = ((a >> 31) & 1) ^ ((b >> 31) & 1) ^ s31;
+        let v = carry_in31 ^ s32;
+        if v != 0 {
+            cpu.xpsr |= 1 << 28;
+        } else {
+            cpu.xpsr &= !(1 << 28);
+        }
+    }
+
+    /// 读取进位标志（APSR.C，bit29）
+    fn carry_bit(&self, cpu: &CpuState) -> bool {
+        cpu.xpsr & (1 << 29) != 0
     }
 
     /// 条件码评估
@@ -1437,6 +1527,214 @@ mod tests {
 
     fn setup() -> (Executor, CpuState, Memory) {
         (Executor::new(), CpuState::default(), Memory::test_ram())
+    }
+
+    // ================= E1: 16-bit 寄存器数据处理组 golden 测试 =================
+    // 编码与 arm-none-eabi-as 实测一致（见任务 E1 清单）；GIVEN/WHEN/THEN 结构。
+    // NZCV 断言位序：nzcv() = bit3=N bit2=Z bit1=C bit0=V。
+
+    #[test]
+    fn e1_ands_eors_orrs_bics() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // ANDS r2, r3 = 0x401A：0xFF00FF00 & 0xF0F0F0F0 = 0xF000F000
+        h.cpu.regs[2] = 0xFF00_FF00;
+        h.cpu.regs[3] = 0xF0F0_F0F0;
+        h.exec_halfword(0x401A);
+        assert_eq!(h.cpu.regs[2], 0xF000_F000);
+        assert_eq!(h.nzcv(), 0b1000, "N 置位（结果 bit31=1）");
+        // ANDS 置 Z：0x0F00 & 0x00F0 = 0
+        h.cpu.regs[2] = 0x0F00;
+        h.cpu.regs[3] = 0x00F0;
+        h.exec_halfword(0x401A);
+        assert_eq!(h.cpu.regs[2], 0);
+        assert_eq!(h.nzcv(), 0b0100, "Z 置位");
+        // EORS r2, r3 = 0x405A：0xFF00FF00 ^ 0x0FF00FF0 = 0xF0F0F0F0
+        h.cpu.regs[2] = 0xFF00_FF00;
+        h.cpu.regs[3] = 0x0FF0_0FF0;
+        h.exec_halfword(0x405A);
+        assert_eq!(h.cpu.regs[2], 0xF0F0_F0F0);
+        assert_eq!(h.nzcv(), 0b1000, "N 置位");
+        // ORRS r2, r3 = 0x431A：0xF0F0F0F0 | 0x0F0F0F0F = 0xFFFFFFFF
+        h.cpu.regs[2] = 0xF0F0_F0F0;
+        h.cpu.regs[3] = 0x0F0F_0F0F;
+        h.exec_halfword(0x431A);
+        assert_eq!(h.cpu.regs[2], 0xFFFF_FFFF);
+        assert_eq!(h.nzcv(), 0b1000, "N 置位");
+        // BICS r2, r3 = 0x439A：0xFF00FF00 & ~0x0F0F0F0F = 0xF000F000
+        h.cpu.regs[2] = 0xFF00_FF00;
+        h.cpu.regs[3] = 0x0F0F_0F0F;
+        h.exec_halfword(0x439A);
+        assert_eq!(h.cpu.regs[2], 0xF000_F000);
+        assert_eq!(h.nzcv(), 0b1000, "N 置位");
+        // BICS 置 Z：0xFF & ~0xFF = 0
+        h.cpu.regs[2] = 0xFF;
+        h.cpu.regs[3] = 0xFF;
+        h.exec_halfword(0x439A);
+        assert_eq!(h.cpu.regs[2], 0);
+        assert_eq!(h.nzcv(), 0b0100, "Z 置位");
+    }
+
+    #[test]
+    fn e1_lsl_lsr_asr_ror_register() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // LSLS r2, r5 = 0x40AA：1 << 4 = 16
+        h.cpu.regs[2] = 1;
+        h.cpu.regs[5] = 4;
+        h.exec_halfword(0x40AA);
+        assert_eq!(h.cpu.regs[2], 16);
+        assert_eq!(h.nzcv(), 0, "N/Z 清零");
+        // LSLS 置 Z：0x80000000 << 1 = 0
+        h.cpu.regs[2] = 0x8000_0000;
+        h.cpu.regs[5] = 1;
+        h.exec_halfword(0x40AA);
+        assert_eq!(h.cpu.regs[2], 0);
+        assert_eq!(h.nzcv(), 0b0100, "Z 置位");
+        // LSRS r2, r5 = 0x40EA：0x80000000 >> 1 = 0x40000000
+        h.cpu.regs[2] = 0x8000_0000;
+        h.cpu.regs[5] = 1;
+        h.exec_halfword(0x40EA);
+        assert_eq!(h.cpu.regs[2], 0x4000_0000);
+        assert_eq!(h.nzcv(), 0, "N/Z 清零");
+        // ASRS r2, r5 = 0x412A：0x80000000 算术右移 1 = 0xC0000000
+        h.cpu.regs[2] = 0x8000_0000;
+        h.cpu.regs[5] = 1;
+        h.exec_halfword(0x412A);
+        assert_eq!(h.cpu.regs[2], 0xC000_0000);
+        assert_eq!(h.nzcv(), 0b1000, "N 置位（符号扩展）");
+        // RORS r2, r5 = 0x41EA：0x00000008 循环右移 4 = 0x80000000
+        h.cpu.regs[2] = 0x0000_0008;
+        h.cpu.regs[5] = 4;
+        h.exec_halfword(0x41EA);
+        assert_eq!(h.cpu.regs[2], 0x8000_0000);
+        assert_eq!(h.nzcv(), 0b1000, "N 置位");
+        // ROR 复合：0x0000000F 循环右移 2 = 0xC0000003
+        h.cpu.regs[2] = 0x0000_000F;
+        h.cpu.regs[5] = 2;
+        h.exec_halfword(0x41EA);
+        assert_eq!(h.cpu.regs[2], 0xC000_0003);
+    }
+
+    #[test]
+    fn e1_adc_sbc_flags() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // ADCS r2, r3 = 0x415A，C=1：1 + 1 + 1 = 3（无进位出 → C 清零）
+        h.cpu.regs[2] = 1;
+        h.cpu.regs[3] = 1;
+        h.cpu.xpsr = 1 << 29; // C=1
+        h.exec_halfword(0x415A);
+        assert_eq!(h.cpu.regs[2], 3);
+        assert_eq!(h.nzcv(), 0, "1+1+1=3：无进位出 C=0，N/Z 清零");
+        // ADC 溢出：0x7FFFFFFF + 1 + 1 = 0x80000001 → V=1 N=1 C=0
+        h.cpu.regs[2] = 0x7FFF_FFFF;
+        h.cpu.regs[3] = 1;
+        h.cpu.xpsr = 1 << 29;
+        h.exec_halfword(0x415A);
+        assert_eq!(h.cpu.regs[2], 0x8000_0001);
+        assert_eq!(h.nzcv(), 0b1001, "N=1 V=1 C=0（正+正溢出）");
+        // ADC 进位出：0xFFFFFFFF + 1 + 0 = 0x00000000 → C=1 Z=1
+        h.cpu.regs[2] = 0xFFFF_FFFF;
+        h.cpu.regs[3] = 1;
+        h.cpu.xpsr = 0;
+        h.exec_halfword(0x415A);
+        assert_eq!(h.cpu.regs[2], 0);
+        assert_eq!(h.nzcv(), 0b0110, "C=1 Z=1（进位出、结果为 0）");
+        // SBCS r2, r3 = 0x419A，C=1：5 - 3 - 0 = 2
+        h.cpu.regs[2] = 5;
+        h.cpu.regs[3] = 3;
+        h.cpu.xpsr = 1 << 29;
+        h.exec_halfword(0x419A);
+        assert_eq!(h.cpu.regs[2], 2);
+        assert_eq!(h.nzcv(), 0b0010, "C=1（无借位）");
+        // SBC 借位：3 - 5 - 0 = -2 → N=1 C=0
+        h.cpu.regs[2] = 3;
+        h.cpu.regs[3] = 5;
+        h.cpu.xpsr = 1 << 29;
+        h.exec_halfword(0x419A);
+        assert_eq!(h.cpu.regs[2], 0xFFFF_FFFE);
+        assert_eq!(h.nzcv(), 0b1000, "N=1 C=0（借位）");
+        // SBC C=0（减 NOT(C)=1）：5 - 3 - 1 = 1
+        h.cpu.regs[2] = 5;
+        h.cpu.regs[3] = 3;
+        h.cpu.xpsr = 0;
+        h.exec_halfword(0x419A);
+        assert_eq!(h.cpu.regs[2], 1);
+        assert_eq!(h.nzcv(), 0b0010, "C=1（无借位）");
+    }
+
+    #[test]
+    fn e1_tst_cmp_cmn_neg_mvn_mul() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // TST r2, r3 = 0x421A：0xFF00FF00 & 0x00FF00FF = 0 → Z=1
+        h.cpu.regs[2] = 0xFF00_FF00;
+        h.cpu.regs[3] = 0x00FF_00FF;
+        h.exec_halfword(0x421A);
+        assert_eq!(h.nzcv(), 0b0100, "Z 置位");
+        // TST 非零：0xFF00 & 0x0FF0 = 0x0F00 → N=0 Z=0
+        h.cpu.regs[2] = 0xFF00;
+        h.cpu.regs[3] = 0x0FF0;
+        h.exec_halfword(0x421A);
+        assert_eq!(h.nzcv(), 0, "N/Z 清零");
+        // CMP r2, r3 = 0x429A：5 == 5 → Z=1 C=1
+        h.cpu.regs[2] = 5;
+        h.cpu.regs[3] = 5;
+        h.exec_halfword(0x429A);
+        assert_eq!(h.nzcv(), 0b0110, "Z=1 C=1");
+        // CMP 3 < 5 → N=1 C=0
+        h.cpu.regs[2] = 3;
+        h.cpu.regs[3] = 5;
+        h.exec_halfword(0x429A);
+        assert_eq!(h.nzcv(), 0b1000, "N=1 C=0");
+        // CMN r2, r3 = 0x42DA：5 + (-5) = 0 → Z=1 C=1
+        h.cpu.regs[2] = 5;
+        h.cpu.regs[3] = 0xFFFF_FFFB;
+        h.exec_halfword(0x42DA);
+        assert_eq!(h.nzcv(), 0b0110, "Z=1 C=1");
+        // NEGS r2, r3 = 0x425A：0 - 5 = -5 → N=1 C=0
+        h.cpu.regs[2] = 0xDEAD_BEEF;
+        h.cpu.regs[3] = 5;
+        h.exec_halfword(0x425A);
+        assert_eq!(h.cpu.regs[2], 0xFFFF_FFFB);
+        assert_eq!(h.nzcv(), 0b1000, "N=1 C=0");
+        // NEG 0：0 - 0 = 0 → Z=1 C=1
+        h.cpu.regs[3] = 0;
+        h.exec_halfword(0x425A);
+        assert_eq!(h.cpu.regs[2], 0);
+        assert_eq!(h.nzcv(), 0b0110, "Z=1 C=1");
+        // NEG 溢出：0 - 0x80000000 = 0x80000000 → V=1
+        h.cpu.regs[3] = 0x8000_0000;
+        h.exec_halfword(0x425A);
+        assert_eq!(h.cpu.regs[2], 0x8000_0000);
+        assert_eq!(h.nzcv(), 0b1001, "N=1 V=1（0-INT_MIN 溢出）");
+        // MVNS r2, r3 = 0x43DA：~0xFFFFFFFF = 0 → Z=1（逻辑指令不动 C/V，先清零 xpsr）
+        h.cpu.xpsr = 0;
+        h.cpu.regs[2] = 0;
+        h.cpu.regs[3] = 0xFFFF_FFFF;
+        h.exec_halfword(0x43DA);
+        assert_eq!(h.cpu.regs[2], 0);
+        assert_eq!(h.nzcv(), 0b0100, "Z 置位");
+        // MVN ~0 = 0xFFFFFFFF → N=1
+        h.cpu.regs[3] = 0;
+        h.exec_halfword(0x43DA);
+        assert_eq!(h.cpu.regs[2], 0xFFFF_FFFF);
+        assert_eq!(h.nzcv(), 0b1000, "N 置位");
+        // MULS r2, r3 = 0x435A：0x12345678 * 0x10000 = 0x56780000（低 32 位）
+        h.cpu.regs[2] = 0x1234_5678;
+        h.cpu.regs[3] = 0x0001_0000;
+        h.cpu.xpsr = 0;
+        h.exec_halfword(0x435A);
+        assert_eq!(h.cpu.regs[2], 0x5678_0000);
+        assert_eq!(h.nzcv(), 0, "ARMv7E-M：MUL 不更新 flags");
+        // MUL 结果全 0 时 flags 仍不动
+        h.cpu.regs[2] = 0;
+        h.cpu.regs[3] = 0xFFFF_FFFF;
+        h.cpu.xpsr = 0;
+        h.exec_halfword(0x435A);
+        assert_eq!(h.cpu.regs[2], 0);
+        assert_eq!(h.nzcv(), 0, "MUL 0 结果也不写 flags");
     }
 
     #[test]

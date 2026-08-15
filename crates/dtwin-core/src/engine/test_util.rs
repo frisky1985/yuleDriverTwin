@@ -33,6 +33,17 @@ impl Harness {
         self.executor.execute(&mut self.cpu, &mut self.mem, &instr)
     }
 
+    /// 执行一条 16 位 Thumb 指令（编码已由汇编器验证）
+    pub fn exec_halfword(&mut self, half: u16) -> ExecOutcome {
+        let instr = self.decoder.decode_halfword(half, self.cpu.regs[15]);
+        self.executor.execute(&mut self.cpu, &mut self.mem, &instr)
+    }
+
+    /// APSR N/Z/C/V 标志（bits[31:28]）
+    pub fn nzcv(&self) -> u32 {
+        (self.cpu.xpsr >> 28) & 0xF
+    }
+
     /// 读取 APSR Q 标志（bit27）
     pub fn q_flag(&self) -> bool {
         self.cpu.xpsr & (1 << 27) != 0
