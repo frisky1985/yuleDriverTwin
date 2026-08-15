@@ -131,9 +131,7 @@ impl Executor {
         self.it_was_active = false;
         if self.it_remaining > 0 {
             let k = self.it_block_len - self.it_remaining; // 当前块内序号（0 起）
-            let cond = self.it_cond_at(k);
-            let holds = self.cond_holds(cpu, cond);
-            eprintln!("IT gate: k={k} cond={cond:?} holds={holds} rem={} xpsr={:#x}", self.it_remaining, cpu.xpsr);
+            let holds = self.cond_holds(cpu, self.it_cond_at(k));
             self.it_remaining -= 1;
             if !holds {
                 return ExecOutcome::Skipped;
@@ -650,6 +648,33 @@ impl Executor {
                     },
                 }
             }
+            // 有符号加载（LDRSB/LDRSH）：读后符号扩展到 32 位
+            Instruction::LdrSignExtend {
+                rt,
+                rn,
+                offset,
+                width,
+            } => {
+                let base = cpu.regs[*rn as usize];
+                let addr = match offset {
+                    LoadStoreOffset::Immediate(imm) => base.wrapping_add(*imm),
+                    LoadStoreOffset::Register(rm) => base.wrapping_add(cpu.regs[*rm as usize]),
+                };
+                let val = match width {
+                    AccessWidth::Byte => memory.read_u8(addr).map(|v| (v as i8) as u32),
+                    AccessWidth::HalfWord => memory.read_u16(addr).map(|v| (v as i16) as u32),
+                    AccessWidth::Word => memory.read_u32(addr),
+                };
+                match val {
+                    Ok(v) => {
+                        cpu.regs[*rt as usize] = v;
+                        ExecOutcome::Continue
+                    }
+                    Err(_f) => ExecOutcome::Fault {
+                        reason: super::FaultReason::BusFault { address: addr },
+                    },
+                }
+            }
             Instruction::Str {
                 rt,
                 rn,
@@ -733,11 +758,12 @@ impl Executor {
                 ExecOutcome::Continue
             }
             Instruction::Svc { imm8 } => {
-                // SVC → SVCall 异常（异常号 11）
+                // 诚实注：SVC 已解码但异常入口（SVCall 向量跳转/压栈）未实现，
+                // 按 UnimplementedInstr Fault 处理（引擎无上层调度，不会进一步处理）
                 let _ = imm8;
                 ExecOutcome::Fault {
                     reason: super::FaultReason::UnimplementedInstr,
-                } // 异常入口由上层调度
+                }
             }
             Instruction::Breakpoint { imm8: _ } => {
                 // BKPT：调试事件（引擎统计 exceptions 并停止 run）

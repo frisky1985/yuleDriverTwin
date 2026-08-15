@@ -152,6 +152,13 @@ pub enum Instruction {
         offset: LoadStoreOffset,
         width: AccessWidth,
     },
+    /// 有符号加载（符号扩展）: LDRSB/LDRSH Rt, [Rn, Rm]
+    LdrSignExtend {
+        rt: u8,
+        rn: u8,
+        offset: LoadStoreOffset,
+        width: AccessWidth,
+    },
     /// 存储字: STR Rt, [Rn, #off] / [Rn, Rm]
     Str {
         rt: u8,
@@ -624,7 +631,7 @@ impl Decoder {
             };
         }
 
-        // BL（11110 S imm10 → 11111 J1 J2 imm11）。BLX 低半字为 11110 开头，未建模 → Unimplemented
+        // BL（11110 S imm10 → 11111 J1 J2 imm11）；BLX（低半字 11101 开头）见下一分支
         if (top & 0xF800) == 0xF000 && (bits & 0xF800) == 0xF800 {
             return self.decode_bl(bits, pc);
         }
@@ -1305,34 +1312,66 @@ impl Decoder {
         }
     }
 
-    /// 16-bit LDR/STR 寄存器偏移：01010/01011（真实编码：bit10 = B 选字节宽度）
-    /// - 01010: STR（bit10=0）/ STRB（bit10=1）
-    /// - 01011: LDR（bit10=0）/ LDRB（bit10=1）
+    /// 16-bit LDR/STR 寄存器偏移：0101 op2[2:0] Rm Rn Rt（真实编码，GNU as 实测）
+    /// op2：000=STR、001=STRH、010=STRB、011=LDRSB（符号扩展）、100=LDR、
+    ///      101=LDRH、110=LDRB、111=UNDEF（保留）
     fn decode_ldr_str_reg(&self, bits: u16) -> Instruction {
         let rt = (bits & 0x7) as u8;
         let rn = ((bits >> 3) & 0x7) as u8;
         let rm = ((bits >> 6) & 0x7) as u8;
-        let load = ((bits >> 11) & 1) == 1;
-        let width = if (bits >> 10) & 1 == 1 {
-            AccessWidth::Byte
-        } else {
-            AccessWidth::Word
-        };
         let offset = LoadStoreOffset::Register(rm);
-        if load {
-            Instruction::Ldr {
+        match ((bits >> 9) & 0x7) as u8 {
+            // 000: STR（字）
+            0 => Instruction::Str {
                 rt,
                 rn,
                 offset,
-                width,
-            }
-        } else {
-            Instruction::Str {
+                width: AccessWidth::Word,
+            },
+            // 001: STRH（半字）
+            1 => Instruction::Str {
                 rt,
                 rn,
                 offset,
-                width,
-            }
+                width: AccessWidth::HalfWord,
+            },
+            // 010: STRB（字节）
+            2 => Instruction::Str {
+                rt,
+                rn,
+                offset,
+                width: AccessWidth::Byte,
+            },
+            // 011: LDRSB（有符号字节加载）
+            3 => Instruction::LdrSignExtend {
+                rt,
+                rn,
+                offset,
+                width: AccessWidth::Byte,
+            },
+            // 100: LDR（字）
+            4 => Instruction::Ldr {
+                rt,
+                rn,
+                offset,
+                width: AccessWidth::Word,
+            },
+            // 101: LDRH（半字）
+            5 => Instruction::Ldr {
+                rt,
+                rn,
+                offset,
+                width: AccessWidth::HalfWord,
+            },
+            // 110: LDRB（字节）
+            6 => Instruction::Ldr {
+                rt,
+                rn,
+                offset,
+                width: AccessWidth::Byte,
+            },
+            // 111: 保留（UNDEF）→ 诚实 Invalid
+            _ => Instruction::Invalid { address: 0 },
         }
     }
 
@@ -1799,7 +1838,7 @@ impl Decoder {
     fn decode_bl(&self, bits: u32, pc: u32) -> Instruction {
         let top = (bits >> 16) as u16;
         let low = bits as u16;
-        // BL 低半字以 11111 开头；11110 开头为 BLX（未建模）
+        // BL 低半字以 11111 开头；11101 开头为 BLX（decode_blx，A-profile 语义，M-profile UNDEF）
         if low & 0xF800 != 0xF800 {
             return Instruction::Unimplemented { bits };
         }
