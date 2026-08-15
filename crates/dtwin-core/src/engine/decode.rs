@@ -119,10 +119,24 @@ pub enum Instruction {
         rm: Option<u8>,
         imm: Option<u32>,
     },
-    /// 负数比较
-    Cmn { rn: u8, rm: u8 },
-    /// 测试位: TST Rn, Rm
-    Tst { rn: u8, rm: u8 },
+    /// 负数比较: CMN Rn, Rm/imm
+    Cmn {
+        rn: u8,
+        rm: Option<u8>,
+        imm: Option<u32>,
+    },
+    /// 测试位: TST Rn, Rm/imm
+    Tst {
+        rn: u8,
+        rm: Option<u8>,
+        imm: Option<u32>,
+    },
+    /// 测试相等（异或）: TEQ Rn, Rm/imm（仅更新标志）
+    Teq {
+        rn: u8,
+        rm: Option<u8>,
+        imm: Option<u32>,
+    },
     /// 分支: B<cond> imm
     Branch { cond: Option<Cond>, target: u32 },
     /// 分支+链接
@@ -547,6 +561,10 @@ pub enum SpecialReg {
     Apsr,
     /// APSR_nzcvqg：NZCV+Q+GE（xPSR bits[31:27]+[19:16]）
     ApsrGe,
+    /// IAPSR：IPSR + APSR（xPSR bits[31:27]+[8:0]）
+    Iapsr,
+    /// EAPSR：EPSR + APSR（xPSR bits[31:27]+[24:16]）
+    Eapsr,
     /// IPSR（xPSR bits[8:0]，异常号）
     Ipsr,
     /// EPSR（xPSR bits[24:16]，T+GE）
@@ -737,7 +755,10 @@ impl Decoder {
         let sysm = (bits & 0xFF) as u8;
         let reg = match sysm {
             0x00 => SpecialReg::Apsr,
-            0x01 | 0x02 => SpecialReg::ApsrGe,
+            // M-profile SYSm：0x01=IAPSR（IPSR+APSR）、0x02=EAPSR（EPSR+APSR）
+            // （A-profile 的 APSR_nzcvqg 表不适用，P1-7 修复）
+            0x01 => SpecialReg::Iapsr,
+            0x02 => SpecialReg::Eapsr,
             0x05 => SpecialReg::Ipsr,
             0x06 => SpecialReg::Epsr,
             0x08 => SpecialReg::Msp,
@@ -1551,7 +1572,11 @@ impl Decoder {
                     flags: true,
                 },
                 // 1000 TST Rd, Rm
-                0x8 => Instruction::Tst { rn: rd, rm },
+                0x8 => Instruction::Tst {
+                    rn: rd,
+                    rm: Some(rm),
+                    imm: None,
+                },
                 // 1001 NEGS Rd, Rm（= RSB Rd, Rm, #0）
                 0x9 => Instruction::Neg {
                     rd,
@@ -1565,7 +1590,11 @@ impl Decoder {
                     imm: None,
                 },
                 // 1011 CMN Rd, Rm
-                0xB => Instruction::Cmn { rn: rd, rm },
+                0xB => Instruction::Cmn {
+                    rn: rd,
+                    rm: Some(rm),
+                    imm: None,
+                },
                 // 1100 ORRS Rd, Rd, Rm
                 0xC => Instruction::Orr {
                     rd,
@@ -1906,6 +1935,12 @@ impl Decoder {
         let imm12 = (i << 11) | (imm3 << 8) | imm8;
         let imm = Self::thumb_expand_imm(imm12);
         match op4 {
+            // AND/ANDS；Rd=1111 → TST（只更新标志，不写 PC）
+            0x0 if rd == 0xF => Instruction::Tst {
+                rn,
+                rm: None,
+                imm: Some(imm),
+            },
             // AND/ANDS
             0x0 => Instruction::And {
                 rd,
@@ -1938,6 +1973,12 @@ impl Decoder {
             },
             // ORN / MVN 未建模
             0x3 => Instruction::Unimplemented { bits },
+            // EOR/EORS；Rd=1111 → TEQ（只更新标志，不写 PC）
+            0x4 if rd == 0xF => Instruction::Teq {
+                rn,
+                rm: None,
+                imm: Some(imm),
+            },
             // EOR/EORS
             0x4 => Instruction::Eor {
                 rd,
@@ -1945,6 +1986,12 @@ impl Decoder {
                 rm: None,
                 imm: Some(imm),
                 flags: s,
+            },
+            // ADD/ADDS；Rd=1111 → CMN（只更新标志，不写 PC）
+            0x8 if rd == 0xF => Instruction::Cmn {
+                rn,
+                rm: None,
+                imm: Some(imm),
             },
             // ADD/ADDS
             0x8 => Instruction::Add {
@@ -1954,21 +2001,23 @@ impl Decoder {
                 imm: Some(imm),
                 flags: s,
             },
+            // SUB/SUBS；Rd=1111 → CMP（只更新标志，不写 PC）
+            // （汇编实测：SUB 编码 op4=0xD；旧代码误用 0xB=SBC）
+            0xD if rd == 0xF => Instruction::Cmp {
+                rn,
+                rm: None,
+                imm: Some(imm),
+            },
             // SUB/SUBS
-            0xB => Instruction::Sub {
+            0xD => Instruction::Sub {
                 rd,
                 rn,
                 rm: None,
                 imm: Some(imm),
                 flags: s,
             },
-            // CMP（恒置标志）
-            0xD => Instruction::Cmp {
-                rn,
-                rm: None,
-                imm: Some(imm),
-            },
-            // 其余（ADC/SBC/CMN/TEQ/RSB/MVN 等）无变体 → 诚实 Unimplemented
+            // 其余（ADC/SBC/RSB/ORN/MVN 等）无 imm 变体 → 诚实 Unimplemented
+            // 0xA=ADC、0xB=SBC、0xE=RSB（汇编实测 0xF143/0xF163/0xF1C3）
             _ => Instruction::Unimplemented { bits },
         }
     }
@@ -2851,6 +2900,44 @@ fn decode_data_proc_imm() {
             imm: Some(0xA5A5_A5A5),
         }
     );
+    // P0-1 回归：tst.w r3, #1（0xF013 0x0F01）→ Tst（Rd=1111，不写 PC）
+    assert_eq!(
+        d.decode_word(0xF013_0F01, 0),
+        Instruction::Tst {
+            rn: 3,
+            rm: None,
+            imm: Some(1),
+        }
+    );
+    // P0-1 回归：teq.w r3, #2（0xF093 0x0F02，arm-none-eabi-as 实测）→ Teq（Rd=1111）
+    assert_eq!(
+        d.decode_word(0xF093_0F02, 0),
+        Instruction::Teq {
+            rn: 3,
+            rm: None,
+            imm: Some(2),
+        }
+    );
+    // P0-1 回归：cmn.w r3, #3（0xF113 0x0F03）→ Cmn（Rd=1111）
+    assert_eq!(
+        d.decode_word(0xF113_0F03, 0),
+        Instruction::Cmn {
+            rn: 3,
+            rm: None,
+            imm: Some(3),
+        }
+    );
+    // P0-1 回归：sub.w r3, r3, #4 正常形式不受影响（0xF1A3 0x0304，汇编实测）→ Sub
+    assert_eq!(
+        d.decode_word(0xF1A3_0304, 0),
+        Instruction::Sub {
+            rd: 3,
+            rn: 3,
+            rm: None,
+            imm: Some(4),
+            flags: false,
+        }
+    );
 }
 
 /// 16-bit 寄存器数据处理组（0x4000-0x43FF）完整解码——十六种操作映射
@@ -2947,7 +3034,11 @@ fn decode_data_proc_reg_16ops() {
     // 1000 TST r2, r3（0x421A）
     assert_eq!(
         d.decode_halfword(0x421A, 0),
-        Instruction::Tst { rn: 2, rm: 3 }
+        Instruction::Tst {
+            rn: 2,
+            rm: Some(3),
+            imm: None,
+        }
     );
     // 1001 NEGS r2, r3（0x425A：Rd=bits[2:0]=r2，源 Rn=bits[5:3]=r3）
     assert_eq!(
@@ -2970,7 +3061,11 @@ fn decode_data_proc_reg_16ops() {
     // 1011 CMN r2, r3（0x42DA）
     assert_eq!(
         d.decode_halfword(0x42DA, 0),
-        Instruction::Cmn { rn: 2, rm: 3 }
+        Instruction::Cmn {
+            rn: 2,
+            rm: Some(3),
+            imm: None,
+        }
     );
     // 1100 ORRS r2, r3（0x431A）
     assert_eq!(

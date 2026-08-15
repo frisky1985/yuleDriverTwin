@@ -163,9 +163,11 @@ impl Executor {
             Instruction::MovImm32 { rd, imm16, top } => {
                 let val = *imm16 as u32;
                 if *top {
+                    // MOVT：保留低半字，写高半字
                     cpu.regs[*rd as usize] = (cpu.regs[*rd as usize] & 0xFFFF) | (val << 16);
                 } else {
-                    cpu.regs[*rd as usize] = (cpu.regs[*rd as usize] & 0xFFFF0000) | val;
+                    // MOVW：ZeroExtend(imm16,32)——高半字清零（P1-5 修复）
+                    cpu.regs[*rd as usize] = val;
                 }
                 ExecOutcome::Continue
             }
@@ -319,8 +321,8 @@ impl Executor {
                 let b = cpu.regs[*rm as usize];
                 let cin = (cpu.xpsr >> 29) & 1; // APSR.C
                 let notc = 1 - cin; // SBC = a - b - NOT(C)
-                // 扩展精度有符号结果（a/b 解释为 i32）
-                let ext = (a as i64) - (b as i64) - (notc as i64);
+                // 扩展精度有符号结果（a/b 符号扩展到 i64，V 判定需符号语义）
+                let ext = (a as i32 as i64) - (b as i32 as i64) - (notc as i64);
                 let result = (ext & 0xFFFF_FFFF) as u32;
                 if *flags {
                     self.update_flags_logical(cpu, result);
@@ -399,6 +401,18 @@ impl Executor {
                 };
                 if *flags {
                     self.update_flags_logical(cpu, result);
+                    // 移位指令更新 C 标志 = 最后移出位（P1-6 修复）
+                    let c = match amount {
+                        ShiftAmount::Immediate(n) => self.shift_carry(val, *kind, *n),
+                        ShiftAmount::Register(r) => {
+                            self.shift_carry(val, *kind, (cpu.regs[*r as usize] & 0xFF) as u8)
+                        }
+                    };
+                    if c {
+                        cpu.xpsr |= 1 << 29;
+                    } else {
+                        cpu.xpsr &= !(1 << 29);
+                    }
                 }
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
@@ -414,15 +428,36 @@ impl Executor {
                 self.update_flags_sub(cpu, a, b, result, borrow);
                 ExecOutcome::Continue
             }
-            Instruction::Cmn { rn, rm } => {
+            Instruction::Cmn { rn, rm, imm } => {
                 let a = cpu.regs[*rn as usize];
-                let b = cpu.regs[*rm as usize];
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
                 let (result, carry) = a.overflowing_add(b);
                 self.update_flags_add(cpu, a, b, result, carry);
                 ExecOutcome::Continue
             }
-            Instruction::Tst { rn, rm } => {
-                let result = cpu.regs[*rn as usize] & cpu.regs[*rm as usize];
+            Instruction::Tst { rn, rm, imm } => {
+                let a = cpu.regs[*rn as usize];
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
+                let result = a & b;
+                self.update_flags_logical(cpu, result);
+                ExecOutcome::Continue
+            }
+            Instruction::Teq { rn, rm, imm } => {
+                let a = cpu.regs[*rn as usize];
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
+                let result = a ^ b;
                 self.update_flags_logical(cpu, result);
                 ExecOutcome::Continue
             }
@@ -719,6 +754,8 @@ impl Executor {
                     let v = match reg {
                         SpecialReg::Apsr => cpu.xpsr & 0xF800_0000,
                         SpecialReg::ApsrGe => cpu.xpsr & 0xF8FF_0000,
+                        SpecialReg::Iapsr => cpu.xpsr & 0xF800_01FF,
+                        SpecialReg::Eapsr => cpu.xpsr & 0xF9FF_0000,
                         SpecialReg::Ipsr => cpu.xpsr & 0x1FF,
                         SpecialReg::Epsr => cpu.xpsr & 0x01FF_0000,
                         SpecialReg::Msp => cpu.msp,
@@ -740,6 +777,13 @@ impl Executor {
                         }
                         SpecialReg::ApsrGe => {
                             cpu.xpsr = (cpu.xpsr & !0xF8FF_0000) | (v & 0xF8FF_0000)
+                        }
+                        // IAPSR/EAPSR 写：仅 APSR 字段可写，IPSR/EPSR 位忽略（ARM 语义）
+                        SpecialReg::Iapsr => {
+                            cpu.xpsr = (cpu.xpsr & !0xF800_0000) | (v & 0xF800_0000)
+                        }
+                        SpecialReg::Eapsr => {
+                            cpu.xpsr = (cpu.xpsr & !0xF800_0000) | (v & 0xF800_0000)
                         }
                         // IPSR/EPSR 只读：写被忽略（ARM 语义 UNPREDICTABLE，保守忽略）
                         SpecialReg::Ipsr | SpecialReg::Epsr => {}
@@ -802,20 +846,11 @@ impl Executor {
                     }
                     DspShiftKind::Asr => {
                         let n = *shift_imm & 0x1F;
-                        if *signed {
-                            // SSAT: ASR（n=0 → 移 32 位，符号填充）
-                            if n == 0 {
-                                ((t as i32) >> 31) as u32
-                            } else {
-                                ((t as i32) >> n) as u32
-                            }
+                        if n == 0 {
+                            // sh=1：ASR（USAT/SSAT 均算术右移；n=0 → 移 32 位，符号填充）
+                            ((t as i32) >> 31) as u32
                         } else {
-                            // USAT: LSR（n=0 → 移 32 位 → 0）
-                            if n == 0 {
-                                0
-                            } else {
-                                t >> n
-                            }
+                            ((t as i32) >> n) as u32
                         }
                     }
                 };
@@ -1530,14 +1565,85 @@ impl Executor {
     }
 
     /// 移位计算（n 为已按 ARM 语义取模/限幅后的移位量）
+    /// 立即数形式：LSR/ASR #0 编码为 #32（decode 端已转换），LSL #0 不移位；
+    /// 寄存器形式：低 8 位，0 → 不移位，≥32 → 0（LSR/LSL）/ 符号填充（ASR）。
     fn shift_val(&self, cpu: &CpuState, val: u32, kind: ShiftKind, n: u8) -> u32 {
-        let n = n & 0x1F;
         match kind {
-            ShiftKind::Lsl => val.wrapping_shl(n as u32),
-            ShiftKind::Lsr => val.wrapping_shr(n as u32),
-            ShiftKind::Asr => ((val as i32) >> n) as u32,
-            ShiftKind::Ror => val.rotate_right(n as u32),
+            ShiftKind::Lsl => {
+                if n >= 32 {
+                    0
+                } else if n == 0 {
+                    val
+                } else {
+                    val.wrapping_shl(n as u32)
+                }
+            }
+            ShiftKind::Lsr => {
+                if n >= 32 {
+                    0
+                } else if n == 0 {
+                    val
+                } else {
+                    val.wrapping_shr(n as u32)
+                }
+            }
+            ShiftKind::Asr => {
+                if n >= 32 {
+                    ((val as i32) >> 31) as u32
+                } else if n == 0 {
+                    val
+                } else {
+                    ((val as i32) >> n) as u32
+                }
+            }
+            ShiftKind::Ror => {
+                if n == 0 {
+                    val
+                } else {
+                    val.rotate_right((n & 0x1F) as u32)
+                }
+            }
             ShiftKind::Rrx => (val >> 1) | ((self.carry_bit(cpu) as u32) << 31),
+        }
+    }
+
+    /// 移位计算 C 标志（最后移出位）
+    /// 与 shift_val 同语义约定：立即数 LSR/ASR #0 → #32；n>=32 按移满处理。
+    fn shift_carry(&self, val: u32, kind: ShiftKind, n: u8) -> bool {
+        match kind {
+            ShiftKind::Lsl => {
+                if n >= 32 || n == 0 {
+                    false
+                } else {
+                    (val >> (32 - n)) & 1 != 0
+                }
+            }
+            ShiftKind::Lsr => {
+                if n >= 32 {
+                    (val >> 31) & 1 != 0
+                } else if n == 0 {
+                    false
+                } else {
+                    (val >> (n - 1)) & 1 != 0
+                }
+            }
+            ShiftKind::Asr => {
+                if n >= 32 {
+                    (val >> 31) & 1 != 0
+                } else if n == 0 {
+                    false
+                } else {
+                    (val >> (n - 1)) & 1 != 0
+                }
+            }
+            ShiftKind::Ror => {
+                if n == 0 {
+                    false
+                } else {
+                    (val >> ((n & 0x1F) - 1)) & 1 != 0
+                }
+            }
+            ShiftKind::Rrx => val & 1 != 0,
         }
     }
 
@@ -1711,12 +1817,12 @@ mod tests {
         h.exec_halfword(0x40AA);
         assert_eq!(h.cpu.regs[2], 16);
         assert_eq!(h.nzcv(), 0, "N/Z 清零");
-        // LSLS 置 Z：0x80000000 << 1 = 0
+        // LSLS 置 Z：0x80000000 << 1 = 0，C = 移出位 bit31 = 1
         h.cpu.regs[2] = 0x8000_0000;
         h.cpu.regs[5] = 1;
         h.exec_halfword(0x40AA);
         assert_eq!(h.cpu.regs[2], 0);
-        assert_eq!(h.nzcv(), 0b0100, "Z 置位");
+        assert_eq!(h.nzcv(), 0b0110, "Z 置位 + C 置位（bit31 移出）");
         // LSRS r2, r5 = 0x40EA：0x80000000 >> 1 = 0x40000000
         h.cpu.regs[2] = 0x8000_0000;
         h.cpu.regs[5] = 1;
@@ -1730,11 +1836,12 @@ mod tests {
         assert_eq!(h.cpu.regs[2], 0xC000_0000);
         assert_eq!(h.nzcv(), 0b1000, "N 置位（符号扩展）");
         // RORS r2, r5 = 0x41EA：0x00000008 循环右移 4 = 0x80000000
+        // 最后移出位 = bit3 = 1 → C 置位（ARM 语义）
         h.cpu.regs[2] = 0x0000_0008;
         h.cpu.regs[5] = 4;
         h.exec_halfword(0x41EA);
         assert_eq!(h.cpu.regs[2], 0x8000_0000);
-        assert_eq!(h.nzcv(), 0b1000, "N 置位");
+        assert_eq!(h.nzcv(), 0b1010, "N 置位 + C 置位（移出 bit3）");
         // ROR 复合：0x0000000F 循环右移 2 = 0xC0000003
         h.cpu.regs[2] = 0x0000_000F;
         h.cpu.regs[5] = 2;

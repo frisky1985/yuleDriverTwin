@@ -19,10 +19,11 @@ pub fn ssat(val: i32, bit_pos: u32) -> i32 {
 /// 无符号饱和到 n 位（0-32）
 pub fn usat(val: i32, bit_pos: u32) -> u32 {
     let bit_pos = bit_pos.clamp(0, 31);
-    let max = if bit_pos == 31 {
-        u32::MAX
+    // 饱和上限 = 2^n - 1（n=31 → 0x7FFFFFFF，非 u32::MAX）
+    let max = if bit_pos == 0 {
+        0
     } else {
-        (1u32 << (bit_pos + 1)) - 1
+        (1u32 << bit_pos) - 1
     };
     if val < 0 {
         0
@@ -251,8 +252,8 @@ mod tests {
     #[test]
     fn usat_bounds() {
         assert_eq!(usat(-1, 8), 0); // 负数 → 0
-        assert_eq!(usat(600, 8), 511); // 超出 9 位无符号 → 饱和 511 (ARM USAT #8 = 9 位)
-        assert_eq!(usat(300, 8), 300); // 9 位范围内 → 原值
+        assert_eq!(usat(600, 8), 255); // 超出 8 位无符号 → 饱和 255 (ARM USAT #8 = 2^8-1)
+        assert_eq!(usat(300, 8), 255); // 8 位范围内最大值 255
         assert_eq!(usat(100, 8), 100);
     }
 
@@ -408,13 +409,13 @@ mod tests {
 
     #[test]
     fn golden_usat_saturates() {
-        // GIVEN: R1 = 600（超出 9 位无符号范围）
+        // GIVEN: R1 = 600（超出 8 位无符号范围）
         let mut h = Harness::new();
         h.cpu.regs[1] = 600;
         // WHEN: USAT R0, #8, R1（0xF381 0008）
         assert_eq!(h.exec_word(0xF381_0008), ExecOutcome::Continue);
-        // THEN: R0 = 511，Q 置位
-        assert_eq!(h.cpu.regs[0], 511);
+        // THEN: R0 = 255（2^8-1），Q 置位
+        assert_eq!(h.cpu.regs[0], 255);
         assert!(h.q_flag());
     }
 
