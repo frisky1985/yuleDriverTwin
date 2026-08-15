@@ -212,4 +212,43 @@ mod tests {
         assert_eq!(cpu.regs[15], 8);
         assert_eq!(eng.stats.instructions, 2);
     }
+
+    /// 16-bit LDR/STR 全链路：烧 flash 字节序验证（小端，16 位指令正常小端字节序）
+    #[test]
+    fn engine_flash_16bit_ldr_str() {
+        // GIVEN: 内存中依次放置（小端字节序）
+        //   MOVS R0, #0x2A（0x202A）→ 字节 2A 20
+        //   STR R0, [R1, #4]（0x6048）→ 字节 48 60（R1 = 0x2000_0000）
+        //   LDR R2, [R1, #4]（0x684A）→ 字节 4A 68
+        //   LDRB R3, [R1, #4]（0x790B）→ 字节 0B 79
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::test_ram();
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        cpu.regs[15] = 0;
+        cpu.regs[1] = 0x2000_0000;
+        mem.flash[0] = 0x2A;
+        mem.flash[1] = 0x20;
+        mem.flash[2] = 0x48;
+        mem.flash[3] = 0x60;
+        mem.flash[4] = 0x4A;
+        mem.flash[5] = 0x68;
+        mem.flash[6] = 0x0B;
+        mem.flash[7] = 0x79;
+
+        // WHEN: 连续执行 4 条指令
+        for _ in 0..4 {
+            assert_eq!(
+                eng.step(&mut cpu, &mut mem, &mut nvic),
+                EngineResult::Halted
+            );
+        }
+
+        // THEN: R0 = 0x2A；[0x2000_0004] = 0x2A；R2 = 0x2A；R3 = 0x2A
+        assert_eq!(cpu.regs[0], 0x2A);
+        assert_eq!(mem.read_u32(0x2000_0004).unwrap(), 0x2A);
+        assert_eq!(cpu.regs[2], 0x2A);
+        assert_eq!(cpu.regs[3], 0x2A);
+        assert_eq!(cpu.regs[15], 8);
+    }
 }

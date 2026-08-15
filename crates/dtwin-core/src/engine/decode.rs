@@ -438,20 +438,23 @@ impl Decoder {
             0b00011 => self.decode_add_sub_imm(bits),
             // 001xx: MOVS/CMP/ADDS/SUBS #imm8
             0b00100 | 0b00101 | 0b00110 | 0b00111 => self.decode_mov_cmp_add_sub_imm8(bits),
-            // 010xx: MOV/CMP/ADD/SUB 寄存器
-            0b01000 | 0b01001 | 0b01010 | 0b01011 => self.decode_mov_cmp_add_sub_reg(bits),
-            // 011xx: ALU 寄存器
-            0b01100 | 0b01101 | 0b01110 | 0b01111 => self.decode_alu_reg(bits),
-            // 100xx: LDR/STR halfword/byte — decode 未接，留 Unimplemented
-            0b10000 | 0b10001 | 0b10010 | 0b10011 => {
-                Instruction::Unimplemented { bits: bits as u32 }
-            }
-            // 101xx: 条件分支
-            0b10101 => self.decode_branch_cond(bits, pc),
-            // 110xx: LDR/STR word — decode 未接，留 Unimplemented
-            0b11000 | 0b11001 | 0b11010 | 0b11011 => {
-                Instruction::Unimplemented { bits: bits as u32 }
-            }
+            // 01000/01001: 现有 MOV/CMP/ADD/SUB 组（注意：真实 Thumb 中
+            //   01001 是 LDR literal（PC 相对字面量），本引擎未接，保留原路由并诚实注明）
+            0b01000 | 0b01001 => self.decode_mov_cmp_add_sub_reg(bits),
+            // 01010/01011: STR/STRB、LDR/LDRB 寄存器偏移（真实编码：bit10 = B）
+            0b01010 | 0b01011 => self.decode_ldr_str_reg(bits),
+            // 01100-01111: STR/LDR/STRB/LDRB 立即数偏移（真实编码：imm5）
+            0b01100 | 0b01101 | 0b01110 | 0b01111 => self.decode_ldr_str_imm(bits),
+            // 10000/10001: STRH/LDRH 立即数偏移（imm5×2）
+            0b10000 | 0b10001 => self.decode_ldr_str_imm(bits),
+            // 10010/10011: STR/LDR SP 相对（imm8×4）
+            0b10010 | 0b10011 => self.decode_sp_relative(bits),
+            // 101xx: ADD SP 等未接 → Unimplemented
+            // 11000/11001: STMIA/LDMIA（16 位形式固定回写）
+            0b11000 => self.decode_stmia(bits),
+            0b11001 => self.decode_ldmia(bits),
+            // 11010/11011: B<cond>
+            0b11010 | 0b11011 => self.decode_branch_cond(bits, pc),
             // 11100: 无条件分支
             0b11100 => self.decode_branch_uncond(bits, pc),
             // 其他 111xx: BL/BLX 等 32-bit 前缀或系统指令
@@ -971,6 +974,116 @@ impl Decoder {
         }
     }
 
+    /// 16-bit LDR/STR 立即数偏移：01100-01111（STR/LDR/STRB/LDRB）与
+    /// 10000/10001（STRH/LDRH）。真实 Thumb-1 编码（objdump 实测）：
+    /// - 01100 STR (imm5×4)、01101 LDR (imm5×4)
+    /// - 01110 STRB (imm5)、01111 LDRB (imm5)
+    /// - 10000 STRH (imm5×2)、10001 LDRH (imm5×2)
+    fn decode_ldr_str_imm(&self, bits: u16) -> Instruction {
+        let rt = (bits & 0x7) as u8;
+        let rn = ((bits >> 3) & 0x7) as u8;
+        let imm5 = ((bits >> 6) & 0x1F) as u32;
+        let (load, width, scale) = match bits >> 11 {
+            0b01100 => (false, AccessWidth::Word, 4),     // STR
+            0b01101 => (true, AccessWidth::Word, 4),      // LDR
+            0b01110 => (false, AccessWidth::Byte, 1),     // STRB
+            0b01111 => (true, AccessWidth::Byte, 1),      // LDRB
+            0b10000 => (false, AccessWidth::HalfWord, 2), // STRH
+            _ => (true, AccessWidth::HalfWord, 2),        // LDRH
+        };
+        let offset = LoadStoreOffset::Immediate(imm5 * scale);
+        if load {
+            Instruction::Ldr {
+                rt,
+                rn,
+                offset,
+                width,
+            }
+        } else {
+            Instruction::Str {
+                rt,
+                rn,
+                offset,
+                width,
+            }
+        }
+    }
+
+    /// 16-bit LDR/STR 寄存器偏移：01010/01011（真实编码：bit10 = B 选字节宽度）
+    /// - 01010: STR（bit10=0）/ STRB（bit10=1）
+    /// - 01011: LDR（bit10=0）/ LDRB（bit10=1）
+    fn decode_ldr_str_reg(&self, bits: u16) -> Instruction {
+        let rt = (bits & 0x7) as u8;
+        let rn = ((bits >> 3) & 0x7) as u8;
+        let rm = ((bits >> 6) & 0x7) as u8;
+        let load = ((bits >> 11) & 1) == 1;
+        let width = if (bits >> 10) & 1 == 1 {
+            AccessWidth::Byte
+        } else {
+            AccessWidth::Word
+        };
+        let offset = LoadStoreOffset::Register(rm);
+        if load {
+            Instruction::Ldr {
+                rt,
+                rn,
+                offset,
+                width,
+            }
+        } else {
+            Instruction::Str {
+                rt,
+                rn,
+                offset,
+                width,
+            }
+        }
+    }
+
+    /// 16-bit SP 相对 STR/LDR（10010/10011，imm8×4，Rt 在 bits[10:8]）
+    fn decode_sp_relative(&self, bits: u16) -> Instruction {
+        let rt = ((bits >> 8) & 0x7) as u8;
+        let imm = ((bits & 0xFF) as u32) * 4;
+        let offset = LoadStoreOffset::Immediate(imm);
+        if (bits >> 11) & 1 == 1 {
+            Instruction::Ldr {
+                rt,
+                rn: 13, // SP
+                offset,
+                width: AccessWidth::Word,
+            }
+        } else {
+            Instruction::Str {
+                rt,
+                rn: 13,
+                offset,
+                width: AccessWidth::Word,
+            }
+        }
+    }
+
+    /// 16-bit STMIA（11000，Rn 为 R0-R7，固定回写）
+    fn decode_stmia(&self, bits: u16) -> Instruction {
+        let rn = ((bits >> 8) & 0x7) as u8;
+        let regs = (bits & 0xFF) as u16;
+        Instruction::Stm {
+            rn,
+            regs,
+            writeback: true,
+        }
+    }
+
+    /// 16-bit LDMIA（11001，Rn 为 R0-R7，固定回写）
+    fn decode_ldmia(&self, bits: u16) -> Instruction {
+        let rn = ((bits >> 8) & 0x7) as u8;
+        let regs = (bits & 0xFF) as u16;
+        Instruction::Ldm {
+            rn,
+            regs,
+            writeback: true,
+        }
+    }
+
     /// 移位立即数: 000 00 xxxxx xxxxx (LSL/LSR/ASR)
     fn decode_shift_imm(&self, bits: u16) -> Instruction {
         let rd = (bits & 0x7) as u8;
@@ -990,9 +1103,7 @@ impl Decoder {
             amount: ShiftAmount::Immediate(imm5 as u8),
             flags: true,
         }
-    }
-
-    /// 加减立即数: 000 11 xxxxx xxxxx (ADD/SUB #imm)
+    }    /// 加减立即数: 000 11 xxxxx xxxxx (ADD/SUB #imm)
     fn decode_add_sub_imm(&self, bits: u16) -> Instruction {
         let rd = (bits & 0x7) as u8;
         let rn = ((bits >> 3) & 0x7) as u8;
@@ -1050,116 +1161,6 @@ impl Decoder {
                 imm: None,
                 flags: true,
             },
-        }
-    }
-
-    /// ALU 寄存器: 010 000 1101 xxxx (AND/ORR/EOR/BIC/MUL)
-    fn decode_alu_reg(&self, bits: u16) -> Instruction {
-        let rd = (bits & 0x7) as u8;
-        let rm = ((bits >> 3) & 0x7) as u8;
-        let rn = rd;
-        let op = (bits >> 6) & 0xF;
-        match op {
-            0 => Instruction::And {
-                rd,
-                rn,
-                rm,
-                flags: true,
-            },
-            1 => Instruction::Eor {
-                rd,
-                rn,
-                rm,
-                flags: true,
-            },
-            2 => Instruction::Shift {
-                rd,
-                rm,
-                kind: ShiftKind::Lsl,
-                amount: ShiftAmount::Register(rn),
-                flags: true,
-            },
-            3 => Instruction::Shift {
-                rd,
-                rm,
-                kind: ShiftKind::Lsr,
-                amount: ShiftAmount::Register(rn),
-                flags: true,
-            },
-            4 => Instruction::Shift {
-                rd,
-                rm,
-                kind: ShiftKind::Asr,
-                amount: ShiftAmount::Register(rn),
-                flags: true,
-            },
-            5 => Instruction::Add {
-                rd,
-                rn,
-                rm: Some(rm),
-                imm: None,
-                flags: true,
-            },
-            6 => Instruction::Sub {
-                rd,
-                rn,
-                rm: Some(rm),
-                imm: None,
-                flags: true,
-            },
-            7 => Instruction::Shift {
-                rd,
-                rm,
-                kind: ShiftKind::Ror,
-                amount: ShiftAmount::Register(rn),
-                flags: true,
-            },
-            8 => Instruction::And {
-                rd,
-                rn,
-                rm,
-                flags: false,
-            },
-            9 => Instruction::Eor {
-                rd,
-                rn,
-                rm,
-                flags: false,
-            },
-            10 => Instruction::Shift {
-                rd,
-                rm,
-                kind: ShiftKind::Lsl,
-                amount: ShiftAmount::Register(rn),
-                flags: false,
-            },
-            11 => Instruction::Shift {
-                rd,
-                rm,
-                kind: ShiftKind::Lsr,
-                amount: ShiftAmount::Register(rn),
-                flags: false,
-            },
-            12 => Instruction::Shift {
-                rd,
-                rm,
-                kind: ShiftKind::Asr,
-                amount: ShiftAmount::Register(rn),
-                flags: false,
-            },
-            13 => Instruction::Mul {
-                rd,
-                rn,
-                rm,
-                flags: false,
-            },
-            14 => Instruction::Bic {
-                rd,
-                rn,
-                rm,
-                flags: true,
-            },
-            _ => Instruction::Unimplemented { bits: bits as u32 },
         }
     }
 
@@ -1228,5 +1229,182 @@ impl Decoder {
     /// 生成非法指令错误
     pub fn invalid(&self, address: u32) -> FaultReason {
         FaultReason::IllegalInstruction { pc: address }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 16-bit LDR/STR 立即数偏移解码（编码经 arm-none-eabi-as 实测）
+    #[test]
+    fn decode_16bit_ldr_str_imm() {
+        let mut d = Decoder::new();
+        // STR r0, [r1, #12] = 0x60C8 → Word 偏移 12
+        assert_eq!(
+            d.decode_halfword(0x60C8, 0),
+            Instruction::Str {
+                rt: 0,
+                rn: 1,
+                offset: LoadStoreOffset::Immediate(12),
+                width: AccessWidth::Word,
+            }
+        );
+        // LDR r2, [r3, #20] = 0x695A
+        assert_eq!(
+            d.decode_halfword(0x695A, 0),
+            Instruction::Ldr {
+                rt: 2,
+                rn: 3,
+                offset: LoadStoreOffset::Immediate(20),
+                width: AccessWidth::Word,
+            }
+        );
+        // STRB r4, [r5, #7] = 0x71EC
+        assert_eq!(
+            d.decode_halfword(0x71EC, 0),
+            Instruction::Str {
+                rt: 4,
+                rn: 5,
+                offset: LoadStoreOffset::Immediate(7),
+                width: AccessWidth::Byte,
+            }
+        );
+        // LDRB r6, [r7, #3] = 0x78FE
+        assert_eq!(
+            d.decode_halfword(0x78FE, 0),
+            Instruction::Ldr {
+                rt: 6,
+                rn: 7,
+                offset: LoadStoreOffset::Immediate(3),
+                width: AccessWidth::Byte,
+            }
+        );
+        // STRH r0, [r1, #6] = 0x80C8
+        assert_eq!(
+            d.decode_halfword(0x80C8, 0),
+            Instruction::Str {
+                rt: 0,
+                rn: 1,
+                offset: LoadStoreOffset::Immediate(6),
+                width: AccessWidth::HalfWord,
+            }
+        );
+        // LDRH r2, [r3, #10] = 0x895A
+        assert_eq!(
+            d.decode_halfword(0x895A, 0),
+            Instruction::Ldr {
+                rt: 2,
+                rn: 3,
+                offset: LoadStoreOffset::Immediate(10),
+                width: AccessWidth::HalfWord,
+            }
+        );
+    }
+
+    /// 16-bit LDR/STR 寄存器偏移解码（真实编码：bit10 = B）
+    #[test]
+    fn decode_16bit_ldr_str_reg() {
+        let mut d = Decoder::new();
+        // STR r0, [r1, r2] = 0x5088
+        assert_eq!(
+            d.decode_halfword(0x5088, 0),
+            Instruction::Str {
+                rt: 0,
+                rn: 1,
+                offset: LoadStoreOffset::Register(2),
+                width: AccessWidth::Word,
+            }
+        );
+        // STRB r0, [r1, r2] = 0x5488
+        assert_eq!(
+            d.decode_halfword(0x5488, 0),
+            Instruction::Str {
+                rt: 0,
+                rn: 1,
+                offset: LoadStoreOffset::Register(2),
+                width: AccessWidth::Byte,
+            }
+        );
+        // LDR r3, [r4, r5] = 0x5963
+        assert_eq!(
+            d.decode_halfword(0x5963, 0),
+            Instruction::Ldr {
+                rt: 3,
+                rn: 4,
+                offset: LoadStoreOffset::Register(5),
+                width: AccessWidth::Word,
+            }
+        );
+        // LDRB r3, [r4, r5] = 0x5D63
+        assert_eq!(
+            d.decode_halfword(0x5D63, 0),
+            Instruction::Ldr {
+                rt: 3,
+                rn: 4,
+                offset: LoadStoreOffset::Register(5),
+                width: AccessWidth::Byte,
+            }
+        );
+    }
+
+    /// 16-bit SP 相对 STR/LDR + STMIA/LDMIA + B<cond> 解码
+    #[test]
+    fn decode_16bit_sp_relative_multi_branch() {
+        let mut d = Decoder::new();
+        // STR r0, [sp, #4] = 0x9001
+        assert_eq!(
+            d.decode_halfword(0x9001, 0),
+            Instruction::Str {
+                rt: 0,
+                rn: 13,
+                offset: LoadStoreOffset::Immediate(4),
+                width: AccessWidth::Word,
+            }
+        );
+        // LDR r0, [sp, #4] = 0x9801
+        assert_eq!(
+            d.decode_halfword(0x9801, 0),
+            Instruction::Ldr {
+                rt: 0,
+                rn: 13,
+                offset: LoadStoreOffset::Immediate(4),
+                width: AccessWidth::Word,
+            }
+        );
+        // STMIA r0!, {r1, r2} = 0xC006
+        assert_eq!(
+            d.decode_halfword(0xC006, 0),
+            Instruction::Stm {
+                rn: 0,
+                regs: 0b110,
+                writeback: true,
+            }
+        );
+        // LDMIA r0!, {r1, r2} = 0xC806
+        assert_eq!(
+            d.decode_halfword(0xC806, 0),
+            Instruction::Ldm {
+                rn: 0,
+                regs: 0b110,
+                writeback: true,
+            }
+        );
+        // BEQ：0xD006 → 条件分支，目标 = pc+4+6*2
+        assert_eq!(
+            d.decode_halfword(0xD006, 0x1000),
+            Instruction::Branch {
+                cond: Some(Cond::Eq),
+                target: 0x1000 + 4 + 12,
+            }
+        );
+        // BNE：0xD106
+        assert_eq!(
+            d.decode_halfword(0xD106, 0x1000),
+            Instruction::Branch {
+                cond: Some(Cond::Ne),
+                target: 0x1000 + 4 + 12,
+            }
+        );
     }
 }

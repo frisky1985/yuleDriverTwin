@@ -1288,4 +1288,175 @@ mod tests {
         assert_eq!(cpu.regs[4], 0xBB);
         assert_eq!(cpu.regs[0], 0x2000_0008);
     }
+
+    // ============ P1-补：16-bit LDR/STR golden（编码经 arm-none-eabi-as 实测） ============
+
+    use crate::engine::decode::Decoder;
+
+    /// 全链路：16-bit STR/LDR word 立即数（0x60C8 STR / 0x695A LDR）
+    #[test]
+    fn golden_16bit_ldr_str_word_imm() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        let mut dec = Decoder::new();
+        cpu.regs[1] = 0x2000_0000;
+        cpu.regs[0] = 0x1122_3344;
+        // STR r0, [r1, #12]（0x60C8）
+        let instr = dec.decode_halfword(0x60C8, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u32(0x2000_000C).unwrap(), 0x1122_3344);
+        // LDR r2, [r3, #20]（0x695A：rn=r3，偏移 20）
+        cpu.regs[3] = 0x2000_0000;
+        mem.write_u32(0x2000_0014, 0x1122_3344).unwrap();
+        let instr = dec.decode_halfword(0x695A, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[2], 0x1122_3344);
+    }
+
+    /// 全链路：16-bit STRB/LDRB（0x71EC / 0x78FE）与 STRH/LDRH（0x80C8 / 0x895A）
+    #[test]
+    fn golden_16bit_ldr_str_byte_half() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        let mut dec = Decoder::new();
+        cpu.regs[5] = 0x2000_0000;
+        cpu.regs[4] = 0xDEAD_BEEF;
+        // STRB r4, [r5, #7]（0x71EC）→ 只写低字节
+        let instr = dec.decode_halfword(0x71EC, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u8(0x2000_0007).unwrap(), 0xEF);
+        // LDRB r6, [r7, #3]（0x78FE）→ 零扩展
+        cpu.regs[7] = 0x2000_0000;
+        mem.write_u8(0x2000_0003, 0xEF).unwrap();
+        let instr = dec.decode_halfword(0x78FE, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[6], 0xEF);
+        // STRH r0, [r1, #6]（0x80C8）
+        cpu.regs[1] = 0x2000_0000;
+        cpu.regs[0] = 0xABCD_1234;
+        let instr = dec.decode_halfword(0x80C8, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u16(0x2000_0006).unwrap(), 0x1234);
+        // LDRH r2, [r3, #10]（0x895A）
+        cpu.regs[3] = 0x2000_0000;
+        mem.write_u16(0x2000_000A, 0x5A5A).unwrap();
+        let instr = dec.decode_halfword(0x895A, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[2], 0x5A5A);
+    }
+
+    /// 全链路：16-bit STR/LDR 寄存器偏移（0x5088/0x5963）与 SP 相对（0x9001/0x9801）
+    #[test]
+    fn golden_16bit_ldr_str_reg_sp() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        let mut dec = Decoder::new();
+        cpu.regs[1] = 0x2000_0000;
+        cpu.regs[2] = 0x10;
+        cpu.regs[0] = 0xCAFE_BABE;
+        // STR r0, [r1, r2]（0x5088）→ [0x2000_0010]
+        let instr = dec.decode_halfword(0x5088, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u32(0x2000_0010).unwrap(), 0xCAFE_BABE);
+        // LDR r3, [r4, r5]（0x5963）
+        cpu.regs[4] = 0x2000_0000;
+        cpu.regs[5] = 0x10;
+        let instr = dec.decode_halfword(0x5963, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[3], 0xCAFE_BABE);
+        // SP 相对：STR r0, [sp, #4]（0x9001）
+        cpu.regs[13] = 0x2000_0100;
+        let instr = dec.decode_halfword(0x9001, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(mem.read_u32(0x2000_0104).unwrap(), 0xCAFE_BABE);
+        // LDR r0, [sp, #4]（0x9801）
+        let instr = dec.decode_halfword(0x9801, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[0], 0xCAFE_BABE);
+    }
+
+    /// 全链路：16-bit STMIA/LDMIA（0xC006 / 0xC806）
+    #[test]
+    fn golden_16bit_stmia_ldmia() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        let mut dec = Decoder::new();
+        cpu.regs[0] = 0x2000_0000;
+        cpu.regs[1] = 0xAA;
+        cpu.regs[2] = 0xBB;
+        // STMIA r0!, {r1, r2}（0xC006）
+        let instr = dec.decode_halfword(0xC006, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[0], 0x2000_0008); // 回写
+        assert_eq!(mem.read_u32(0x2000_0000).unwrap(), 0xAA);
+        assert_eq!(mem.read_u32(0x2000_0004).unwrap(), 0xBB);
+        // LDMIA r0!, {r1, r2}（0xC806）
+        cpu.regs[0] = 0x2000_0000;
+        let instr = dec.decode_halfword(0xC806, 0);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[1], 0xAA);
+        assert_eq!(cpu.regs[2], 0xBB);
+        assert_eq!(cpu.regs[0], 0x2000_0008);
+    }
+
+    /// 全链路：16-bit 条件分支 B<cond>（0xD006 BEQ / 0xD106 BNE）
+    #[test]
+    fn golden_16bit_cond_branch() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        let mut dec = Decoder::new();
+        // Z=0 → BEQ 不跳
+        cpu.regs[15] = 0x1000;
+        let instr = dec.decode_halfword(0xD006, 0x1000);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        // 置 Z=1 → BEQ 跳转
+        cpu.xpsr |= 1 << 30;
+        let instr = dec.decode_halfword(0xD006, 0x1000);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Branch {
+                target: 0x1000 + 4 + 12,
+            }
+        );
+        // BNE：Z=1 → 不跳
+        let instr = dec.decode_halfword(0xD106, 0x1000);
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+    }
 }
