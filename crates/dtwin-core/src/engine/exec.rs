@@ -194,6 +194,9 @@ impl Executor {
                     self.update_flags_add(cpu, a, b, result, carry);
                 }
                 cpu.regs[*rd as usize] = result;
+                if *rd == 13 {
+                    self.sync_sp(cpu);
+                }
                 ExecOutcome::Continue
             }
             Instruction::Sub {
@@ -214,6 +217,9 @@ impl Executor {
                     self.update_flags_sub(cpu, a, b, result, borrow);
                 }
                 cpu.regs[*rd as usize] = result;
+                if *rd == 13 {
+                    self.sync_sp(cpu);
+                }
                 ExecOutcome::Continue
             }
             Instruction::And {
@@ -555,6 +561,7 @@ impl Executor {
                     }
                 }
                 cpu.regs[13] = sp;
+                self.sync_sp(cpu);
                 ExecOutcome::Continue
             }
             Instruction::Pop { regs, pc } => {
@@ -593,9 +600,11 @@ impl Executor {
                     };
                     cpu.regs[13] = sp.wrapping_add((count + 1) * 4);
                     cpu.regs[15] = val & !1; // 清 Thumb 位后直接写入 PC（与 LDM 写 PC 语义一致）
+                    self.sync_sp(cpu);
                     return ExecOutcome::Branch { target: val & !1 };
                 }
                 cpu.regs[13] = sp.wrapping_add(count * 4);
+                self.sync_sp(cpu);
                 ExecOutcome::Continue
             }
             Instruction::Ldm {
@@ -628,6 +637,9 @@ impl Executor {
                 }
                 if *writeback {
                     cpu.regs[*rn as usize] = last;
+                    if *rn == 13 {
+                        self.sync_sp(cpu);
+                    }
                 }
                 match pc_val {
                     Some(t) => ExecOutcome::Branch { target: t },
@@ -1647,6 +1659,17 @@ impl Executor {
         }
     }
 
+    /// SP 别名同步：regs[13] 变更后，按 CONTROL.SPSEL 同步到 msp/psp
+    /// （A7 修复：MSP/PSP 与 SP 运算保持一致性）
+    fn sync_sp(&self, cpu: &mut CpuState) {
+        let sp = cpu.regs[13];
+        if cpu.control & 1 == 0 {
+            cpu.msp = sp;
+        } else {
+            cpu.psp = sp;
+        }
+    }
+
     /// 逻辑操作更新标志（N/Z，C/V 由调用方处理）
     fn update_flags_logical(&self, cpu: &mut CpuState, result: u32) {
         // APSR N/Z 位（bit31/bit30）
@@ -2138,6 +2161,59 @@ mod tests {
         assert_eq!(cpu.regs[3], 0xAA);
         assert_eq!(cpu.regs[4], 0xBB);
         assert_eq!(cpu.regs[0], 0x2000_0008);
+    }
+
+    /// A7：SP 运算后同步 msp/psp（CONTROL.SPSEL=0 → msp）
+    #[test]
+    fn sp_sync_msp_psp() {
+        let (mut ex, mut cpu, mut mem) = setup();
+        // 默认 CONTROL.SPSEL=0 → SP 别名 MSP
+        cpu.regs[13] = 0x2000_1000;
+        // SUB SP, #8（0xB085）
+        let instr = Instruction::Sub {
+            rd: 13,
+            rn: 13,
+            rm: None,
+            imm: Some(8),
+            flags: false,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[13], 0x2000_0FF8);
+        assert_eq!(cpu.msp, 0x2000_0FF8, "SPSEL=0 → SP 同步到 msp");
+
+        // SPSEL=1 → SP 别名 PSP
+        cpu.control = 1;
+        cpu.regs[13] = 0x2000_2000;
+        let instr = Instruction::Add {
+            rd: 13,
+            rn: 13,
+            rm: None,
+            imm: Some(16),
+            flags: false,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.regs[13], 0x2000_2010);
+        assert_eq!(cpu.psp, 0x2000_2010, "SPSEL=1 → SP 同步到 psp");
+        assert_eq!(cpu.msp, 0x2000_0FF8, "msp 不受 PSP 运算影响");
+
+        // PUSH 也同步（SPSEL=0）
+        cpu.control = 0;
+        cpu.regs[13] = 0x2000_1000;
+        let instr = Instruction::Push {
+            regs: 0b1,
+            lr: false,
+        };
+        assert_eq!(
+            ex.execute(&mut cpu, &mut mem, &instr),
+            ExecOutcome::Continue
+        );
+        assert_eq!(cpu.msp, 0x2000_0FFC, "PUSH 后 SP 同步到 msp");
     }
 
     // ============ P1-补：16-bit LDR/STR golden（编码经 arm-none-eabi-as 实测） ============
