@@ -19,7 +19,7 @@ use dtwin_core::engine::{Engine, EngineResult};
 use dtwin_core::loader::Loader;
 use dtwin_core::memory::Memory;
 use dtwin_core::nvic::Nvic;
-use dtwin_core::uart::CmsdkUart;
+use dtwin_core::uart::{CmsdkUart, Lpuart0Uart};
 use dtwin_core::CpuState;
 
 /// Driver Twin — 芯片级精度 ARM Cortex-M 行为模拟器
@@ -54,6 +54,9 @@ enum Commands {
         /// yuleASR QEMU 兼容固件实际访问 0x40004000，需显式指定）
         #[arg(long, value_parser = parse_hex_u32)]
         uart_base: Option<u32>,
+        /// UART 行为模型：cmsdk（默认，E2E 兼容）/ lpuart0（真实 S32K312 LPUART0）
+        #[arg(long, value_parser = clap::value_parser!(UartModel), default_value_t = UartModel::Cmsdk)]
+        uart_model: UartModel,
     },
     /// 创建模拟实例
     Create {
@@ -93,7 +96,8 @@ fn main() -> ExitCode {
             chip,
             max_instructions,
             uart_base,
-        } => match cmd_run(&elf, &chip, max_instructions, uart_base) {
+            uart_model,
+        } => match cmd_run(&elf, &chip, max_instructions, uart_base, uart_model) {
             Ok(rc) => ExitCode::from(rc),
             Err(e) => {
                 eprintln!("[run] 错误: {e:#}");
@@ -126,6 +130,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// UART 行为模型选择
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lower")]
+enum UartModel {
+    /// CMSDK APB UART（QEMU MPS2 兼容，yuleASR QEMU 固件用）
+    Cmsdk,
+    /// 真实 S32K312 LPUART0（0x40180000，TDRE/TC/RDRF 位定义）
+    Lpuart0,
+}
+
+impl std::fmt::Display for UartModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UartModel::Cmsdk => write!(f, "cmsdk"),
+            UartModel::Lpuart0 => write!(f, "lpuart0"),
+        }
+    }
+}
+
 /// 解析十六进制/十进制地址（CLI 友好：支持 0x 前缀）
 fn parse_hex_u32(s: &str) -> Result<u32, String> {
     let t = s.trim();
@@ -145,10 +168,17 @@ fn chip_profile(name: &str) -> anyhow::Result<dtwin_chip::ChipProfile> {
     }
 }
 
-/// 从芯片 profile 构造内存并挂接默认 UART（S32K312 LPUART0 0x40180000）
-fn memory_with_uart(profile: &dtwin_chip::ChipProfile, uart_base: u32) -> Memory {
+/// 从芯片 profile 构造内存并挂接 UART 行为模型
+fn memory_with_uart(profile: &dtwin_chip::ChipProfile, uart_base: u32, model: UartModel) -> Memory {
     let mut mem = memory_from_profile(profile);
-    mem.attach_peripheral(CmsdkUart::with_echo(uart_base, true));
+    match model {
+        UartModel::Cmsdk => {
+            mem.attach_peripheral(CmsdkUart::with_echo(uart_base, true));
+        }
+        UartModel::Lpuart0 => {
+            mem.attach_peripheral(Lpuart0Uart::with_echo(uart_base, true));
+        }
+    }
     mem
 }
 
@@ -179,28 +209,30 @@ fn cmd_load(elf: &PathBuf, chip: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `dtwin run <elf> --chip S32K312 [--max-instructions N] [--uart-base ADDR]`
+/// `dtwin run <elf> --chip S32K312 [--max-instructions N] [--uart-base ADDR] [--uart-model cmsdk|lpuart0]`
 fn cmd_run(
     elf: &PathBuf,
     chip: &str,
     max_instructions: u64,
     uart_base: Option<u32>,
+    uart_model: UartModel,
 ) -> anyhow::Result<u8> {
     let profile = chip_profile(chip)?;
     // 默认 UART 基址 = S32K312 LPUART0；yuleASR QEMU 兼容固件需 --uart-base 0x40004000
     let base = uart_base.unwrap_or(0x4018_0000);
-    let mut mem = memory_with_uart(&profile, base);
+    let mut mem = memory_with_uart(&profile, base, uart_model);
     let mut cpu = CpuState::default();
 
     let summary = Loader::load_elf(elf, &mut mem, &mut cpu)
         .with_context(|| format!("加载固件 {}", elf.display()))?;
     println!(
-        "[run] 加载 {} -> SP={:#010x} PC={:#010x} (chip={}, uart={:#x})",
+        "[run] 加载 {} -> SP={:#010x} PC={:#010x} (chip={}, uart={:#x}, uart_model={:?})",
         elf.display(),
         summary.initial_sp,
         summary.entry_pc,
         chip,
-        base
+        base,
+        uart_model
     );
 
     let mut nvic = Nvic::new();
