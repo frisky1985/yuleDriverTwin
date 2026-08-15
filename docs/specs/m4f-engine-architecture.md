@@ -82,10 +82,27 @@
 
 ## 6. 验收标准
 
-| 编号 | 场景 | 预期 |
-|------|------|------|
-| M4F-01 | `dtwin create --chip STM32F407VG` | 实例创建，内核=Cortex-M4F，168MHz |
-| M4F-02 | 加载 FPU 驱动 ELF（含 VADD/VCVT） | FPU 指令正确执行，FPSCR 更新 |
-| M4F-03 | DSP 饱和指令（SSAT/QADD） | 饱和行为与硬件一致，Q 标志置位 |
-| M4F-04 | 中断嵌套（FPU 上下文切换） | 惰性压栈正确，浮点状态保存/恢复 |
-| M4F-05 | GDB 连接查看 S0-S31 | 浮点寄存器可读写 |
+> 状态更新（2026-08-16）：M4F-01/02/03 已达成；M4F-04/05 未达成（异常嵌套为骨架、GDB 集成未实现）。详见下方状态列。
+
+| 编号 | 场景 | 预期 | 状态 |
+|------|------|------|------|
+| M4F-01 | `dtwin create --chip STM32F407VG` | 实例创建，内核=Cortex-M4F，168MHz | ✅ 达成（S32K312 profile 亦可用） |
+| M4F-02 | 加载 FPU 驱动 ELF（含 VADD/VCVT） | FPU 指令正确执行，FPSCR 更新 | ✅ 达成（Phase 4 + E2E 固件） |
+| M4F-03 | DSP 饱和指令（SSAT/QADD） | 饱和行为与硬件一致，Q 标志置位 | ✅ 达成（Phase 3 + golden 测试） |
+| M4F-04 | 中断嵌套（FPU 上下文切换） | 惰性压栈正确，浮点状态保存/恢复 | ❌ 未达成（异常入口/出口为骨架，FPU 上下文切换未实现） |
+| M4F-05 | GDB 连接查看 S0-S31 | 浮点寄存器可读写 | ❌ 未达成（dtwin-gdb crate 仅骨架，GDB RSP 未实现） |
+
+### 6.1 E2E 覆盖边界（2026-08-16 记录）
+
+现有 E2E 固件（yuleASR QEMU 兼容固件 + e2e_driver_stress）覆盖：
+- 16/32 位 LDR/STR 家族（含 LDRSH/LDRSB 符号扩展、LDRD/STRD 双字）
+- DSP（SSAT/USAT/QADD/SADD16）、FPU（VADD/VMUL/VCVT）、IT 块、MRS/MSR、TST.W 位测试、移位链
+- UART 输出与 QEMU 黄金逐行一致（27/27 检查行）
+
+未覆盖：异常/中断嵌套路径、FPU 上下文切换（M4F-04 依赖）；GDB 调试链路（M4F-05）。
+
+### 6.2 参考分歧记录（2026-08-16）
+
+- **SADD16 GE 标志**：与 QEMU `op_addsub.h` 交叉核对一致（小克 2620e2e 已按 QEMU 语义实现）
+- **MRS SYSm 表**：M-profile 0x01/0x02 = IAPSR/EAPSR（非 A-profile APSR_nzcvqg，P1-7 修复）
+- **SUB 编码 op4**：实测 SUB=0xD（0xB 为 SBC，与部分文档记忆相反，以汇编器为准）
