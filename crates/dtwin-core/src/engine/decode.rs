@@ -251,6 +251,30 @@ pub enum Instruction {
         load: bool,
         double: bool,
     },
+    /// VLDM/VSTM: 多寄存器加载/存储（S 或 D 列表，IA/DB + 回写）
+    FpLoadStoreMulti {
+        /// 起始寄存器索引（SP: S[vd..]；DP: D[vd..]）
+        vd: u8,
+        rn: u8,
+        /// 寄存器个数（imm8 按字计算：SP = imm8，DP = imm8/2）
+        count: u32,
+        load: bool,
+        double: bool,
+        /// true = DB（先减后访存），false = IA
+        decrement: bool,
+        writeback: bool,
+    },
+    /// VCVT 定点转换（Vd 与源同寄存器，仅单精度）
+    FpCvtFixed {
+        vd: u8,
+        /// 小数位数 fbits
+        fbits: u8,
+        /// 整数宽度：16 或 32
+        width: u8,
+        signed: bool,
+        /// true = 定点 → 浮点；false = 浮点 → 定点
+        to_float: bool,
+    },
 
     /// 未实现指令
     Unimplemented { bits: u32 },
@@ -566,6 +590,13 @@ impl Decoder {
             if let Some(instr) = self.try_decode_fpu(bits) {
                 return instr;
             }
+        }
+        // VLDM/VSTM（0xECxx IA 家族；0xED2x/0xED3x DB 家族需 W=1，避开 VLDR/VSTR）
+        if ((top & 0xFF00) == 0xEC00 || ((top & 0xFF00) == 0xED00 && (top & 0x20) != 0))
+            && (bits & 0x0E00) == 0x0A00
+            && (bits & 0x00F0) == 0
+        {
+            return self.decode_vldm_vstm(bits);
         }
         // VLDR/VSTR（0xED00，bit21=0）
         if (top & 0xFF00) == 0xED00
@@ -911,6 +942,30 @@ impl Decoder {
             (sp_vd(bits), sp_vm(bits))
         };
 
+        // ---- VCVT 定点（0xEEBA/0xEEBB = 定点→F32，0xEEBE/0xEEBF = F32→定点）----
+        // bits[7:4] = 0x4（16 位）/ 0xC（32 位），fbits = N - (bits[3:0] << 1)；
+        // Vd 与 Vm 同寄存器（编码无独立 Vm 字段）。
+        if matches!(top & 0xF, 0xA | 0xB | 0xE | 0xF) {
+            let width_marker = (bits >> 4) & 0xF;
+            if width_marker == 0x4 || width_marker == 0xC {
+                let width = if width_marker == 0x4 { 16u8 } else { 32u8 };
+                let n = width as u32;
+                let fb = (bits & 0xF) << 1;
+                if fb < n {
+                    let to_float = matches!(top & 0xF, 0xA | 0xB);
+                    let signed = matches!(top & 0xF, 0xA | 0xE);
+                    return Instruction::FpCvtFixed {
+                        vd,
+                        fbits: (n - fb) as u8,
+                        width,
+                        signed,
+                        to_float,
+                    };
+                }
+            }
+            return Instruction::Unimplemented { bits };
+        }
+
         match op5 {
             _ if (low & 0xF0) == 0 => {
                 // VMOV（立即数）：bits[7:4]=0000，imm8 = bits[19:16]<<4 | bits[3:0]
@@ -1032,6 +1087,46 @@ impl Decoder {
                 }
             }
             _ => Instruction::Unimplemented { bits },
+        }
+    }
+
+    /// 解码 VLDM/VSTM（编码 1110 110P U D L Rn Vd 101x imm8）
+    /// SP 寄存器索引 = (Vd<<1)|D；DP 索引 = D0-D15（D=1 → D16+ 未支持，诚实 Unimplemented）
+    fn decode_vldm_vstm(&self, bits: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let p = (top >> 8) & 1 == 1; // bit24
+        let u = (top >> 7) & 1 == 1; // bit23
+        let d = (top >> 6) & 1 == 1; // bit22
+        let w = (top >> 5) & 1 == 1; // bit21
+        let l = (top >> 4) & 1 == 1; // bit20
+        let rn = (top & 0xF) as u8;
+        let vd_field = ((bits >> 12) & 0xF) as u8;
+        let double = (bits >> 8) & 1 == 1; // sz
+        let imm8 = bits & 0xFF;
+        // 仅 IA（P=0,U=1）与 DB（P=1,U=0）为合法组合
+        if p == u {
+            return Instruction::Unimplemented { bits };
+        }
+        let decrement = !u; // DB
+        // 寄存器个数：imm8 为字数；SP 每寄存器 1 字，DP 每寄存器 2 字
+        let count = imm8 / if double { 2 } else { 1 };
+        let vd = if double {
+            if d {
+                // D16-D31 超出 FpuRegisters D0-D15 骨架
+                return Instruction::Unimplemented { bits };
+            }
+            vd_field
+        } else {
+            (vd_field << 1) | d as u8
+        };
+        Instruction::FpLoadStoreMulti {
+            vd,
+            rn,
+            count,
+            load: l,
+            double,
+            decrement,
+            writeback: w,
         }
     }
 
@@ -1665,6 +1760,177 @@ mod tests {
         assert_eq!(
             d.decode_word(0xF382_8820, 0),
             Instruction::Unimplemented { bits: 0xF382_8820 }
+        );
+    }
+
+    // ============ P4-补：VLDM/VSTM + VCVT 定点解码（编码经 arm-none-eabi-as 实测） ============
+
+    /// VLDM/VSTM 解码：SP/DP、IA/DB、回写、S16+（D 位）
+    #[test]
+    fn decode_vldm_vstm_variants() {
+        let mut d = Decoder::new();
+        // VSTMIA r0, {s0-s3} = 0xEC80 0A04
+        assert_eq!(
+            d.decode_word(0xEC80_0A04, 0),
+            Instruction::FpLoadStoreMulti {
+                vd: 0,
+                rn: 0,
+                count: 4,
+                load: false,
+                double: false,
+                decrement: false,
+                writeback: false,
+            }
+        );
+        // VLDMIA r0, {s0-s3} = 0xEC90 0A04
+        assert_eq!(
+            d.decode_word(0xEC90_0A04, 0),
+            Instruction::FpLoadStoreMulti {
+                vd: 0,
+                rn: 0,
+                count: 4,
+                load: true,
+                double: false,
+                decrement: false,
+                writeback: false,
+            }
+        );
+        // VSTMDB r0!, {s0-s3} = 0xED20 0A04（回写 + 先减）
+        assert_eq!(
+            d.decode_word(0xED20_0A04, 0),
+            Instruction::FpLoadStoreMulti {
+                vd: 0,
+                rn: 0,
+                count: 4,
+                load: false,
+                double: false,
+                decrement: true,
+                writeback: true,
+            }
+        );
+        // VLDMIA r1!, {s16-s19} = 0xECB1 8A04（D=0, Vd=8 → S16；回写）
+        assert_eq!(
+            d.decode_word(0xECB1_8A04, 0),
+            Instruction::FpLoadStoreMulti {
+                vd: 16,
+                rn: 1,
+                count: 4,
+                load: true,
+                double: false,
+                decrement: false,
+                writeback: true,
+            }
+        );
+        // VLDMIA r0, {s1-s2} = 0xECC0 0A02（D=1, Vd=0 → S1；无回写）
+        assert_eq!(
+            d.decode_word(0xECC0_0A02, 0),
+            Instruction::FpLoadStoreMulti {
+                vd: 1,
+                rn: 0,
+                count: 2,
+                load: false,
+                double: false,
+                decrement: false,
+                writeback: false,
+            }
+        );
+        // VSTMIA r0, {d0-d1} = 0xEC80 0B04（DP：count = 4/2 = 2）
+        assert_eq!(
+            d.decode_word(0xEC80_0B04, 0),
+            Instruction::FpLoadStoreMulti {
+                vd: 0,
+                rn: 0,
+                count: 2,
+                load: false,
+                double: true,
+                decrement: false,
+                writeback: false,
+            }
+        );
+        // VSTMDB r0!, {d0-d1} = 0xED20 0B04
+        assert_eq!(
+            d.decode_word(0xED20_0B04, 0),
+            Instruction::FpLoadStoreMulti {
+                vd: 0,
+                rn: 0,
+                count: 2,
+                load: false,
+                double: true,
+                decrement: true,
+                writeback: true,
+            }
+        );
+    }
+
+    /// VCVT 定点解码：S16/U16/S32/U32 双向、fbits 计算
+    #[test]
+    fn decode_vcvt_fixed_variants() {
+        let mut d = Decoder::new();
+        // VCVT.S16.F32 s0, s0, #8 = 0xEEBE 0A44
+        assert_eq!(
+            d.decode_word(0xEEBE_0A44, 0),
+            Instruction::FpCvtFixed {
+                vd: 0,
+                fbits: 8,
+                width: 16,
+                signed: true,
+                to_float: false,
+            }
+        );
+        // VCVT.U16.F32 s0, s0, #8 = 0xEEBF 0A44
+        assert_eq!(
+            d.decode_word(0xEEBF_0A44, 0),
+            Instruction::FpCvtFixed {
+                vd: 0,
+                fbits: 8,
+                width: 16,
+                signed: false,
+                to_float: false,
+            }
+        );
+        // VCVT.S32.F32 s4, s4, #16 = 0xEEBE 2AC8（Vd=S4）
+        assert_eq!(
+            d.decode_word(0xEEBE_2AC8, 0),
+            Instruction::FpCvtFixed {
+                vd: 4,
+                fbits: 16,
+                width: 32,
+                signed: true,
+                to_float: false,
+            }
+        );
+        // VCVT.U32.F32 s0, s0, #16 = 0xEEBF 0AC8
+        assert_eq!(
+            d.decode_word(0xEEBF_0AC8, 0),
+            Instruction::FpCvtFixed {
+                vd: 0,
+                fbits: 16,
+                width: 32,
+                signed: false,
+                to_float: false,
+            }
+        );
+        // VCVT.F32.S16 s0, s0, #8 = 0xEEBA 0A44（定点→浮点）
+        assert_eq!(
+            d.decode_word(0xEEBA_0A44, 0),
+            Instruction::FpCvtFixed {
+                vd: 0,
+                fbits: 8,
+                width: 16,
+                signed: true,
+                to_float: true,
+            }
+        );
+        // VCVT.F32.U32 s3, s3, #16 = 0xEEFB 1AC8（U32→F32，Vd=S3）
+        assert_eq!(
+            d.decode_word(0xEEFB_1AC8, 0),
+            Instruction::FpCvtFixed {
+                vd: 3,
+                fbits: 16,
+                width: 32,
+                signed: false,
+                to_float: true,
+            }
         );
     }
 }

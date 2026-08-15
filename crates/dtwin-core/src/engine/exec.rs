@@ -1055,6 +1055,113 @@ impl Executor {
                 }
                 ExecOutcome::Continue
             }
+            Instruction::FpLoadStoreMulti {
+                vd,
+                rn,
+                count,
+                load,
+                double,
+                decrement,
+                writeback,
+            } => {
+                let base = cpu.regs[*rn as usize];
+                let bytes = (*count as u32) * if *double { 8 } else { 4 };
+                let addr = if *decrement {
+                    base.wrapping_sub(bytes)
+                } else {
+                    base
+                };
+                // 对齐：字对齐（VFP 多寄存器访问 4 字节对齐）
+                if addr & 3 != 0 {
+                    return ExecOutcome::Fault {
+                        reason: super::FaultReason::UnalignedAccess { address: addr },
+                    };
+                }
+                let fpu = &mut cpu.fpu;
+                let stride = if *double { 8 } else { 4 };
+                for i in 0..*count {
+                    let a = addr + i * stride;
+                    if *double {
+                        let reg = *vd as usize + i as usize;
+                        if *load {
+                            let lo = match memory.read_u32(a) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    return ExecOutcome::Fault {
+                                        reason: self.map_mem_fault(e),
+                                    }
+                                }
+                            };
+                            let hi = match memory.read_u32(a + 4) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    return ExecOutcome::Fault {
+                                        reason: self.map_mem_fault(e),
+                                    }
+                                }
+                            };
+                            fpu.write_d(reg, (lo as u64) | ((hi as u64) << 32));
+                        } else {
+                            let v = fpu.read_d(reg);
+                            if let Err(e) = memory.write_u32(a, v as u32) {
+                                return ExecOutcome::Fault {
+                                    reason: self.map_mem_fault(e),
+                                };
+                            }
+                            if let Err(e) = memory.write_u32(a + 4, (v >> 32) as u32) {
+                                return ExecOutcome::Fault {
+                                    reason: self.map_mem_fault(e),
+                                };
+                            }
+                        }
+                    } else if *load {
+                        match memory.read_u32(a) {
+                            Ok(v) => fpu.write_s(*vd as usize + i as usize, v),
+                            Err(e) => {
+                                return ExecOutcome::Fault {
+                                    reason: self.map_mem_fault(e),
+                                }
+                            }
+                        }
+                    } else {
+                        match memory.write_u32(a, fpu.read_s(*vd as usize + i as usize)) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                return ExecOutcome::Fault {
+                                    reason: self.map_mem_fault(e),
+                                }
+                            }
+                        }
+                    }
+                }
+                if *writeback {
+                    let final_addr = if *decrement {
+                        base.wrapping_sub(bytes)
+                    } else {
+                        base.wrapping_add(bytes)
+                    };
+                    cpu.regs[*rn as usize] = final_addr;
+                }
+                ExecOutcome::Continue
+            }
+            Instruction::FpCvtFixed {
+                vd,
+                fbits,
+                width,
+                signed,
+                to_float,
+            } => {
+                let fpu = &mut cpu.fpu;
+                let v = fpu.read_s(*vd as usize);
+                let (r, flags) = if *to_float {
+                    fpu::cvt_fixed_to_f32(fpu, v, *fbits, *signed, *width)
+                } else {
+                    fpu::cvt_f32_to_fixed(fpu, v, *fbits, *signed, *width)
+                };
+                self.apply_fpu_flags(fpu, &flags);
+                fpu.write_s(*vd as usize, r);
+                ExecOutcome::Continue
+            }
             Instruction::Unimplemented { .. } => ExecOutcome::Fault {
                 reason: super::FaultReason::UnimplementedInstr,
             },

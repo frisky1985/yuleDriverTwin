@@ -879,6 +879,80 @@ pub fn cvt_f64_to_f32(fpu: &FpuRegisters, bits: u64) -> (u32, FpOpFlags) {
     (res.to_bits(), flags)
 }
 
+// ==================== VCVT 定点转换（P4-补） ====================
+
+/// f32 → 定点（VCVT.S16.F32 等）：按 FPSCR 舍入模式取整(Sm × 2^fbits)，
+/// 饱和到目标宽度（超出范围 → FPSCR.QC）。NaN → 0 + IOC；舍入发生 → IXC。
+/// 注意：×2^fbits 为 2 的幂缩放，f64 中间量精确。
+pub fn cvt_f32_to_fixed(
+    fpu: &FpuRegisters,
+    bits: u32,
+    fbits: u8,
+    signed: bool,
+    width: u8,
+) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    let f = f32::from_bits(bits);
+    if f.is_nan() {
+        flags.ioc = true;
+        return (0, flags);
+    }
+    let scaled = (f as f64) * ((1u64 << fbits) as f64);
+    let rounded = match fpu.rounding_mode() {
+        FpRounding::Nearest => scaled.round_ties_even(),
+        FpRounding::Zero => scaled.trunc(),
+        FpRounding::PlusInf => scaled.ceil(),
+        FpRounding::MinusInf => scaled.floor(),
+    };
+    let (min, max) = if signed {
+        (-(1i64 << (width - 1)), (1i64 << (width - 1)) - 1)
+    } else {
+        (0, (1i64 << width) - 1)
+    };
+    let (val, saturated) = if f.is_infinite() || rounded > max as f64 {
+        (max, true)
+    } else if rounded < min as f64 {
+        (min, true)
+    } else {
+        (rounded as i64, false)
+    };
+    if saturated {
+        flags.qc = true;
+    }
+    if rounded != scaled {
+        flags.ixc = true;
+    }
+    (val as u32, flags)
+}
+
+/// 定点 → f32（VCVT.F32.S16 等）：符号/零扩展值 ÷ 2^fbits（2 的幂，f64 精确），
+/// 按 FPSCR 舍入模式取 f32；不精确 → IXC。
+pub fn cvt_fixed_to_f32(
+    fpu: &FpuRegisters,
+    bits: u32,
+    fbits: u8,
+    signed: bool,
+    width: u8,
+) -> (u32, FpOpFlags) {
+    let mut flags = FpOpFlags::default();
+    let raw = bits & if width == 16 { 0xFFFF } else { 0xFFFF_FFFF };
+    let val = if signed {
+        if width == 16 {
+            (raw as u16 as i16) as f64
+        } else {
+            (raw as i32) as f64
+        }
+    } else {
+        raw as f64
+    };
+    let exact = val / ((1u64 << fbits) as f64);
+    let r = round_f64_per_mode_f32(fpu.rounding_mode(), exact);
+    if (r as f64) != exact {
+        flags.ixc = true;
+    }
+    (r.to_bits(), flags)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,5 +1409,161 @@ mod tests {
                 }
             }
         );
+    }
+
+    // ============ P4-补：VLDM/VSTM + VCVT 定点 golden（编码经 arm-none-eabi-as 实测） ============
+
+    /// VSTMIA/VLDMIA 单精度多寄存器往返
+    #[test]
+    fn golden_vstm_vldm_roundtrip() {
+        // GIVEN: R0 = 0x2000_0000，S0-S3 = 1.0/2.0/3.0/4.0
+        let mut h = Harness::new();
+        h.cpu.regs[0] = 0x2000_0000;
+        for (i, v) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+            h.cpu.fpu.write_s(i, v.to_bits());
+        }
+        // WHEN: VSTMIA r0, {s0-s3}（0xEC80 0A04）
+        assert_eq!(h.exec_word(0xEC80_0A04), ExecOutcome::Continue);
+        // THEN: 内存依次为 1.0/2.0/3.0/4.0
+        for (i, v) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+            assert_eq!(h.mem.read_u32(0x2000_0000 + i as u32 * 4).unwrap(), v.to_bits());
+        }
+        // WHEN: VLDMIA r0, {s0-s3}（0xEC90 0A04）
+        h.cpu.fpu.write_s(0, 0);
+        h.cpu.fpu.write_s(1, 0);
+        h.cpu.fpu.write_s(2, 0);
+        h.cpu.fpu.write_s(3, 0);
+        h.cpu.regs[0] = 0x2000_0000;
+        assert_eq!(h.exec_word(0xEC90_0A04), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(1.0));
+        assert_eq!(h.cpu.fpu.read_s(1), f32(2.0));
+        assert_eq!(h.cpu.fpu.read_s(2), f32(3.0));
+        assert_eq!(h.cpu.fpu.read_s(3), f32(4.0));
+    }
+
+    /// VLDMIA 回写 + VSTMDB 先减后存
+    #[test]
+    fn golden_vldm_writeback_vstmdb() {
+        let mut h = Harness::new();
+        // VSTMDB r0!, {s0-s3}：R0 = 0x2000_0010 → 数据写入 0x2000_0000..0x2000_000C，R0 回写 0x2000_0000
+        h.cpu.regs[0] = 0x2000_0010;
+        for (i, v) in [1.0f32, 2.0, 3.0, 4.0].iter().enumerate() {
+            h.cpu.fpu.write_s(i, v.to_bits());
+        }
+        assert_eq!(h.exec_word(0xED20_0A04), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x2000_0000);
+        assert_eq!(h.mem.read_u32(0x2000_0000).unwrap(), f32(1.0));
+        assert_eq!(h.mem.read_u32(0x2000_000C).unwrap(), f32(4.0));
+        // VLDMIA r0!, {s0-s3}：R0 = 0x2000_0000 → 加载后回写 0x2000_0010
+        h.cpu.fpu.write_s(0, 0);
+        h.cpu.regs[0] = 0x2000_0000;
+        assert_eq!(h.exec_word(0xECB0_0A04), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x2000_0010);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(1.0));
+        assert_eq!(h.cpu.fpu.read_s(3), f32(4.0));
+    }
+
+    /// VLDM/VSTM 双精度 + 高 S 寄存器（S16-S19，D 位）
+    #[test]
+    fn golden_vldm_double_and_s16() {
+        let mut h = Harness::new();
+        // 双精度：VSTMIA r0, {d0-d1}（0xEC80 0B04）
+        h.cpu.regs[0] = 0x2000_0000;
+        h.cpu.fpu.write_d(0, 2.5f64.to_bits());
+        h.cpu.fpu.write_d(1, (-1.25f64).to_bits());
+        assert_eq!(h.exec_word(0xEC80_0B04), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u32(0x2000_0000).unwrap(), 2.5f64.to_bits() as u32);
+        assert_eq!(h.mem.read_u32(0x2000_0008).unwrap(), (-1.25f64).to_bits() as u32);
+        // VLDMIA r0, {d0-d1}（0xEC90 0B04）
+        h.cpu.fpu.write_d(0, 0);
+        h.cpu.fpu.write_d(1, 0);
+        assert_eq!(h.exec_word(0xEC90_0B04), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_d(0), 2.5f64.to_bits());
+        assert_eq!(h.cpu.fpu.read_d(1), (-1.25f64).to_bits());
+        // S16-S19：VLDMIA r1!, {s16-s19}（0xECB1 8A04）
+        for (i, v) in [1.5f32, -2.5, 3.5, -4.5].iter().enumerate() {
+            h.mem.write_u32(0x2000_0000 + i as u32 * 4, v.to_bits()).unwrap();
+        }
+        h.cpu.regs[1] = 0x2000_0000;
+        assert_eq!(h.exec_word(0xECB1_8A04), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(16), f32(1.5));
+        assert_eq!(h.cpu.fpu.read_s(17), f32(-2.5));
+        assert_eq!(h.cpu.fpu.read_s(18), f32(3.5));
+        assert_eq!(h.cpu.fpu.read_s(19), f32(-4.5));
+        assert_eq!(h.cpu.regs[1], 0x2000_0010);
+    }
+
+    /// VCVT.S16.F32：定点换算 + 饱和 → QC
+    #[test]
+    fn golden_vcvt_s16_f32_fixed() {
+        let mut h = Harness::new();
+        // GIVEN: S0 = 1.5（Q15 定点 fbits=8 → 1.5×256 = 384）
+        h.cpu.fpu.write_s(0, f32(1.5));
+        // WHEN: VCVT.S16.F32 S0, S0, #8（0xEEBE 0A44）
+        assert_eq!(h.exec_word(0xEEBE_0A44), ExecOutcome::Continue);
+        // THEN: S0 = 384（位模式），QC 不置位
+        assert_eq!(h.cpu.fpu.read_s(0), 384);
+        assert!(!h.cpu.fpu.qc());
+        // 饱和：S0 = 1000.0 → 1000×256 = 256000 > 32767 → 饱和 32767 + QC
+        h.cpu.fpu.write_s(0, f32(1000.0));
+        assert_eq!(h.exec_word(0xEEBE_0A44), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0) as i32, 32767);
+        assert!(h.cpu.fpu.qc());
+    }
+
+    /// VCVT.F32.S16：定点 → 浮点
+    #[test]
+    fn golden_vcvt_f32_s16_fixed() {
+        let mut h = Harness::new();
+        // GIVEN: S0 = 384（Q15：384 / 256 = 1.5）
+        h.cpu.fpu.write_s(0, 384);
+        // WHEN: VCVT.F32.S16 S0, S0, #8（0xEEBA 0A44）
+        assert_eq!(h.exec_word(0xEEBA_0A44), ExecOutcome::Continue);
+        // THEN: S0 = 1.5
+        assert_eq!(h.cpu.fpu.read_s(0), f32(1.5));
+        // 负值：-0.5 → -128 / 256 = -0.5
+        h.cpu.fpu.write_s(0, 0xFFFF_FF80u32); // -128 符号扩展
+        assert_eq!(h.exec_word(0xEEBA_0A44), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(-0.5));
+    }
+
+    /// VCVT.S32.F32 #16 与 VCVT.F32.S32 #16（Q16.16）
+    #[test]
+    fn golden_vcvt_s32_f32_q16() {
+        let mut h = Harness::new();
+        // 1.5 × 65536 = 98304
+        h.cpu.fpu.write_s(0, f32(1.5));
+        // WHEN: VCVT.S32.F32 S0, S0, #16（0xEEBE 0AC8）
+        assert_eq!(h.exec_word(0xEEBE_0AC8), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), 98304);
+        // WHEN: VCVT.F32.S32 S0, S0, #16（0xEEBA 0AC8）→ 98304 / 65536 = 1.5
+        assert_eq!(h.exec_word(0xEEBA_0AC8), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), f32(1.5));
+        // 饱和：S0 = 1e10 → 超 2^31 → 饱和 0x7FFF_FFFF + QC
+        h.cpu.fpu.write_s(0, f32(1e10));
+        assert_eq!(h.exec_word(0xEEBE_0AC8), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), 0x7FFF_FFFF);
+        assert!(h.cpu.fpu.qc());
+        // U32：负值 → 饱和 0 + QC
+        h.cpu.fpu.write_s(0, f32(-1.0));
+        assert_eq!(h.exec_word(0xEEBF_0AC8), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), 0);
+        assert!(h.cpu.fpu.qc());
+    }
+
+    /// VCVT 定点 NaN → IOC；舍入 → IXC
+    #[test]
+    fn golden_vcvt_fixed_flags() {
+        let mut h = Harness::new();
+        // NaN → 0 + IOC
+        h.cpu.fpu.write_s(0, 0x7FC0_0000);
+        assert_eq!(h.exec_word(0xEEBE_0A44), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), 0);
+        assert_ne!(h.cpu.fpu.fpscr & 1, 0);
+        // 0.1 × 256 = 25.6 → 舍入 26，IXC 置位
+        h.cpu.fpu.write_s(0, f32(0.1));
+        assert_eq!(h.exec_word(0xEEBE_0A44), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), 26);
+        assert_ne!(h.cpu.fpu.fpscr & (1 << 4), 0);
     }
 }
