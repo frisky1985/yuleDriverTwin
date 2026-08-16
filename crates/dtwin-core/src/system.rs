@@ -196,6 +196,36 @@ impl SystemBlock {
         self.syst_ctrl
     }
 
+    /// SHPR1（MemManage/BusFault/UsageFault/DebugMonitor 优先级字节，FRT-SYS-04）
+    pub fn shpr1(&self) -> u32 {
+        self.shpr1
+    }
+
+    /// SHPR2（SVCall 优先级字节）
+    pub fn shpr2(&self) -> u32 {
+        self.shpr2
+    }
+
+    /// SHPR3（SysTick/PendSV 优先级字节）
+    pub fn shpr3(&self) -> u32 {
+        self.shpr3
+    }
+
+    /// VTOR（向量表基址；本阶段恒 0）
+    pub fn vtor(&self) -> u32 {
+        self.vtor
+    }
+
+    /// CCR.STKALIGN（异常入口 8 字节对齐开关；复位=1）
+    pub fn ccr_stkalign(&self) -> bool {
+        self.ccr & (1 << 9) != 0
+    }
+
+    /// 挂起位图全量（bit n = 异常 n 挂起；供引擎优先级仲裁扫描）
+    pub fn pended_bits(&self) -> u16 {
+        self.pended
+    }
+
     /// 读寄存器（addr 为绝对地址；支持字节/半字/字 lane，按 width 屏蔽）
     /// 注：SysTick CTRL 整字读取后 COUNTFLAG 硬件自动清零（ARM/QEMU 读即清，FRT-SYS-01）
     fn read_reg(&mut self, addr: u32, width: u32) -> u32 {

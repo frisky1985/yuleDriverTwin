@@ -136,6 +136,8 @@ pub struct Nvic {
     pub priority: [u8; 240],
     /// 当前异常号（0 = 线程模式）
     pub current_exception: u8,
+    /// 嵌套历史（enter 压栈旧值，exit 弹栈恢复；首元素恒 0 = 线程模式基线）
+    pub exception_stack: Vec<u8>,
     /// 嵌套深度
     pub nesting_depth: u8,
     /// 异常追踪日志
@@ -162,6 +164,7 @@ impl Nvic {
             active: [0; 8],
             priority: [0; 240],
             current_exception: 0,
+            exception_stack: vec![0],
             nesting_depth: 0,
             events: Vec::new(),
             clock_ns: 0,
@@ -222,8 +225,11 @@ impl Nvic {
         None
     }
 
-    /// 进入异常：current_exception 置位，记录事件
+    /// 进入异常：current_exception 置位（嵌套历史压栈），记录事件
+    /// 注：P3 起该函数由引擎在真实异常入口（压栈/跳向量完成后）调用，
+    /// 不再承担「入口」职责（见 Engine::take_exception）
     pub fn enter_exception(&mut self, number: u8) {
+        self.exception_stack.push(self.current_exception);
         self.current_exception = number;
         self.nesting_depth += 1;
         let irq_num: u16 = if number >= 16 { number as u16 - 16 } else { 0 };
@@ -241,19 +247,27 @@ impl Nvic {
         });
     }
 
-    /// 退出异常：恢复当前异常号
+    /// 退出异常：恢复上一个活跃异常号（嵌套历史弹栈）
+    /// 注：P3 起该函数由引擎在真实异常出口（弹栈/恢复完成后）调用
     pub fn exit_exception(&mut self) {
         if self.nesting_depth > 0 {
             self.nesting_depth -= 1;
         }
-        // 弹栈恢复上一个活跃异常（简化：直接回线程模式）
+        let exiting = self.current_exception;
+        if let Some(prev) = self.exception_stack.pop() {
+            self.current_exception = prev;
+        } else {
+            self.exception_stack.push(0);
+            self.current_exception = 0;
+        }
         if let Some(ev) = self.events.last_mut() {
             ev.exec_duration_ns = self.clock_ns.saturating_sub(ev.response_time_ns);
         }
-        self.current_exception = 0;
-        // 外部中断活跃位清除
-        for a in self.active.iter_mut() {
-            *a = 0;
+        // 外部中断活跃位清除（仅清除正在退出的 IRQ）
+        if exiting >= 16 {
+            let irq = (exiting - 16) as u16;
+            let idx = (irq / 32) as usize;
+            self.active[idx] &= !(1 << (irq % 32));
         }
     }
 }

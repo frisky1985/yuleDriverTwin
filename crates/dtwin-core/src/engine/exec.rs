@@ -18,8 +18,11 @@ pub enum ExecOutcome {
     Continue,
     /// 分支跳转
     Branch { target: u32 },
-    /// 异常返回（BX LR 特殊形式）
-    ExceptionReturn,
+    /// 异常返回（BX EXC_RETURN 特殊形式，携带 EXC_RETURN 值）
+    ExceptionReturn { exc_return: u32 },
+    /// 触发硬件异常入口（SVC → 异常 11；引擎负责压栈/跳向量）
+    /// return_pc：同步异常（SVC）现场帧的 PC 槽 = 下一条指令地址（PC+宽度）
+    TakeException { number: u8, return_pc: u32 },
     /// IT 块内条件不成立：本指令被跳过（PC 仍正常前进）
     Skipped,
     /// 调试事件（BKPT 触发）
@@ -145,6 +148,11 @@ impl Executor {
                     address: cpu.regs[15],
                 },
             };
+        }
+        // FPU 上下文活跃跟踪（FRT-EXC-09）：任务执行 VFP 指令 → CONTROL.FPCA=1
+        // （bit2，引擎内部约定；硬件 lazy 压栈的 eager 等价），异常入口据此压扩展帧
+        if is_fpu_instr(instr) {
+            cpu.control |= 4;
         }
         match instr {
             Instruction::Nop => ExecOutcome::Continue,
@@ -520,7 +528,11 @@ impl Executor {
             }
             Instruction::BranchExchange { rm } => {
                 let target = cpu.regs[*rm as usize];
-                if target & 1 == 0 {
+                // EXC_RETURN 特殊值（0xFFFFFFF1/9/D + FPU 变体 E1/9/D）：异常返回
+                // （FRT-EXC-02）——由引擎弹栈恢复现场；非 EXC_RETURN 保持普通分支语义
+                if crate::nvic::ExcReturn::from_value(target) != crate::nvic::ExcReturn::Invalid {
+                    ExecOutcome::ExceptionReturn { exc_return: target }
+                } else if target & 1 == 0 {
                     ExecOutcome::Fault {
                         reason: super::FaultReason::UsageFault { address: target },
                     }
@@ -883,7 +895,15 @@ impl Executor {
                         SpecialReg::BasepriMax => {
                             cpu.basepri = cpu.basepri.min((v & 0xFF) as u8)
                         }
-                        SpecialReg::Control => cpu.control = (v & 0x3) as u8,
+                        SpecialReg::Control => {
+                            cpu.control = (v & 0x3) as u8;
+                            // SPSEL 切换：SP 别名即时更新（ARM 语义：regs[13] 指向新选栈）
+                            cpu.regs[13] = if cpu.control & 1 != 0 {
+                                cpu.psp
+                            } else {
+                                cpu.msp
+                            };
+                        }
                     }
                 }
                 ExecOutcome::Continue
@@ -1008,11 +1028,13 @@ impl Executor {
                 }
             }
             Instruction::Svc { imm8 } => {
-                // 诚实注：SVC 已解码但异常入口（SVCall 向量跳转/压栈）未实现，
-                // 按 UnimplementedInstr Fault 处理（引擎无上层调度，不会进一步处理）
+                // SVC → 触发异常 11（SVCall，FRT-EXC-07）：入口由引擎完成
+                // （压栈/跳向量/EXC_RETURN），不再返回 UnimplementedInstr Fault。
+                // 同步异常语义：现场帧 PC 槽 = 下一条指令地址（SVC 为 16 位，PC+2）
                 let _ = imm8;
-                ExecOutcome::Fault {
-                    reason: super::FaultReason::UnimplementedInstr,
+                ExecOutcome::TakeException {
+                    number: crate::nvic::ExceptionNumber::SvCall.as_u8(),
+                    return_pc: cpu.regs[15].wrapping_add(2),
                 }
             }
             Instruction::Breakpoint { imm8: _ } => {
@@ -1029,7 +1051,13 @@ impl Executor {
                 self.it_mask = *mask;
                 ExecOutcome::Continue
             }
-            Instruction::ExceptionReturn => ExecOutcome::ExceptionReturn,
+            Instruction::ExceptionReturn => {
+                // 解码直产路径（当前 decode 无产出；BX EXC_RETURN 走 BranchExchange 携带值）。
+                // 保守语义：EXC_RETURN 恒在 LR（r14）——异常入口写入
+                ExecOutcome::ExceptionReturn {
+                    exc_return: cpu.regs[14],
+                }
+            }
 
             // ================= Phase 3: DSP =================
             Instruction::Sat {

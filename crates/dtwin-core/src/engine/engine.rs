@@ -54,7 +54,7 @@ impl Engine {
     }
 
     /// 单步执行一条指令（供调试器使用）
-    pub fn step(&mut self, cpu: &mut CpuState, mem: &mut Memory, _nvic: &mut Nvic) -> EngineResult {
+    pub fn step(&mut self, cpu: &mut CpuState, mem: &mut Memory, nvic: &mut Nvic) -> EngineResult {
         // 取指
         let pc = cpu.regs[15];
         let raw = match mem.read_u16(pc) {
@@ -116,8 +116,16 @@ impl Engine {
                 cpu.regs[15] = target;
                 EngineResult::Halted
             }
-            ExecOutcome::ExceptionReturn => {
+            ExecOutcome::ExceptionReturn { exc_return } => {
+                // P3：BX EXC_RETURN → 真实异常出口（弹栈/恢复/切线程模式）
                 self.stats.exceptions += 1;
+                self.return_from_exception(cpu, mem, nvic, exc_return);
+                EngineResult::Halted
+            }
+            // SVC 等指令触发异常入口（压栈/跳向量由引擎完成）
+            ExecOutcome::TakeException { number, return_pc } => {
+                self.stats.exceptions += 1;
+                self.take_exception(cpu, mem, nvic, number, Some(return_pc));
                 EngineResult::Halted
             }
             // 调试事件（BKPT）：ITSTATE 清零（异常语义），统计并返回
@@ -142,17 +150,16 @@ impl Engine {
             if self.stats.instructions - start >= self.max_instructions {
                 return EngineResult::LimitReached;
             }
-            // 检查是否有待处理中断（简化：仅当无当前异常时）
-            if nvic.current_exception == 0 {
-                if let Some(irq) = nvic.next_pending_irq() {
-                    nvic.enter_exception((irq + 16) as u8);
-                    self.stats.exceptions += 1;
-                }
+            // 异常仲裁（FRT-EXC-05/06）：存在可接受（未屏蔽 + 可抢占）的挂起异常 → 入口
+            if let Some(number) = self.pending_exception_to_take(cpu, mem, nvic) {
+                // 异步异常：现场帧 PC 槽 = 当前 PC（被中断流下一条待执行指令）
+                self.take_exception(cpu, mem, nvic, number, None);
+                self.stats.exceptions += 1;
+                continue;
             }
             match self.step(cpu, mem, nvic) {
                 EngineResult::Halted => {
-                    // 周期驱动：SysTick 递减（1 指令 = 1 周期，FRT-SYS-02）；
-                    // 挂起位由 SystemBlock 内部记录，P3 仲裁统一消费
+                    // 周期驱动：SysTick 递减（1 指令 = 1 周期，FRT-SYS-02）
                     let _pend = mem.tick_system(1);
                     // 同步 VECTACTIVE（ICSR 读）与 SystemBlock 当前异常号
                     if let Some(sb) = mem.system_block_mut() {
@@ -163,6 +170,284 @@ impl Engine {
                 }
                 r => return r,
             }
+        }
+    }
+
+    // ==================== P3：异常机制（FRT-EXC-01~10） ====================
+
+    /// 可配置异常优先级数值（越小越高）：
+    /// NMI=0（固定最高）、HardFault=1（固定次高）、其余 = 2 + SHPR/NVIC 值（0-255）
+    fn exception_priority(&mut self, mem: &mut Memory, nvic: &Nvic, number: u8) -> u16 {
+        let cfg = self.configurable_priority(mem, nvic, number);
+        match number {
+            2 => 0,
+            3 => 1,
+            _ => 2 + cfg as u16,
+        }
+    }
+
+    /// 可配置优先级来源：系统异常取 SHPR1-3 字节，外部 IRQ 取 NVIC priority 数组
+    fn configurable_priority(&mut self, mem: &mut Memory, nvic: &Nvic, number: u8) -> u8 {
+        match number {
+            4 | 5 | 6 | 12 => {
+                let v = mem
+                    .system_block_mut()
+                    .map(|sb| sb.shpr1())
+                    .unwrap_or(0);
+                let byte = match number {
+                    4 => 3,  // MemManage [31:24]
+                    5 => 2,  // BusFault [23:16]
+                    6 => 1,  // UsageFault [15:8]
+                    _ => 0,  // DebugMonitor [7:0]
+                };
+                ((v >> (byte * 8)) & 0xFF) as u8
+            }
+            11 => ((mem.system_block_mut().map(|sb| sb.shpr2()).unwrap_or(0) >> 24) & 0xFF) as u8,
+            14 | 15 => {
+                let v = mem
+                    .system_block_mut()
+                    .map(|sb| sb.shpr3())
+                    .unwrap_or(0);
+                let byte = if number == 14 { 2 } else { 3 }; // PendSV [23:16] / SysTick [31:24]
+                ((v >> (byte * 8)) & 0xFF) as u8
+            }
+            n if n >= 16 => nvic.priority[(n - 16) as usize],
+            _ => 0,
+        }
+    }
+
+    /// 屏蔽检查（FRT-EXC-06）：PRIMASK/FAULTMASK/BASEPRI 约束
+    fn is_masked(&self, cpu: &CpuState, number: u8, pri: u16) -> bool {
+        match number {
+            // NMI 永不被屏蔽
+            2 => false,
+            // HardFault：仅 FAULTMASK 屏蔽
+            3 => cpu.faultmask != 0,
+            // 可配置异常（4+）
+            _ => {
+                if cpu.faultmask != 0 || cpu.primask != 0 {
+                    true
+                } else if cpu.basepri != 0 && pri >= 2 + cpu.basepri as u16 {
+                    // BASEPRI=N 屏蔽优先级数值 ≥ N 的异常（数值 < N 的高优先级仍可抢占）
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// 当前执行优先级：线程模式基线 512；Handler = 当前异常优先级（FRT-EXC-05）
+    fn current_priority(&mut self, mem: &mut Memory, nvic: &Nvic, _cpu: &CpuState) -> u16 {
+        if nvic.current_exception == 0 {
+            512
+        } else {
+            self.exception_priority(mem, nvic, nvic.current_exception)
+        }
+    }
+
+    /// 仲裁：扫描系统挂起 + 外部 IRQ 挂起，选出可接受（未屏蔽且可抢占）的最高优先级异常。
+    /// 同优先级不抢占（保持挂起）。返回异常号（1-255），无则 None。
+    fn pending_exception_to_take(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut Memory,
+        nvic: &Nvic,
+    ) -> Option<u8> {
+        let current = self.current_priority(mem, nvic, cpu);
+        let mut best: Option<(u16, u8)> = None;
+        // 系统异常（SystemBlock.pended）
+        let sys_bits = mem
+            .system_block_mut()
+            .map(|sb| sb.pended_bits())
+            .unwrap_or(0);
+        for number in 1..16u8 {
+            if sys_bits & (1 << number) == 0 {
+                continue;
+            }
+            let pri = self.exception_priority(mem, nvic, number);
+            if self.is_masked(cpu, number, pri) || pri >= current {
+                continue;
+            }
+            if best.map_or(true, |(bp, _)| pri < bp) {
+                best = Some((pri, number));
+            }
+        }
+        // 外部 IRQ（NVIC pending & enabled）
+        for irq in 0..240u16 {
+            if nvic.pending[(irq / 32) as usize] & (1 << (irq % 32)) == 0 {
+                continue;
+            }
+            if nvic.enabled[(irq / 32) as usize] & (1 << (irq % 32)) == 0 {
+                continue;
+            }
+            let number = (irq + 16) as u8;
+            let pri = self.exception_priority(mem, nvic, number);
+            if self.is_masked(cpu, number, pri) || pri >= current {
+                continue;
+            }
+            if best.map_or(true, |(bp, _)| pri < bp) {
+                best = Some((pri, number));
+            }
+        }
+        best.map(|(_, n)| n)
+    }
+
+    /// 异常入口（FRT-EXC-01/03/04/08/09）：压栈 → EXC_RETURN → IPSR → 切 Handler → 跳向量
+    /// return_pc：同步异常（SVC）传下一条指令地址；异步异常（仲裁路径）传 None（用当前 PC）
+    fn take_exception(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut Memory,
+        nvic: &mut Nvic,
+        number: u8,
+        return_pc: Option<u32>,
+    ) {
+        let from_thread = nvic.current_exception == 0;
+        // 栈选择（FRT-EXC-01③）：线程模式按 SPSEL（引擎约定 control bit0），Handler 恒 MSP。
+        // 直接用 msp/psp 状态（SP 修改指令均经 sync_sp 同步，比 regs[13] 别名更稳——
+        // MSR CONTROL 切换 SPSEL 后 regs[13] 别名可能滞后于 msp/psp）
+        let using_psp = from_thread && (cpu.control & 1) != 0;
+        let mut sp = if using_psp { cpu.psp } else { cpu.msp };
+        // STKALIGN（FRT-EXC-04）：SP 未 8 字节对齐 → 先减 4 并置 xPSR bit9（SPREALIGN）
+        let mut sprealign = false;
+        let stkalign = mem
+            .system_block_mut()
+            .map(|sb| sb.ccr_stkalign())
+            .unwrap_or(true);
+        if stkalign && (sp & 4) != 0 {
+            sp = sp.wrapping_sub(4);
+            sprealign = true;
+        }
+        // FPU 扩展帧（FRT-EXC-09 SHOULD，eager 保存）：CONTROL.FPCA=1 时压 S0-S15+FPSCR
+        let fpu_frame = (cpu.control & 4) != 0;
+        if fpu_frame {
+            sp = sp.wrapping_sub(0x48);
+        }
+        // 压 8 字基本帧（r0,r1,r2,r3,r12,lr,pc,xpsr；小端、低地址在前，FRT-EXC-01②）
+        sp = sp.wrapping_sub(32);
+        // PC 槽 = 被中断流下一指令地址（FRT-EXC-03）：同步异常（SVC）= 调用方传入的
+        // 返回地址；异步异常 = 当前 PC（下一条待执行指令，中断在指令边界取走）
+        let pc = return_pc.unwrap_or(cpu.regs[15]);
+        let lr = cpu.regs[14]; // LR 槽 = 被中断 r14 寄存器值（FRT-EXC-03）
+        let mut frame_xpsr = cpu.xpsr;
+        if sprealign {
+            frame_xpsr |= 1 << 9; // SPREALIGN
+        }
+        let frame = [
+            cpu.regs[0],
+            cpu.regs[1],
+            cpu.regs[2],
+            cpu.regs[3],
+            cpu.regs[12],
+            lr,
+            pc,
+            frame_xpsr,
+        ];
+        for (i, v) in frame.iter().enumerate() {
+            let _ = mem.write_u32(sp + (i as u32) * 4, *v);
+        }
+        // 扩展帧内容（S0-S15 + FPSCR + 4 字节保留，共 0x48）
+        if fpu_frame {
+            for i in 0..16u32 {
+                let _ = mem.write_u32(sp + 32 + i * 4, cpu.fpu.read_s(i as usize));
+            }
+            let _ = mem.write_u32(sp + 32 + 64, cpu.fpu.fpscr);
+        }
+        // LR ← EXC_RETURN（FRT-EXC-01④）：线程+PSP→FD、线程+MSP→F9、Handler→F1；
+        // FPU 上下文 → bit4=0 的对应变体（ED/E9/E1）
+        let exc_return = match (fpu_frame, from_thread, using_psp) {
+            (true, true, true) => 0xFFFF_FFED,
+            (true, true, false) => 0xFFFF_FFE9,
+            (true, false, _) => 0xFFFF_FFE1,
+            (false, true, true) => 0xFFFF_FFFD,
+            (false, true, false) => 0xFFFF_FFF9,
+            (false, false, _) => 0xFFFF_FFF1,
+        };
+        cpu.regs[14] = exc_return;
+        // 更新被中断栈指针 + 切 Handler 模式（SP 别名 MSP）
+        if using_psp {
+            cpu.psp = sp;
+        } else {
+            cpu.msp = sp;
+        }
+        cpu.regs[13] = cpu.msp;
+        // IPSR ← 异常号（FRT-EXC-08）；ITSTATE 清零（FRT-EXC-01⑦）；FPCA 清（eager 已压栈）
+        cpu.xpsr = (cpu.xpsr & !0x1FF) | (number as u32 & 0x1FF);
+        self.executor.clear_it();
+        if fpu_frame {
+            cpu.control &= !4;
+        }
+        // 向量地址 = (VTOR + 4×异常号) 从内存读（FRT-EXC-01①/FRT-CHIP-03）
+        let vt = mem
+            .system_block_mut()
+            .map(|sb| sb.vtor())
+            .unwrap_or(0);
+        let vec = mem.read_u32(vt.wrapping_add(4 * number as u32)).unwrap_or(0);
+        cpu.regs[15] = vec & !1;
+        // NVIC 记账（嵌套历史 + 外部 IRQ 清挂起/置活跃）
+        if number < 16 {
+            if let Some(sb) = mem.system_block_mut() {
+                sb.unpend_exception(number);
+            }
+        }
+        nvic.enter_exception(number);
+        if let Some(sb) = mem.system_block_mut() {
+            sb.set_vectactive(nvic.current_exception);
+        }
+    }
+
+    /// 异常出口（FRT-EXC-02）：BX EXC_RETURN → 弹栈恢复 → 切线程模式 → SPSEL 更新
+    fn return_from_exception(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut Memory,
+        nvic: &mut Nvic,
+        exc_return: u32,
+    ) {
+        let uses_psp = exc_return & 4 != 0;
+        // FPU 变体（bit4=0：E1/E9/ED）→ 弹扩展帧恢复 S0-S15+FPSCR
+        let fpu_frame = exc_return & 0x10 == 0;
+        let mut sp = if uses_psp { cpu.psp } else { cpu.msp };
+        // 弹 8 字基本帧
+        let mut vals = [0u32; 8];
+        for (i, v) in vals.iter_mut().enumerate() {
+            *v = mem.read_u32(sp + (i as u32) * 4).unwrap_or(0);
+        }
+        sp = sp.wrapping_add(32);
+        if fpu_frame {
+            for i in 0..16u32 {
+                cpu.fpu.write_s(i as usize, mem.read_u32(sp + i * 4).unwrap_or(0));
+            }
+            cpu.fpu.fpscr = mem.read_u32(sp + 64).unwrap_or(0);
+            sp = sp.wrapping_add(0x48);
+        }
+        // 恢复 r0-r3/r12/r14/PC/xPSR；SPREALIGN（xPSR bit9）→ SP+=4 并清位（FRT-EXC-04）
+        cpu.regs[0] = vals[0];
+        cpu.regs[1] = vals[1];
+        cpu.regs[2] = vals[2];
+        cpu.regs[3] = vals[3];
+        cpu.regs[12] = vals[4];
+        cpu.regs[14] = vals[5];
+        let mut xpsr = vals[7];
+        if xpsr & (1 << 9) != 0 {
+            sp = sp.wrapping_add(4);
+            xpsr &= !(1 << 9);
+        }
+        cpu.regs[15] = vals[6] & !1; // PC 槽（清 T 位；T 位由 xPSR 槽恢复）
+        // 切回线程模式：IPSR=0；CONTROL.SPSEL 按 EXC_RETURN bit2 更新（FRT-EXC-02）
+        cpu.xpsr = xpsr & !0x1FF;
+        if uses_psp {
+            cpu.psp = sp;
+            cpu.control |= 1;
+        } else {
+            cpu.msp = sp;
+            cpu.control &= !1;
+        }
+        cpu.regs[13] = sp;
+        nvic.exit_exception();
+        if let Some(sb) = mem.system_block_mut() {
+            sb.set_vectactive(nvic.current_exception);
         }
     }
 }
@@ -431,9 +716,10 @@ mod tests {
         assert_eq!(cpu.regs[15], 6);
     }
 
-    /// P2：SysTick 周期驱动接入 run 循环（FRT-SYS-02/FRT-CHIP-02）
+    /// P2/P3：SysTick 周期驱动接入 run 循环（FRT-SYS-02/FRT-CHIP-02 + FRT-EXC-01）
     /// 固件（as 实测编码）使能 SysTick（LOAD=100, TICKINT=1）后空转；
-    /// run 循环每指令 tick_system(1) → 递减至 0 → SystemBlock 挂起异常 15。
+    /// run 循环每指令 tick_system(1) → 递减至 0 → 仲裁取异常 15 → 入口跳向量。
+    /// 向量表：异常 15 → 0x20 的 handler（bx lr 立即返回）。
     #[test]
     fn e2_systick_tick_pends_exception15() {
         use crate::system::SystemBlock;
@@ -454,14 +740,23 @@ mod tests {
         {
             mem.flash[i] = *b;
         }
+        // 向量表：异常 15（SysTick）→ 0x20（handler：bx lr = 0x4770）
+        let vec15 = 0x21u32; // 0x20 | T 位
+        mem.flash[60..64].copy_from_slice(&vec15.to_le_bytes());
+        mem.flash[0x20] = 0x70;
+        mem.flash[0x21] = 0x47;
         let mut nvic = Nvic::new();
         let mut eng = Engine::new();
-        eng.max_instructions = 400; // 7 条使能指令 + 空转（LOAD=100 → ~102 tick 触发）
-        assert_eq!(eng.run(&mut cpu, &mut mem, &mut nvic), EngineResult::LimitReached);
-        // THEN：SysTick 已挂起异常 15（SystemBlock 内部记录，P3 仲裁消费）
-        let sb = mem.system_block_mut().expect("SystemBlock 已挂接");
-        assert_eq!(sb.next_pending_exception(), Some(15), "SysTick 归零 → 挂起异常 15");
+        eng.max_instructions = 800; // 使能 + 空转（LOAD=100 → ~102 tick 触发）+ 多次异常往返
+        let r = eng.run(&mut cpu, &mut mem, &mut nvic);
+        assert_eq!(r, EngineResult::LimitReached);
+        // THEN：SysTick 异常被仲裁取走并进入（入口/出口各计 1 次 exceptions）
+        assert!(eng.stats.exceptions >= 4, "exceptions={}", eng.stats.exceptions);
         assert_eq!(eng.stats.faults, 0);
+        assert_eq!(nvic.current_exception, 0, "handler bx lr 返回线程模式");
+        // SystemBlock 无残留挂起（被入口消费）
+        let sb = mem.system_block_mut().expect("SystemBlock 已挂接");
+        assert_eq!(sb.next_pending_exception(), None);
     }
 
     /// P2：SYSTEM 区访问经 Memory 路由到 SystemBlock（FRT-CHIP-02）
