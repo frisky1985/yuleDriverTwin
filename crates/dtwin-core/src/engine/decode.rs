@@ -1586,11 +1586,17 @@ impl Decoder {
             2 => ShiftKind::Asr,
             _ => return Instruction::Unimplemented { bits: bits as u32 },
         };
+        // ARMv7-M：LSR/ASR 立即数 imm5=0 编码表示 #32（移满 → LSR=0 / ASR=符号填充），
+        // 必须在 decode 端转换为 32，exec 才能按 n>=32 语义执行；LSL #0 为不移位，保持原值。
+        let amount = match (kind, imm5) {
+            (ShiftKind::Lsr | ShiftKind::Asr, 0) => ShiftAmount::Immediate(32),
+            _ => ShiftAmount::Immediate(imm5 as u8),
+        };
         Instruction::Shift {
             rd,
             rm,
             kind,
-            amount: ShiftAmount::Immediate(imm5 as u8),
+            amount,
             flags: true,
         }
     }    /// 加减: 000 11 x xxxxx xxxxx
@@ -2094,12 +2100,16 @@ impl Decoder {
                 imm: Some(imm),
                 flags: s,
             },
-            // ORR（Rn=1111 → MOV）/ ORRS / MOVS（S=1 未建模）
-            0x2 if rn == 0xF && !s => Instruction::Mov {
+            // ORR（Rn=1111 → MOV）/ MOVS.W（S=1）
+            // ARMv7-M：op4=0x2 且 Rn=1111 恒为 MOV（imm），与 S 无关；
+            // MOVS.W r15,#imm（Rd=1111 且 S=1）为 UNPREDICTABLE → 诚实 Unimplemented，
+            // 不静默写 PC（P0-1 家族残留修复）。
+            0x2 if rn == 0xF && rd == 0xF && s => Instruction::Unimplemented { bits },
+            0x2 if rn == 0xF => Instruction::Mov {
                 rd,
                 rm: 0,
                 imm: Some(imm),
-                flags: false,
+                flags: s,
             },
             0x2 => Instruction::Orr {
                 rd,
@@ -3243,6 +3253,123 @@ fn decode_data_proc_reg_16ops() {
             rd: 2,
             rm: 3,
             flags: true,
+        }
+    );
+}
+
+/// B1: 16 位立即数移位形式 decode（编码经 arm-none-eabi-as 实测）
+/// ARMv7-M：LSR/ASR 立即数 imm5=0 表示 #32（移满），LSL #0 为不移位。
+#[test]
+fn decode_16bit_shift_imm() {
+    let mut d = Decoder::new();
+    // LSRS r3, r2, #32（imm5=0 → 必须转换为 Immediate(32)，否则静默返回原值）
+    assert_eq!(
+        d.decode_halfword(0x0813, 0),
+        Instruction::Shift {
+            rd: 3,
+            rm: 2,
+            kind: ShiftKind::Lsr,
+            amount: ShiftAmount::Immediate(32),
+            flags: true,
+        }
+    );
+    // ASRS r3, r2, #32（imm5=0 → Immediate(32)）
+    assert_eq!(
+        d.decode_halfword(0x1013, 0),
+        Instruction::Shift {
+            rd: 3,
+            rm: 2,
+            kind: ShiftKind::Asr,
+            amount: ShiftAmount::Immediate(32),
+            flags: true,
+        }
+    );
+    // LSLS r3, r2, #0（0x0013：汇编器同义为 movs r3, r2）→ 不移位，imm5 原样传入
+    assert_eq!(
+        d.decode_halfword(0x0013, 0),
+        Instruction::Shift {
+            rd: 3,
+            rm: 2,
+            kind: ShiftKind::Lsl,
+            amount: ShiftAmount::Immediate(0),
+            flags: true,
+        }
+    );
+    // 非零立即数不受影响：LSRS r3, r2, #31 = 0x0FD3
+    assert_eq!(
+        d.decode_halfword(0x0FD3, 0),
+        Instruction::Shift {
+            rd: 3,
+            rm: 2,
+            kind: ShiftKind::Lsr,
+            amount: ShiftAmount::Immediate(31),
+            flags: true,
+        }
+    );
+    // ASRS r3, r2, #31 = 0x17D3
+    assert_eq!(
+        d.decode_halfword(0x17D3, 0),
+        Instruction::Shift {
+            rd: 3,
+            rm: 2,
+            kind: ShiftKind::Asr,
+            amount: ShiftAmount::Immediate(31),
+            flags: true,
+        }
+    );
+}
+
+/// B2: 32 位 MOVS.W / MOV.W 立即数 + MOVS.W r15 非法路径 decode（编码经 as 实测）
+/// op4=0x2 且 Rn=1111 恒为 MOV（与 S 无关）；Rd=1111 且 S=1 为 UNPREDICTABLE。
+#[test]
+fn decode_32bit_movs_imm() {
+    let mut d = Decoder::new();
+    // MOVS.W r0, #0x8000（0xF45F 4000，S=1/Rn=1111）→ Mov 置标志，禁止走 Orr 读 PC
+    assert_eq!(
+        d.decode_word(0xF45F_4000, 0),
+        Instruction::Mov {
+            rd: 0,
+            rm: 0,
+            imm: Some(0x8000),
+            flags: true,
+        }
+    );
+    // MOV.W r0, #0x8000（0xF44F 4000，S=0）→ Mov 不置标志
+    assert_eq!(
+        d.decode_word(0xF44F_4000, 0),
+        Instruction::Mov {
+            rd: 0,
+            rm: 0,
+            imm: Some(0x8000),
+            flags: false,
+        }
+    );
+    // MOVS.W r15, #0x8000（0xF45F 4F80，Rd=1111 且 S=1，ARM 语义 UNPREDICTABLE）
+    // → 诚实 Unimplemented，不静默写 PC
+    assert!(matches!(
+        d.decode_word(0xF45F_4F80, 0),
+        Instruction::Unimplemented { .. }
+    ));
+    // 回归：正常 ORRS.W r3, r2, #1（0xF052 0301）仍走 Orr 置标志
+    assert_eq!(
+        d.decode_word(0xF052_0301, 0),
+        Instruction::Orr {
+            rd: 3,
+            rn: 2,
+            rm: None,
+            imm: Some(1),
+            flags: true,
+        }
+    );
+    // 回归：ORR.W r3, r2, #1（0xF042 0301，S=0）
+    assert_eq!(
+        d.decode_word(0xF042_0301, 0),
+        Instruction::Orr {
+            rd: 3,
+            rn: 2,
+            rm: None,
+            imm: Some(1),
+            flags: false,
         }
     );
 }

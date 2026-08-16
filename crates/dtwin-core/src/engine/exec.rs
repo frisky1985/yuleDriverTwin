@@ -2686,4 +2686,59 @@ mod tests {
         assert_eq!(h.exec_word(0xEE30_0A81), ExecOutcome::Continue);
         assert_eq!(h.cpu.fpu.read_s(0), 3.0f32.to_bits());
     }
+
+    // ================= B1: 16 位立即数移位（LSRS/ASRS #32，imm5=0） =================
+    // 期望值 = QEMU MPS2-AN386 实测（/tmp/dtwin_verify2/pshift_qemu.txt）：
+    //   r2=0x80000000：LSRS #32→0，ASRS #32→0xFFFFFFFF，LSRS #31→1，ASRS #31→0xFFFFFFFF
+
+    #[test]
+    fn b1_16bit_lsr_asr_imm32() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // LSRS r3, r2, #32 = 0x0813：0x80000000 >> 32 = 0（QEMU=00000000），C=bit31=1
+        h.cpu.regs[2] = 0x8000_0000;
+        h.exec_halfword(0x0813);
+        assert_eq!(h.cpu.regs[3], 0x0000_0000, "LSRS #32 → 0（QEMU 一致）");
+        assert_eq!(h.nzcv(), 0b0110, "Z 置位 + C 置位（bit31 移出）");
+        // ASRS r3, r2, #32 = 0x1013：0x80000000 算术右移 32 = 0xFFFFFFFF（QEMU 一致），C=bit31=1
+        h.exec_halfword(0x1013);
+        assert_eq!(h.cpu.regs[3], 0xFFFF_FFFF, "ASRS #32 → 0xFFFFFFFF（QEMU 一致）");
+        assert_eq!(h.nzcv(), 0b1010, "N 置位 + C 置位（bit31 移出）");
+        // 对照 #31 不受影响：LSRS r3, r2, #31 = 0x0FD3：0x80000000 >> 31 = 1（QEMU=00000001），C=bit30=0
+        h.exec_halfword(0x0FD3);
+        assert_eq!(h.cpu.regs[3], 0x0000_0001, "LSRS #31 → 1（QEMU 一致）");
+        assert_eq!(h.nzcv(), 0, "N/Z/C 清零");
+        // ASRS r3, r2, #31 = 0x17D3：0x80000000 算术右移 31 = 0xFFFFFFFF（QEMU 一致）
+        h.exec_halfword(0x17D3);
+        assert_eq!(h.cpu.regs[3], 0xFFFF_FFFF, "ASRS #31 → 0xFFFFFFFF（QEMU 一致）");
+        assert_eq!(h.nzcv(), 0b1000, "N 置位");
+        // LSLS #0（0x0013）不移位：保持原值
+        h.cpu.regs[2] = 0x1234_5678;
+        h.exec_halfword(0x0013);
+        assert_eq!(h.cpu.regs[3], 0x1234_5678, "LSLS #0 不移位");
+    }
+
+    // ================= B2: MOVS.W 立即数（S=1, Rn=1111） =================
+    // 期望值 = QEMU 实测（/tmp/dtwin_verify2/pmovs_qemu.txt）：movs r0, #0x8000 → r0=0x00008000
+    // 修复前 dtwin=0x00008054（= PC | 0x8000，静默读 PC 作源）
+
+    #[test]
+    fn b2_movs_imm32_not_pc_tainted() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[15] = 0x54; // 探针固件中该指令处 PC
+        // MOVS.W r0, #0x8000 = 0xF45F 4000：结果必须为纯立即数 0x8000（QEMU 一致），与 PC 无关
+        assert_eq!(h.exec_word(0xF45F_4000), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x0000_8000, "MOVS.W #0x8000 → 0x8000（QEMU 一致，不读 PC）");
+        assert_eq!(h.nzcv(), 0, "N/Z/C/V 均清零（0x8000 非负非零）");
+        // MOV.W r0, #0x8000 = 0xF44F 4000（S=0）：不置标志
+        h.cpu.xpsr = 0x8000_0000; // N=1 预置，验证 S=0 不改标志
+        h.exec_word(0xF44F_4000);
+        assert_eq!(h.cpu.regs[0], 0x0000_8000);
+        assert_eq!(h.nzcv(), 0b1000, "MOV.W 不置标志（N 保持）");
+        // MOVS.W r15, #0x8000 = 0xF45F 4F80（Rd=1111, S=1, ARM 语义 UNPREDICTABLE）
+        // → Unimplemented，绝不静默写 PC
+        let outcome = h.exec_word(0xF45F_4F80);
+        assert!(matches!(outcome, ExecOutcome::Fault { .. }), "MOVS.W r15 → Fault/Unimplemented，不得静默写 PC");
+    }
 }
