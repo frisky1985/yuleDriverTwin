@@ -25,12 +25,14 @@ fn load_real_yuleasr_firmware() {
         vec![
             LoadedSegment {
                 vaddr: 0x0000_0000,
+                paddr: 0x0000_0000,
                 filesz: 0x10b4,
                 memsz: 0x10b4,
                 flags: 5
             }, // R|X
             LoadedSegment {
                 vaddr: 0x2000_0000,
+                paddr: 0x2000_0000,
                 filesz: 0x0000,
                 memsz: 0x8000,
                 flags: 6

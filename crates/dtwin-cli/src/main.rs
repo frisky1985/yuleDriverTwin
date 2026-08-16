@@ -194,8 +194,9 @@ fn cmd_load(elf: &PathBuf, chip: &str) -> anyhow::Result<()> {
     println!("[load] 段摘要 ({} 个 PT_LOAD):", summary.segments.len());
     for (i, seg) in summary.segments.iter().enumerate() {
         println!(
-            "  [{i}] vaddr={:#010x} filesz={:#x} memsz={:#x} flags={:#x}{}",
+            "  [{i}] vaddr={:#010x} paddr={:#010x} filesz={:#x} memsz={:#x} flags={:#x}{}",
             seg.vaddr,
+            seg.paddr,
             seg.filesz,
             seg.memsz,
             seg.flags,
