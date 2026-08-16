@@ -151,6 +151,13 @@ impl Engine {
             }
             match self.step(cpu, mem, nvic) {
                 EngineResult::Halted => {
+                    // 周期驱动：SysTick 递减（1 指令 = 1 周期，FRT-SYS-02）；
+                    // 挂起位由 SystemBlock 内部记录，P3 仲裁统一消费
+                    let _pend = mem.tick_system(1);
+                    // 同步 VECTACTIVE（ICSR 读）与 SystemBlock 当前异常号
+                    if let Some(sb) = mem.system_block_mut() {
+                        sb.set_vectactive(nvic.current_exception);
+                    }
                     // 单步返回 Halted，run 循环继续
                     continue;
                 }
@@ -422,5 +429,59 @@ mod tests {
         }
         assert_eq!(eng.stats.exceptions, 0, "条件不成立的 BKPT 被跳过");
         assert_eq!(cpu.regs[15], 6);
+    }
+
+    /// P2：SysTick 周期驱动接入 run 循环（FRT-SYS-02/FRT-CHIP-02）
+    /// 固件（as 实测编码）使能 SysTick（LOAD=100, TICKINT=1）后空转；
+    /// run 循环每指令 tick_system(1) → 递减至 0 → SystemBlock 挂起异常 15。
+    #[test]
+    fn e2_systick_tick_pends_exception15() {
+        use crate::system::SystemBlock;
+        let mut cpu = CpuState::default();
+        // m4f_default 含 SYSTEM 区（0xE0000000-0xE0100000）
+        let mut mem = Memory::m4f_default();
+        mem.attach_peripheral(SystemBlock::new());
+        // 固件：ldr r1,[pc,#16]=0x4904 | movs r0,#7=0x2007 | str r0,[r1]=0x6008 |
+        // movs r0,#100=0x2064 | str r0,[r1,#4]=0x6048 | movs r0,#0=0x2000 |
+        // str r0,[r1,#8]=0x6088 | nop=0xBF00 | b loop=0xE7FD | 对齐填充 0x12-0x13 |
+        // literal 0xE000E010 @0x14（LDR 字面量地址 = Align(PC+4,4)+16 = 0x14）
+        for (i, b) in [
+            0x04u8, 0x49, 0x07, 0x20, 0x08, 0x60, 0x64, 0x20, 0x48, 0x60, 0x00, 0x20, 0x88,
+            0x60, 0x00, 0xBF, 0xFD, 0xE7, 0x00, 0x00, 0x10, 0xE0, 0x00, 0xE0,
+        ]
+        .iter()
+        .enumerate()
+        {
+            mem.flash[i] = *b;
+        }
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        eng.max_instructions = 400; // 7 条使能指令 + 空转（LOAD=100 → ~102 tick 触发）
+        assert_eq!(eng.run(&mut cpu, &mut mem, &mut nvic), EngineResult::LimitReached);
+        // THEN：SysTick 已挂起异常 15（SystemBlock 内部记录，P3 仲裁消费）
+        let sb = mem.system_block_mut().expect("SystemBlock 已挂接");
+        assert_eq!(sb.next_pending_exception(), Some(15), "SysTick 归零 → 挂起异常 15");
+        assert_eq!(eng.stats.faults, 0);
+    }
+
+    /// P2：SYSTEM 区访问经 Memory 路由到 SystemBlock（FRT-CHIP-02）
+    #[test]
+    fn e2_system_region_routes_to_system_block() {
+        use crate::system::SystemBlock;
+        let mut mem = Memory::m4f_default();
+        mem.attach_peripheral(SystemBlock::new());
+        // 写 SysTick LOAD（0xE000E014）→ 读回
+        mem.write_u32(0xE000_E014, 25000).unwrap();
+        assert_eq!(mem.read_u32(0xE000_E014).unwrap(), 25000);
+        // CPUID 读回 Cortex-M4 r0p1
+        assert_eq!(mem.read_u32(0xE000_ED00).unwrap(), 0x410F_C241);
+        // ICSR PENDSVSET 经内存写 → SystemBlock 挂起 14
+        mem.write_u32(0xE000_ED04, 1 << 28).unwrap();
+        let sb = mem.system_block_mut().unwrap();
+        assert_eq!(sb.next_pending_exception(), Some(14));
+        // 未挂接设备的 SYSTEM 区地址仍按默认行为（读 0 写忽略）
+        let mut mem2 = Memory::m4f_default();
+        mem2.write_u32(0xE000_E018, 0x1234).unwrap();
+        assert_eq!(mem2.read_u32(0xE000_E018).unwrap(), 0);
     }
 }

@@ -4,6 +4,7 @@ pub mod profile;
 pub mod s32k312;
 
 use dtwin_core::memory::{Memory, MemoryRegion, MemoryRegionType};
+use dtwin_core::system::SystemBlock;
 pub use s32k312::S32K312;
 
 /// 芯片配置文件结构（TOML 四大模块：内核/内存/外设/时钟树）
@@ -105,6 +106,6 @@ pub fn memory_from_profile(profile: &ChipProfile) -> Memory {
         flash_erase_required: true,
         read_count: 0,
         write_count: 0,
-        peripherals: Vec::new(),
+        peripherals: vec![Box::new(SystemBlock::new())],
     }
 }

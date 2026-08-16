@@ -7,6 +7,7 @@
 //! - 越界访问 → BusFault；MPU 违反 → MemManage；非对齐 → UsageFault
 
 use crate::peripheral::BusDevice;
+use crate::system::SystemBlock;
 
 /// Cortex-M 标准内存区域
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,10 +465,11 @@ impl Memory {
     }
 
     /// 外设区读：命中已挂接设备则返回 `Some(value)`（值已按 width 屏蔽），否则 `None`
+    /// 注：SYSTEM 区（0xE000_0000-0xE010_0000）同样路由到已挂接设备（FRT-CHIP-02）
     fn peripheral_read(&mut self, addr: u32, width: u32) -> Option<u32> {
         let is_periph = matches!(
             self.region_at(addr).map(|r| r.region_type),
-            Some(MemoryRegionType::Peripheral)
+            Some(MemoryRegionType::Peripheral | MemoryRegionType::System)
         );
         if !is_periph {
             return None;
@@ -479,10 +481,11 @@ impl Memory {
     }
 
     /// 外设区写：命中设备则写入并返回 `true`，否则 `false`（调用方回落写忽略）
+    /// 注：SYSTEM 区（0xE000_0000-0xE010_0000）同样路由到已挂接设备（FRT-CHIP-02）
     fn peripheral_write(&mut self, addr: u32, width: u32, val: u32) -> bool {
         let is_periph = matches!(
             self.region_at(addr).map(|r| r.region_type),
-            Some(MemoryRegionType::Peripheral)
+            Some(MemoryRegionType::Peripheral | MemoryRegionType::System)
         );
         if !is_periph {
             return false;
@@ -503,6 +506,18 @@ impl Memory {
             .iter_mut()
             .find(|d| d.name() == name)
             .map(|d| d.as_any_mut())
+    }
+
+    /// 获取 SystemBlock（SCB+SysTick）可变引用（未挂接则 None）
+    pub fn system_block_mut(&mut self) -> Option<&mut SystemBlock> {
+        self.peripheral_mut_by_name(SystemBlock::NAME)
+            .and_then(|any| any.downcast_mut::<SystemBlock>())
+    }
+
+    /// 周期驱动 SystemBlock（SysTick 递减，FRT-SYS-02/FRT-CHIP-02）；
+    /// 返回本周期新挂起的系统异常号（当前仅 SysTick=15），由引擎仲裁消费。
+    pub fn tick_system(&mut self, cycles: u64) -> Option<u8> {
+        self.system_block_mut().and_then(|sb| sb.tick(cycles))
     }
 }
 

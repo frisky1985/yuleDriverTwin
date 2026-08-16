@@ -11,6 +11,7 @@ pub mod memory;
 pub mod nvic;
 pub mod peripheral;
 pub mod register;
+pub mod system;
 pub mod uart;
 
 use engine::fpu::FpuRegisters;
