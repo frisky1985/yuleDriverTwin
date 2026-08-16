@@ -847,6 +847,64 @@ impl Executor {
                     },
                 }
             }
+            // 带回写加载/存储（前变址 [Rn,#imm]! / 后变址 [Rn],#imm，FRT-INS-03 同族）
+            Instruction::LdrStrWb {
+                rt,
+                rn,
+                imm,
+                width,
+                load,
+                sign_extend,
+                pre,
+            } => {
+                let base = cpu.regs[*rn as usize];
+                // 前变址：addr = base + imm，回写 rn = addr；后变址：addr = base，回写 rn = base + imm
+                let addr = if *pre { base.wrapping_add(*imm) } else { base };
+                let wb = base.wrapping_add(*imm);
+                if *load {
+                    let val = match width {
+                        AccessWidth::Byte => memory.read_u8(addr).map(|v| {
+                            if *sign_extend { (v as i8) as u32 } else { v as u32 }
+                        }),
+                        AccessWidth::HalfWord => memory.read_u16(addr).map(|v| {
+                            if *sign_extend { (v as i16) as u32 } else { v as u32 }
+                        }),
+                        AccessWidth::Word => memory.read_u32(addr),
+                    };
+                    match val {
+                        Ok(v) => {
+                            cpu.regs[*rt as usize] = v;
+                            cpu.regs[*rn as usize] = wb;
+                            if *rn == 13 {
+                                self.sync_sp(cpu);
+                            }
+                            ExecOutcome::Continue
+                        }
+                        Err(_f) => ExecOutcome::Fault {
+                            reason: super::FaultReason::BusFault { address: addr },
+                        },
+                    }
+                } else {
+                    let val = cpu.regs[*rt as usize];
+                    let result = match width {
+                        AccessWidth::Byte => memory.write_u8(addr, val as u8),
+                        AccessWidth::HalfWord => memory.write_u16(addr, val as u16),
+                        AccessWidth::Word => memory.write_u32(addr, val),
+                    };
+                    match result {
+                        Ok(()) => {
+                            cpu.regs[*rn as usize] = wb;
+                            if *rn == 13 {
+                                self.sync_sp(cpu);
+                            }
+                            ExecOutcome::Continue
+                        }
+                        Err(_f) => ExecOutcome::Fault {
+                            reason: super::FaultReason::MemManage { address: addr },
+                        },
+                    }
+                }
+            }
             Instruction::MsrMrs { rt, reg, read } => {
                 if *read {
                     // MRS：特殊寄存器 → 核心寄存器
@@ -3201,5 +3259,70 @@ mod tests {
         assert_eq!(h.exec_word(0xFBC2_0103), ExecOutcome::Continue);
         assert_eq!(h.cpu.regs[0], 0x0001_0005, "SMLAL 累加低 32 位");
         assert_eq!(h.cpu.regs[1], 0, "SMLAL 累加高 32 位");
+    }
+
+    /// LdrStrWb（FRT-INS-03 同族）：前变址 [Rn,#imm]! / 后变址 [Rn],#imm
+    /// 编码 as 实测：ldr.w r0,[r1,#8]!=0xF851 0F08；str.w r2,[r3,#12]!=0xF843 2F0C；
+    /// ldr.w r0,[r1],#8=0xF851 0B08；str.w r2,[r3],#12=0xF843 2B0C；
+    /// ldrh.w r0,[r1,#4]!=0xF831 0F04；ldrsh.w r0,[r1,#6]!=0xF931 0F06；
+    /// ldrb.w r0,[r1,#2]!=0xF811 0F02；ldrsb.w r0,[r1,#3]!=0xF911 0F03
+    #[test]
+    fn p1_ldr_str_writeback() {
+        let mut h = Harness::new();
+        // 前变址 LDR.W [r1,#8]!：addr=base+8，回写 r1=addr
+        h.cpu.regs[1] = 0x2000_0000;
+        h.mem.write_u32(0x2000_0008, 0xCAFE_BABE).unwrap();
+        assert_eq!(h.exec_word(0xF851_0F08), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xCAFE_BABE, "前变址 LDR 读值");
+        assert_eq!(h.cpu.regs[1], 0x2000_0008, "前变址回写 rn=addr");
+
+        // 前变址 STR.W [r3,#12]!：addr=base+12，回写 r3=addr
+        h.cpu.regs[3] = 0x2000_0100;
+        h.cpu.regs[2] = 0x1122_3344;
+        assert_eq!(h.exec_word(0xF843_2F0C), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u32(0x2000_010C).unwrap(), 0x1122_3344, "前变址 STR 写入");
+        assert_eq!(h.cpu.regs[3], 0x2000_010C, "前变址 STR 回写");
+
+        // 后变址 LDR.W [r1],#8：addr=base 访存，回写 r1=base+8
+        h.cpu.regs[1] = 0x2000_0020;
+        h.mem.write_u32(0x2000_0020, 0xDEAD_BEEF).unwrap();
+        assert_eq!(h.exec_word(0xF851_0B08), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xDEAD_BEEF, "后变址 LDR 读 base 处");
+        assert_eq!(h.cpu.regs[1], 0x2000_0028, "后变址回写 rn=base+imm");
+
+        // 后变址 STR.W [r3],#12：addr=base 访存，回写 r3=base+12
+        h.cpu.regs[3] = 0x2000_0100;
+        h.cpu.regs[2] = 0x5566_7788;
+        assert_eq!(h.exec_word(0xF843_2B0C), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u32(0x2000_0100).unwrap(), 0x5566_7788, "后变址 STR 写 base 处");
+        assert_eq!(h.cpu.regs[3], 0x2000_010C, "后变址 STR 回写");
+
+        // 前变址 LDRH.W [r1,#4]!：半字零扩展
+        h.cpu.regs[1] = 0x2000_0030;
+        h.mem.write_u16(0x2000_0034, 0xABCD).unwrap();
+        assert_eq!(h.exec_word(0xF831_0F04), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xABCD, "LDRH 零扩展");
+        assert_eq!(h.cpu.regs[1], 0x2000_0034, "LDRH 回写");
+
+        // 前变址 LDRSH.W [r1,#6]!：半字符号扩展（0x8000 → 0xFFFF8000）
+        h.cpu.regs[1] = 0x2000_0040;
+        h.mem.write_u16(0x2000_0046, 0x8000).unwrap();
+        assert_eq!(h.exec_word(0xF931_0F06), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFFFF_8000, "LDRSH 符号扩展");
+        assert_eq!(h.cpu.regs[1], 0x2000_0046, "LDRSH 回写");
+
+        // 前变址 LDRB.W [r1,#2]!：字节零扩展
+        h.cpu.regs[1] = 0x2000_0050;
+        h.mem.write_u8(0x2000_0052, 0x7F).unwrap();
+        assert_eq!(h.exec_word(0xF811_0F02), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x7F, "LDRB 零扩展");
+        assert_eq!(h.cpu.regs[1], 0x2000_0052, "LDRB 回写");
+
+        // 前变址 LDRSB.W [r1,#3]!：字节符号扩展（0x80 → 0xFFFFFF80）
+        h.cpu.regs[1] = 0x2000_0060;
+        h.mem.write_u8(0x2000_0063, 0x80).unwrap();
+        assert_eq!(h.exec_word(0xF911_0F03), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFFFF_FF80, "LDRSB 符号扩展");
+        assert_eq!(h.cpu.regs[1], 0x2000_0063, "LDRSB 回写");
     }
 }

@@ -238,6 +238,19 @@ pub enum Instruction {
     LdrD { rt: u8, rt2: u8, rn: u8, imm: u32 },
     /// 双字存储: STRD Rt, Rt2, [Rn, #imm8×4]
     StrD { rt: u8, rt2: u8, rn: u8, imm: u32 },
+    /// 带回写加载/存储（32 位前变址 [Rn,#imm]! / 后变址 [Rn],#imm，FRT-INS-03 同族）
+    LdrStrWb {
+        rt: u8,
+        rn: u8,
+        /// 字节偏移（imm8 未缩放）
+        imm: u32,
+        width: AccessWidth,
+        load: bool,
+        /// 符号扩展（LDRSH/LDRSB）
+        sign_extend: bool,
+        /// true = 前变址（先加后访存，回写 rn=地址）；false = 后变址（访存后回写 rn+=imm）
+        pre: bool,
+    },
     /// 特殊寄存器访问: MRS/MSR
     MsrMrs {
         /// 核心寄存器（MRS 的 Rd / MSR 的 Rn）
@@ -956,87 +969,155 @@ impl Decoder {
         let rt = ((bits >> 12) & 0xF) as u8;
         let rn = (top & 0xF) as u8;
         let imm12 = bits & 0xFFF;
-        // 寄存器偏移形式：top & 0x0FF0 == 0x0850(LDR)/0x0840(STR)
-        // （imm12 形式为 0x08D0/0x08C0/0x08B0/0x08A0/0x0890/0x0880/0x09B0/0x0990，勿误判）
-        let is_reg_offset = (top & 0x0FF0) == 0x0850 || (top & 0x0FF0) == 0x0840;
-        if is_reg_offset {
-            let rm = (bits & 0xF) as u8;
-            let is_load = (top & 0x0010) != 0;
-            let offset = LoadStoreOffset::Register(rm);
-            return Some(if is_load {
-                Instruction::Ldr {
-                    rt,
-                    rn,
-                    offset,
-                    width: AccessWidth::Word,
-                }
-            } else {
-                Instruction::Str {
-                    rt,
-                    rn,
-                    offset,
-                    width: AccessWidth::Word,
-                }
-            });
-        }
+        // ---- imm12 形式（既有）----
         match top & 0xFFF0 {
             // LDR.W (imm12)；Rn=1111 → LDR literal
-            0xF8D0 if rn == 0xF => Some(Instruction::LdrLiteral { rt, imm: imm12 }),
-            0xF8D0 => Some(Instruction::Ldr {
-                rt,
-                rn,
-                offset: LoadStoreOffset::Immediate(imm12),
-                width: AccessWidth::Word,
-            }),
-            // STR.W
-            0xF8C0 => Some(Instruction::Str {
-                rt,
-                rn,
-                offset: LoadStoreOffset::Immediate(imm12),
-                width: AccessWidth::Word,
-            }),
-            // LDRH.W
-            0xF8B0 => Some(Instruction::Ldr {
-                rt,
-                rn,
-                offset: LoadStoreOffset::Immediate(imm12),
-                width: AccessWidth::HalfWord,
-            }),
-            // STRH.W
-            0xF8A0 => Some(Instruction::Str {
-                rt,
-                rn,
-                offset: LoadStoreOffset::Immediate(imm12),
-                width: AccessWidth::HalfWord,
-            }),
-            // LDRB.W
-            0xF890 => Some(Instruction::Ldr {
-                rt,
-                rn,
-                offset: LoadStoreOffset::Immediate(imm12),
-                width: AccessWidth::Byte,
-            }),
-            // STRB.W
-            0xF880 => Some(Instruction::Str {
-                rt,
-                rn,
-                offset: LoadStoreOffset::Immediate(imm12),
-                width: AccessWidth::Byte,
-            }),
-            // LDRSH.W（符号扩展半字）
-            0xF9B0 => Some(Instruction::LdrSignExtend {
-                rt,
-                rn,
-                offset: LoadStoreOffset::Immediate(imm12),
-                width: AccessWidth::HalfWord,
-            }),
-            // LDRSB.W（符号扩展字节）
-            0xF990 => Some(Instruction::LdrSignExtend {
-                rt,
-                rn,
-                offset: LoadStoreOffset::Immediate(imm12),
-                width: AccessWidth::Byte,
-            }),
+            0xF8D0 if rn == 0xF => {
+                return Some(Instruction::LdrLiteral { rt, imm: imm12 });
+            }
+            0xF8D0 => {
+                return Some(Instruction::Ldr {
+                    rt,
+                    rn,
+                    offset: LoadStoreOffset::Immediate(imm12),
+                    width: AccessWidth::Word,
+                });
+            }
+            0xF8C0 => {
+                return Some(Instruction::Str {
+                    rt,
+                    rn,
+                    offset: LoadStoreOffset::Immediate(imm12),
+                    width: AccessWidth::Word,
+                });
+            }
+            0xF8B0 => {
+                return Some(Instruction::Ldr {
+                    rt,
+                    rn,
+                    offset: LoadStoreOffset::Immediate(imm12),
+                    width: AccessWidth::HalfWord,
+                });
+            }
+            0xF8A0 => {
+                return Some(Instruction::Str {
+                    rt,
+                    rn,
+                    offset: LoadStoreOffset::Immediate(imm12),
+                    width: AccessWidth::HalfWord,
+                });
+            }
+            0xF890 => {
+                return Some(Instruction::Ldr {
+                    rt,
+                    rn,
+                    offset: LoadStoreOffset::Immediate(imm12),
+                    width: AccessWidth::Byte,
+                });
+            }
+            0xF880 => {
+                return Some(Instruction::Str {
+                    rt,
+                    rn,
+                    offset: LoadStoreOffset::Immediate(imm12),
+                    width: AccessWidth::Byte,
+                });
+            }
+            0xF9B0 => {
+                return Some(Instruction::LdrSignExtend {
+                    rt,
+                    rn,
+                    offset: LoadStoreOffset::Immediate(imm12),
+                    width: AccessWidth::HalfWord,
+                });
+            }
+            0xF990 => {
+                return Some(Instruction::LdrSignExtend {
+                    rt,
+                    rn,
+                    offset: LoadStoreOffset::Immediate(imm12),
+                    width: AccessWidth::Byte,
+                });
+            }
+            _ => {}
+        }
+        // ---- 寄存器偏移 / 前变址(!) / 后变址家族（低半字 bits[11:9] 区分）----
+        // 家族位（top bits[11:4]，arm-none-eabi-as 实测）：
+        //   LDR.W 0x0850 / STR.W 0x0840；LDRH 0x0830 / STRH 0x0820；
+        //   LDRB 0x0810 / STRB 0x0800；LDRSH 0x0930 / LDRSB 0x0910
+        // 低半字 bits[11:9]：000=寄存器偏移；101=后变址；111=前变址(回写)。
+        let fam = top & 0x0FF0;
+        let (width, sign_extend, is_load) = match fam {
+            0x0850 => (AccessWidth::Word, false, true),
+            0x0840 => (AccessWidth::Word, false, false),
+            0x0830 => (AccessWidth::HalfWord, false, true),
+            0x0820 => (AccessWidth::HalfWord, false, false),
+            0x0810 => (AccessWidth::Byte, false, true),
+            0x0800 => (AccessWidth::Byte, false, false),
+            0x0930 => (AccessWidth::HalfWord, true, true),
+            0x0910 => (AccessWidth::Byte, true, true),
+            _ => return None,
+        };
+        let form = (bits >> 9) & 0x7;
+        let imm8 = bits & 0xFF;
+        match form {
+            // 寄存器偏移：rm = bits[3:0]（无移位；带移位的 LSL#n 形态暂 Unimplemented，
+            // 诚实迭代：固件暴露后补）
+            0 => {
+                if bits & 0xE0 != 0 {
+                    return None; // bits[7:5] 非 0 → 移位形式 → Unimplemented
+                }
+                let rm = (bits & 0xF) as u8;
+                let offset = LoadStoreOffset::Register(rm);
+                return Some(if is_load {
+                    if sign_extend {
+                        Instruction::LdrSignExtend {
+                            rt,
+                            rn,
+                            offset,
+                            width,
+                        }
+                    } else {
+                        Instruction::Ldr {
+                            rt,
+                            rn,
+                            offset,
+                            width,
+                        }
+                    }
+                } else {
+                    Instruction::Str {
+                        rt,
+                        rn,
+                        offset,
+                        width,
+                    }
+                });
+            }
+            // 后变址：[Rn], #imm8（先访存，后 rn += imm8）
+            5 => {
+                return Some(Instruction::LdrStrWb {
+                    rt,
+                    rn,
+                    imm: imm8,
+                    width,
+                    load: is_load,
+                    sign_extend,
+                    pre: false,
+                });
+            }
+            // 前变址：[Rn, #imm8]!（先加后访存，回写 rn = 地址）
+            7 => {
+                return Some(Instruction::LdrStrWb {
+                    rt,
+                    rn,
+                    imm: imm8,
+                    width,
+                    load: is_load,
+                    sign_extend,
+                    pre: true,
+                });
+            }
             _ => None,
         }
     }
