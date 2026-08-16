@@ -3140,4 +3140,38 @@ mod tests {
         assert_eq!(h.mem.read_u8(0x2000_0000).unwrap(), 0x5A);
         assert_eq!(h.cpu.regs[6], 0);
     }
+
+    /// UMULL/SMULL/SMLAL（FRT-INS-05 SHOULD，64 位长乘）：
+    /// umull r0,r1,r2,r3=0xFBA2 0103；smull r4,r5,r6,r7=0xFB86 4507；
+    /// smlal r0,r1,r2,r3=0xFBC2 0103（编码 as 实测）
+    #[test]
+    fn p1_mull_long() {
+        let mut h = Harness::new();
+        // UMULL：0xFFFFFFFF × 0xFFFFFFFF = 0xFFFFFFFE_00000001
+        h.cpu.regs[2] = 0xFFFF_FFFF;
+        h.cpu.regs[3] = 0xFFFF_FFFF;
+        assert_eq!(h.exec_word(0xFBA2_0103), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x0000_0001, "UMULL 低 32 位");
+        assert_eq!(h.cpu.regs[1], 0xFFFF_FFFE, "UMULL 高 32 位");
+        // SMULL：(-1) × (-1) = 1
+        h.cpu.regs[6] = 0xFFFF_FFFF;
+        h.cpu.regs[7] = 0xFFFF_FFFF;
+        assert_eq!(h.exec_word(0xFB86_4507), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[4], 1, "SMULL 低 32 位");
+        assert_eq!(h.cpu.regs[5], 0, "SMULL 高 32 位");
+        // SMULL：0x80000000 × 2（有符号 -2^31 × 2 = -2^32 → 0xFFFFFFFF_00000000）
+        h.cpu.regs[6] = 0x8000_0000;
+        h.cpu.regs[7] = 2;
+        assert_eq!(h.exec_word(0xFB86_4507), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[4], 0, "SMULL 低 32 位（负数积）");
+        assert_eq!(h.cpu.regs[5], 0xFFFF_FFFF, "SMULL 高 32 位（符号填充）");
+        // SMLAL：acc[1:0] += 0x100 × 0x100；acc 初始 = 5
+        h.cpu.regs[0] = 5;
+        h.cpu.regs[1] = 0;
+        h.cpu.regs[2] = 0x100;
+        h.cpu.regs[3] = 0x100;
+        assert_eq!(h.exec_word(0xFBC2_0103), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x0001_0005, "SMLAL 累加低 32 位");
+        assert_eq!(h.cpu.regs[1], 0, "SMLAL 累加高 32 位");
+    }
 }
