@@ -5,6 +5,7 @@
 ========================================
 [MRS] PRIMASK init got=0x00000000 exp=0x00000000 PASS
 [MRS] CONTROL init got=0x00000000 exp=0x00000000 PASS
+[LMA] .data init after startup got=0xA5A51234 exp=0xA5A51234 PASS
 --- DSP (SSAT/USAT/QADD/SADD16) ---
 [DSP] SSAT  x=127 sat=7 got=0x0000003F exp=0x0000003F PASS
 [DSP] SSAT  x=128 sat=7 got=0x0000003F exp=0x0000003F PASS
@@ -80,4 +81,4 @@
 [SHF] LSLS 1<<5 (reg) got=0x00000020 exp=0x00000020 PASS
 [SHF] LSLS #0 no-shift got=0x00000101 exp=0x00000101 PASS
 --- Summary ---
-[PASS] all 00000045 checks passed
+[PASS] all 00000046 checks passed

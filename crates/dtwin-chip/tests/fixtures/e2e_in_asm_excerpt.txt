@@ -1,28 +1,32 @@
 # QEMU 指令级执行证据（e2e_driver_stress，MPS2 AN386 / Cortex-M4）
-# 来源：qemu-system-arm -d in_asm 全迹（2669 行）；每类目标指令抽取首次执行实例。
+# 来源：qemu-system-arm -d in_asm 全迹（2685 行）；每类目标指令抽取首次执行实例。
 # 地址/编码为 QEMU 实际执行序列（golden ground truth），与 dtwin 解码路径一一对应。
-0x00000422:  f380 8808  msr      msp, r0
-0x00000cfe:  f3ef 8310  mrs      r3, primask
-0x0000053a:  091b       lsrs     r3, r3, #4
-0x0000061a:  f303 0306  ssat     r3, #7, r3
-0x00000662:  f383 0305  usat     r3, #5, r3
-0x00000692:  fa82 f383  qadd     r3, r3, r2
-0x000006b2:  fa93 f302  sadd16   r3, r3, r2
+# P0 回归：.data 启动拷贝循环（ldr [r1,r3] 读 Flash LMA → str [r2,r3] 写 SRAM VMA）
+# 真实执行——旧固件 .data 为空该循环被 beq 跳过，见末尾两条。
+0x00000422:  f380 8808  msr msp, r0
+0x00000cfe:  f3ef 8310  mrs r3, primask
+0x0000053a:  091b       lsrs r3, r3, #4
+0x0000061a:  f303 0306  ssat r3, #7, r3
+0x00000662:  f383 0305  usat r3, #5, r3
+0x00000692:  fa82 f383  qadd r3, r3, r2
+0x000006b2:  fa93 f302  sadd16 r3, r3, r2
 0x00000942:  ee30 1a20  vadd.f32 s2, s0, s1
 0x0000096e:  ee20 1a20  vmul.f32 s2, s0, s1
 0x00000992:  eebd 0ac0  vcvt.s32.f32 s0, s0
 0x000009b6:  eebd 0a40  vcvtr.s32.f32 s0, s0
 0x000009da:  eebc 0ac0  vcvt.u32.f32 s0, s0
 0x000009fe:  eeb8 0ac0  vcvt.f32.s32 s0, s0
-0x00000c0c:  bf0c       ite      eq
-0x00000c44:  bf02       ittt     eq
-0x00000ee6:  f64f 73ff  movw     r3, #0xffff
-0x00000f52:  f8c3 2000  str.w    r2, [r3]
-0x00000f56:  f8d3 3000  ldr.w    r3, [r3]
-0x00000f98:  f9b3 3000  ldrsh.w  r3, [r3]
-0x00000fbe:  e9c3 2100  strd     r2, r1, [r3]
-0x00000fc6:  e9d3 1200  ldrd     r1, r2, [r3]
-0x000010d0:  420a       tst      r2, r1
-0x000011dc:  005b       lsls     r3, r3, #1
-0x000011e2:  4149       adcs     r1, r1
-0x00001266:  105b       asrs     r3, r3, #1
+0x00000c0c:  bf0c       ite eq
+0x00000c44:  bf02       ittt eq
+0x00000ee6:  f64f 73ff  movw r3, #0xffff
+0x00000f52:  f8c3 2000  str.w r2, [r3]
+0x00000f56:  f8d3 3000  ldr.w r3, [r3]
+0x00000f98:  f9b3 3000  ldrsh.w r3, [r3]
+0x00000fbe:  e9c3 2100  strd r2, r1, [r3]
+0x00000fc6:  e9d3 1200  ldrd r1, r2, [r3]
+0x000010d0:  420a       tst r2, r1
+0x000011dc:  005b       lsls r3, r3, #1
+0x000011e2:  4149       adcs r1, r1
+0x00001266:  105b       asrs r3, r3, #1
+0x00000432:  58c8       ldr r0, [r1, r3]
+0x00000434:  50d0       str r0, [r2, r3]

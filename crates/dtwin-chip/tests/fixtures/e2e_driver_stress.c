@@ -13,6 +13,7 @@
  *   [TST] TST.W 位测试（A1 回归：寄存器 + 立即数形式）
  *   [SHF] LSLS/LSRS/ASRS + 进位链（A4 回归：imm5=0->32 语义、C 标志）
  *   [MOV] MOVW/MOVT（A5 回归：高半字清零）
+ *   [LMA] .data 初始化（P0 回归：loader 按 p_paddr/LMA 烧录 + startup 拷贝）
  *
  * 构建：scripts/build_driver_stress.sh（arm-none-eabi-gcc, cortex-m4）
  * 运行：qemu-system-arm -M mps2-an386 -cpu cortex-m4 -nographic -kernel <elf>
@@ -22,6 +23,9 @@
  *  - 无 libc（freestanding），UART 直写 CMSDK APB UART @ 0x40004000
  *  - 关键指令用内联汇编保证编码形态；期望值全部手写常量
  *  - 避免 dtwin/QEMU 之外的架构特性（无硬浮点 ABI 陷阱：-mfloat-abi=hard）
+ *  - P0 回归（loader LMA）：固件含真实 `.data` 初始化变量（非 const 全局），
+ *    初值 LMA 在 Flash、VMA 在 SRAM，由 startup 拷贝循环搬移——dtwin 加载器
+ *    按 p_paddr(LMA) 烧录后值正确；旧加载器不写 LMA → 0xFF 覆盖 → FAIL
  *============================================================================*/
 
 #include <stdint.h>
@@ -78,8 +82,7 @@ static void uart_hex(uint32_t v)
 /* A9 边界常量：const volatile → .rodata（Flash，LMA==VMA，无需启动拷贝）。
  * 两个动机：
  *  - const：GCC 不会用 MVN.W 立即数合成负常量（dtwin 未建模 MVN.W，见 checkpoint）
- *  - volatile：强制 ldr 内存读；同时规避初始化 .data（dtwin 加载器未按 LMA 加载段，
- *    启动 .data 拷贝会把擦除态 0xFF 覆盖到 SRAM——见 checkpoint 记录） */
+ *  - volatile：强制 ldr 内存读 */
 static const volatile uint32_t VN    = 0xFFFFFFFFu; /* -1      */
 static const volatile uint32_t VN64  = 0xFFFFFFC0u; /* -64     */
 static const volatile uint32_t VN65  = 0xFFFFFFBFu; /* -65     */
@@ -88,6 +91,12 @@ static const volatile uint32_t VN9   = 0xFFFFFFF9u; /* -7      */
 static const volatile uint32_t VNFE  = 0xFFFFFFFEu; /* -2      */
 static const volatile uint32_t VMAX  = 0x7FFFFFFFu; /* INT32_MAX */
 static const volatile uint32_t VMIN  = 0x80000000u; /* INT32_MIN */
+
+/* P0 回归（loader LMA）：非 const 全局 → `.data` 段（LMA=Flash、VMA=SRAM）。
+ * dtwin 加载器按 p_paddr(LMA) 烧录初值后，Reset_Handler 拷贝到 SRAM → 值正确；
+ * 旧加载器不写 LMA → Flash 0xFF → 拷贝后为 0xFFFFFFFF → FAIL。
+ * QEMU 黄金标准同样按物理地址（p_paddr）加载镜像（见 scripts/run_qemu_golden.sh）。 */
+static uint32_t g_data_magic = 0xA5A51234u;
 
 static int n_pass, n_fail;
 
@@ -674,6 +683,10 @@ int main(void)
      * dtwin 未建模 FPCA 位（见 checkpoint 记录），故仅比初始值 */
     report("MRS", "PRIMASK init",       mrs_primask(), 0x00000000);
     report("MRS", "CONTROL init",       mrs_control(), 0x00000000);
+
+    /* P0 回归（loader LMA）：.data 初值经 LMA(Flash)→VMA(SRAM) 启动拷贝后必须仍正确；
+     * 旧加载器（不写 LMA）此值会被 0xFF 覆盖 → FAIL */
+    report("LMA", ".data init after startup", g_data_magic, 0xA5A51234u);
 
     test_dsp();
     test_fpu();

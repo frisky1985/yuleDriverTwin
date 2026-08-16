@@ -13,9 +13,11 @@
 //!   [MEM] LDR.W/STR.W/LDRH/LDRSH/LDRD/STRD/LDRB/STRB（A8 回归）
 //!   [TST] TST 位测试（A1 回归：立即数 TST.W + 16 位寄存器 TST）
 //!   [SHF] LSLS/LSRS/ASRS + 进位捕获（A4 回归）
+//!   [LMA] .data 初始化路径（P0 回归：loader 按 p_paddr/LMA 烧录 + startup 拷贝）
 //!
 //! 注意：dtwin 存在已知引擎缺口（见 memory/2026-08-16-dtwin-a9.md checkpoint），
-//! 固件已按缺口规避编码（MVN.W/MOVT/VSTR/VLDR/TST.W-reg/ADC.W/初始化 .data）。
+//! 固件已按缺口规避编码（MVN.W/MOVT/VSTR/VLDR/TST.W-reg/ADC.W；P0 LMA 已修复，
+//! .data 初始化走真实路径不再规避）。
 
 use dtwin_chip::memory_from_profile;
 use dtwin_chip::S32K312;
@@ -110,6 +112,7 @@ fn e2e_driver_stress_matches_qemu_golden() {
                 || l.starts_with("[MEM]")
                 || l.starts_with("[TST]")
                 || l.starts_with("[SHF]")
+                || l.starts_with("[LMA]") // P0 回归：.data 初始化（LMA→VMA 启动拷贝）
         })
         .collect();
     let mut missing = Vec::new();
@@ -125,7 +128,7 @@ fn e2e_driver_stress_matches_qemu_golden() {
         missing
     );
     eprintln!(
-        "E2E: 检查行 {}/{} 全部命中（含 69 PASS 无 FAIL）",
+        "E2E: 检查行 {}/{} 全部命中（含 70 PASS 无 FAIL）",
         core_lines.len(),
         core_lines.len()
     );
