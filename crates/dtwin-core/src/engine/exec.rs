@@ -4,8 +4,8 @@
 //! Phase 1: 核心整数指令（数据传送/算术逻辑/移位/分支/压栈）
 
 use super::decode::{
-    AccessWidth, Cond, DspShiftKind, FpArithOp, FpCvtOp, FpUnaryOp, Instruction, LoadStoreOffset,
-    QAddKind, ShiftAmount, ShiftKind, SpecialReg,
+    AccessWidth, BitFieldKind, Cond, DspShiftKind, FpArithOp, FpCvtOp, FpUnaryOp,
+    Instruction, LoadStoreOffset, QAddKind, RevKind, ShiftAmount, ShiftKind, SpecialReg,
 };
 use super::{dsp, fpu};
 use crate::memory::{Memory, MemoryFault};
@@ -373,6 +373,34 @@ impl Executor {
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
             }
+            // UMULL/SMULL/SMLAL（FRT-INS-05 SHOULD）：64 位长乘法
+            // UMULL： [RdHi:RdLo] = Rn × Rm（无符号）；SMULL 同（有符号）；
+            // SMLAL： 累加 [RdHi:RdLo] += Rn × Rm（ARMv7-M 不更新 flags）
+            Instruction::MullLong {
+                rdlo,
+                rdhi,
+                rn,
+                rm,
+                signed,
+                accumulate,
+            } => {
+                let a = cpu.regs[*rn as usize];
+                let b = cpu.regs[*rm as usize];
+                let product: u64 = if *signed {
+                    (((a as i32) as i64) * ((b as i32) as i64)) as u64
+                } else {
+                    (a as u64) * (b as u64)
+                };
+                let mut result = product;
+                if *accumulate {
+                    let acc = ((cpu.regs[*rdhi as usize] as u64) << 32)
+                        | (cpu.regs[*rdlo as usize] as u64);
+                    result = result.wrapping_add(acc);
+                }
+                cpu.regs[*rdlo as usize] = result as u32;
+                cpu.regs[*rdhi as usize] = (result >> 32) as u32;
+                ExecOutcome::Continue
+            }
             Instruction::Udiv { rd, rn, rm } => {
                 let divisor = cpu.regs[*rm as usize];
                 cpu.regs[*rd as usize] = if divisor == 0 {
@@ -611,9 +639,17 @@ impl Executor {
                 rn,
                 regs,
                 writeback,
+                descending,
             } => {
-                let mut addr = cpu.regs[*rn as usize];
-                let mut last = 0u32;
+                let base = cpu.regs[*rn as usize];
+                let count = regs.count_ones() as u32;
+                // IA：起始 = base；DB：起始 = base - 4×count（先减后访存）
+                let start = if *descending {
+                    base.wrapping_sub(count * 4)
+                } else {
+                    base
+                };
+                let mut addr = start;
                 let mut pc_val: Option<u32> = None;
                 for i in 0..16 {
                     if regs & (1 << i) != 0 {
@@ -632,11 +668,12 @@ impl Executor {
                             cpu.regs[i] = val;
                         }
                         addr += 4;
-                        last = addr;
                     }
                 }
                 if *writeback {
-                    cpu.regs[*rn as usize] = last;
+                    // IA：回写 = base+4×count（尾地址）；DB：回写 = start（= base-4×count）
+                    let wb = if *descending { start } else { addr };
+                    cpu.regs[*rn as usize] = wb;
                     if *rn == 13 {
                         self.sync_sp(cpu);
                     }
@@ -650,9 +687,17 @@ impl Executor {
                 rn,
                 regs,
                 writeback,
+                descending,
             } => {
                 let base = cpu.regs[*rn as usize];
-                let mut addr = base;
+                let count = regs.count_ones() as u32;
+                // IA：起始 = base；DB：起始 = base - 4×count（先减后访存）
+                let start = if *descending {
+                    base.wrapping_sub(count * 4)
+                } else {
+                    base
+                };
+                let mut addr = start;
                 for i in 0..16 {
                     if regs & (1 << i) != 0 {
                         let val = cpu.regs[i];
@@ -665,7 +710,11 @@ impl Executor {
                     }
                 }
                 if *writeback {
-                    cpu.regs[*rn as usize] = addr;
+                    let wb = if *descending { start } else { addr };
+                    cpu.regs[*rn as usize] = wb;
+                    if *rn == 13 {
+                        self.sync_sp(cpu);
+                    }
                 }
                 ExecOutcome::Continue
             }
@@ -838,6 +887,125 @@ impl Executor {
                     }
                 }
                 ExecOutcome::Continue
+            }
+            // 数据屏障 DSB/ISB/DMB（FRT-INS-02）：单核顺序模拟语义 = 无操作
+            // （不 fault、不改变可观测状态；屏障的存储/取指顺序保证在单核顺序模型中恒成立）
+            Instruction::Barrier { .. } => ExecOutcome::Continue,
+            // CPSIE/CPSID（FRT-INS-01）：置/清 PRIMASK（i）与 FAULTMASK（f）
+            Instruction::Cps { disable, i, f } => {
+                if *i {
+                    cpu.primask = if *disable { 1 } else { 0 };
+                }
+                if *f {
+                    cpu.faultmask = if *disable { 1 } else { 0 };
+                }
+                ExecOutcome::Continue
+            }
+            // CLZ（FRT-INS-04）：前导零计数（Rd = 31 - 最高置位位索引）
+            Instruction::Clz { rd, rm } => {
+                cpu.regs[*rd as usize] = cpu.regs[*rm as usize].leading_zeros();
+                ExecOutcome::Continue
+            }
+            // RBIT（FRT-INS-05 SHOULD）：位反转
+            Instruction::Rbit { rd, rm } => {
+                cpu.regs[*rd as usize] = cpu.regs[*rm as usize].reverse_bits();
+                ExecOutcome::Continue
+            }
+            // REV/REV16/REVSH（FRT-INS-05 SHOULD）：字节序反转
+            Instruction::Rev { rd, rm, kind } => {
+                let v = cpu.regs[*rm as usize];
+                let r = match kind {
+                    // REV：整字字节反转（AABBCCDD → DDCCBBAA）
+                    RevKind::Rev => v.swap_bytes(),
+                    // REV16：半字内字节反转（AABBCCDD → BBAADDCC）
+                    RevKind::Rev16 => {
+                        ((v & 0xFFFF) as u16).swap_bytes() as u32
+                            | (((v >> 16) as u16).swap_bytes() as u32) << 16
+                    }
+                    // REVSH：低半字字节反转 + 符号扩展到 32 位
+                    RevKind::RevSh => ((v & 0xFFFF) as u16).swap_bytes() as i16 as i32 as u32,
+                };
+                cpu.regs[*rd as usize] = r;
+                ExecOutcome::Continue
+            }
+            // UBFX/SBFX/BFI/BFC（FRT-INS-05 SHOULD）：位域提取/插入/清除
+            Instruction::BitField {
+                rd,
+                rn,
+                lsb,
+                width,
+                kind,
+            } => {
+                let lsb = *lsb as u32;
+                let width = *width as u32;
+                // width 最大 32（UBFX #0,#32 / BFI msb=31）：避免 1<<32 溢出
+                let mask = if width >= 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << width) - 1
+                };
+                let src = cpu.regs[*rn as usize];
+                let r = match kind {
+                    // UBFX：无符号提取
+                    BitFieldKind::Ubfx => (src >> lsb) & mask,
+                    // SBFX：提取后按 width 符号扩展
+                    BitFieldKind::Sbfx => {
+                        let u = (src >> lsb) & mask;
+                        let sign = 1u32 << (width - 1);
+                        if u & sign != 0 {
+                            u | !mask
+                        } else {
+                            u
+                        }
+                    }
+                    // BFI：把 Rd 的 [lsb, lsb+width) 替换为 Rn 低 width 位
+                    BitFieldKind::Bfi => {
+                        let field = mask << lsb;
+                        (cpu.regs[*rd as usize] & !field) | ((src << lsb) & field)
+                    }
+                    // BFC：清除 Rd 的 [lsb, lsb+width)（Rn=1111 无源）
+                    BitFieldKind::Bfc => cpu.regs[*rd as usize] & !(mask << lsb),
+                };
+                cpu.regs[*rd as usize] = r;
+                ExecOutcome::Continue
+            }
+            // LDREX/LDREXB/LDREXH（FRT-INS-05 SHOULD）：单核语义与 LDR 等价
+            // （独占监视器恒成功——无并发写者；行为诚实：真实硬件单核同样不失败）
+            Instruction::Ldrex { rt, rn, imm, width } => {
+                let addr = cpu.regs[*rn as usize].wrapping_add(*imm);
+                let val = match width {
+                    AccessWidth::Byte => memory.read_u8(addr).map(|v| v as u32),
+                    AccessWidth::HalfWord => memory.read_u16(addr).map(|v| v as u32),
+                    AccessWidth::Word => memory.read_u32(addr),
+                };
+                match val {
+                    Ok(v) => {
+                        cpu.regs[*rt as usize] = v;
+                        ExecOutcome::Continue
+                    }
+                    Err(_f) => ExecOutcome::Fault {
+                        reason: super::FaultReason::BusFault { address: addr },
+                    },
+                }
+            }
+            // STREX/STREXB/STREXH（FRT-INS-05 SHOULD）：单核语义 = STR + Rd=0（独占成功）
+            Instruction::Strex { rd, rt, rn, imm, width } => {
+                let addr = cpu.regs[*rn as usize].wrapping_add(*imm);
+                let res = match width {
+                    AccessWidth::Byte => memory.write_u8(addr, cpu.regs[*rt as usize] as u8),
+                    AccessWidth::HalfWord => memory.write_u16(addr, cpu.regs[*rt as usize] as u16),
+                    AccessWidth::Word => memory.write_u32(addr, cpu.regs[*rt as usize]),
+                };
+                match res {
+                    Ok(()) => {
+                        // 独占访问成功：Rd = 0
+                        cpu.regs[*rd as usize] = 0;
+                        ExecOutcome::Continue
+                    }
+                    Err(_f) => ExecOutcome::Fault {
+                        reason: super::FaultReason::BusFault { address: addr },
+                    },
+                }
             }
             Instruction::Svc { imm8 } => {
                 // 诚实注：SVC 已解码但异常入口（SVCall 向量跳转/压栈）未实现，
@@ -2167,6 +2335,7 @@ mod tests {
             rn: 0,
             regs: 0b110,
             writeback: true,
+            descending: false,
         };
         assert_eq!(
             ex.execute(&mut cpu, &mut mem, &instr),
@@ -2179,6 +2348,7 @@ mod tests {
             rn: 0,
             regs: 0b11000,
             writeback: true,
+            descending: false,
         };
         assert_eq!(
             ex.execute(&mut cpu, &mut mem, &instr),
@@ -2740,5 +2910,234 @@ mod tests {
         // → Unimplemented，绝不静默写 PC
         let outcome = h.exec_word(0xF45F_4F80);
         assert!(matches!(outcome, ExecOutcome::Fault { .. }), "MOVS.W r15 → Fault/Unimplemented，不得静默写 PC");
+    }
+
+    // ================= P1：FreeRTOS 前置指令补齐（FRT-INS，编码 as 实测）=================
+    use crate::engine::test_util::Harness;
+
+    /// CPSIE/CPSID（FRT-INS-01）：cpsie i=0xB662/cpsid i=0xB672/cpsie f=0xB661/cpsid f=0xB671
+    #[test]
+    fn p1_cpsie_cpsid_primask_faultmask() {
+        let mut h = Harness::new();
+        // GIVEN: 初始 PRIMASK/FAULTMASK = 0
+        assert_eq!(h.cpu.primask, 0);
+        assert_eq!(h.cpu.faultmask, 0);
+        // WHEN: cpsid i（置 PRIMASK）→ cpsid f（置 FAULTMASK）
+        assert_eq!(h.exec_halfword(0xB672), ExecOutcome::Continue);
+        assert_eq!(h.exec_halfword(0xB671), ExecOutcome::Continue);
+        // THEN: PRIMASK=1, FAULTMASK=1
+        assert_eq!(h.cpu.primask, 1, "cpsid i 置 PRIMASK");
+        assert_eq!(h.cpu.faultmask, 1, "cpsid f 置 FAULTMASK");
+        // WHEN: cpsie i → cpsie f（清 PRIMASK/FAULTMASK）
+        assert_eq!(h.exec_halfword(0xB662), ExecOutcome::Continue);
+        assert_eq!(h.exec_halfword(0xB661), ExecOutcome::Continue);
+        // THEN: 全部清零
+        assert_eq!(h.cpu.primask, 0, "cpsie i 清 PRIMASK");
+        assert_eq!(h.cpu.faultmask, 0, "cpsie f 清 FAULTMASK");
+    }
+
+    /// DSB/ISB/DMB（FRT-INS-02）：dsb=0xF3BF 8F4F / isb=0xF3BF 8F6F / dmb=0xF3BF 8F5F
+    /// 单核顺序模拟语义 = 无操作（不 fault、不改变可观测状态）
+    #[test]
+    fn p1_barriers_noop() {
+        let mut h = Harness::new();
+        h.cpu.regs[0] = 0x1234_5678;
+        let before_xpsr = h.cpu.xpsr;
+        // WHEN: 依次执行三种屏障（含 DSB 域变体 0x8F4F）
+        for word in [0xF3BF_8F4Fu32, 0xF3BF_8F5F, 0xF3BF_8F6F] {
+            assert_eq!(h.exec_word(word), ExecOutcome::Continue, "{word:#010x} 不应 fault");
+        }
+        // THEN: 无任何可观测状态变化（寄存器/xPSR 保持）
+        assert_eq!(h.cpu.regs[0], 0x1234_5678);
+        assert_eq!(h.cpu.xpsr, before_xpsr);
+    }
+
+    /// 32 位 LDM/STM 全家族（FRT-INS-03）：IA/DB + 回写 + r14/PC
+    /// 编码（as 实测）：stmia.w r0!,{r4-r11,lr}=0xE8A0 4FF0；ldmia.w=0xE8B0 4FF0；
+    /// stmdb r0!,{..}=0xE920 4FF0；ldmdb r0!,{..}=0xE930 4FF0；pop {r4-r11,pc}=0xE8BD 8FF0
+    #[test]
+    fn p1_ldm_stm_32bit_family() {
+        let mut h = Harness::new();
+        // ---- STMIA.W r0!, {r4-r11, r14}：9 字递增存储，回写 r0 = r0+36 ----
+        h.cpu.regs[0] = 0x2000_0000;
+        for (i, reg) in [4u8, 5, 6, 7, 8, 9, 10, 11, 14].iter().enumerate() {
+            h.cpu.regs[*reg as usize] = 0x1000 + i as u32;
+        }
+        assert_eq!(h.exec_word(0xE8A0_4FF0), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x2000_0024, "STMIA 回写 = base+4×9");
+        assert_eq!(h.mem.read_u32(0x2000_0000).unwrap(), 0x1000, "r4");
+        assert_eq!(h.mem.read_u32(0x2000_0020).unwrap(), 0x1008, "r14 在最后槽");
+
+        // ---- LDMIA.W r0!, {r4-r11, r14}：递增加载恢复 + 回写 ----
+        for i in 0..16 {
+            h.cpu.regs[i] = 0;
+        }
+        h.cpu.regs[0] = 0x2000_0000;
+        assert_eq!(h.exec_word(0xE8B0_4FF0), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[4], 0x1000);
+        assert_eq!(h.cpu.regs[11], 0x1007);
+        assert_eq!(h.cpu.regs[14], 0x1008);
+        assert_eq!(h.cpu.regs[0], 0x2000_0024, "LDMIA 回写");
+
+        // ---- STMDB r0!, {r4-r11, r14}：先减后存，起始 = base-36，回写 r0 = base-36 ----
+        h.cpu.regs[0] = 0x2000_0024;
+        assert_eq!(h.exec_word(0xE920_4FF0), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x2000_0000, "STMDB 回写 = base-4×9");
+        assert_eq!(h.mem.read_u32(0x2000_0000).unwrap(), 0x1000, "r4 在最低地址");
+        assert_eq!(h.mem.read_u32(0x2000_0020).unwrap(), 0x1008, "r14 在最高槽");
+
+        // ---- LDMDB r0!, {r4-r11, r14}：从 base-36 起递增加载，回写 = base-36 ----
+        for i in 0..16 {
+            h.cpu.regs[i] = 0;
+        }
+        h.cpu.regs[0] = 0x2000_0024;
+        assert_eq!(h.exec_word(0xE930_4FF0), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[4], 0x1000);
+        assert_eq!(h.cpu.regs[14], 0x1008);
+        assert_eq!(h.cpu.regs[0], 0x2000_0000, "LDMDB 回写");
+
+        // ---- LDMIA.W sp!, {r4-r11, pc}（POP 32 位等价，0xE8BD 8FF0）：PC 按 Branch 语义 ----
+        h.cpu.regs[13] = 0x2000_0100;
+        for i in 0..16 {
+            h.cpu.regs[i] = 0;
+        }
+        h.cpu.regs[13] = 0x2000_0100;
+        // 预置栈内容：r4=0x1111, r5=0x2222, ..., r11=0x8888, pc 槽=0x0800_0001（T 位）
+        for (j, val) in [0x1111u32, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777, 0x8888, 0x0800_0001]
+            .iter()
+            .enumerate()
+        {
+            h.mem.write_u32(0x2000_0100 + (j as u32) * 4, *val).unwrap();
+        }
+        let out = h.exec_word(0xE8BD_8FF0);
+        assert!(
+            matches!(out, ExecOutcome::Branch { target: 0x0800_0000 }),
+            "LDM 含 pc → Branch 语义清 T 位"
+        );
+        assert_eq!(h.cpu.regs[4], 0x1111);
+        // PC 由引擎按 Branch outcome 应用（Harness 不写 PC，与 Ldm 既有语义一致）
+        assert_eq!(h.cpu.regs[13], 0x2000_0124, "SP 回写 = base+4×9");
+    }
+
+    /// CLZ（FRT-INS-04）：clz r0,r1 = 0xFAB1 F081（前导零计数）
+    #[test]
+    fn p1_clz() {
+        let mut h = Harness::new();
+        // 0x0000_0001 → 31 个前导零
+        h.cpu.regs[1] = 0x0000_0001;
+        assert_eq!(h.exec_word(0xFAB1_F081), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 31);
+        // 0x8000_0000 → 0
+        h.cpu.regs[1] = 0x8000_0000;
+        assert_eq!(h.exec_word(0xFAB1_F081), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0);
+        // 0 → 32
+        h.cpu.regs[1] = 0;
+        assert_eq!(h.exec_word(0xFAB1_F081), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 32);
+        // 0x00FF_0000 → 8
+        h.cpu.regs[1] = 0x00FF_0000;
+        assert_eq!(h.exec_word(0xFAB1_F081), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 8);
+    }
+
+    /// REV/REV16/REVSH（FRT-INS-05 SHOULD）：rev=0xBA08/rev16=0xBA48/revsh=0xBAC8
+    #[test]
+    fn p1_rev_family() {
+        let mut h = Harness::new();
+        // REV：整字字节反转
+        h.cpu.regs[1] = 0xAABB_CCDD;
+        assert_eq!(h.exec_halfword(0xBA08), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xDDCC_BBAA, "REV 整字反转");
+        // REV16：半字内字节反转
+        h.cpu.regs[1] = 0xAABB_CCDD;
+        assert_eq!(h.exec_halfword(0xBA48), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xBBAA_DDCC, "REV16 半字内反转");
+        // REVSH：低半字反转 + 符号扩展（0x0000_00DD → 0xDD00 → 符号扩展 0xFFFF_DD00）
+        h.cpu.regs[1] = 0x0000_00DD;
+        assert_eq!(h.exec_halfword(0xBAC8), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFFFF_DD00u32, "REVSH 符号扩展");
+        // 正值：0x0000_00CD → 0xCD00（bit15=1 → 仍为负）；0x0000_004D → 0x4D00（正）
+        h.cpu.regs[1] = 0x0000_004D;
+        assert_eq!(h.exec_halfword(0xBAC8), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x0000_4D00, "REVSH 正值符号扩展");
+    }
+
+    /// UBFX/SBFX/BFI/BFC（FRT-INS-05 SHOULD）：
+    /// ubfx r0,r1,#3,#5=0xF3C1 00C4；sbfx=0xF341 00C4；bfi r0,r1,#3,#5=0xF361 00C7；bfc=0xF36F 00C7
+    #[test]
+    fn p1_bitfield_ops() {
+        let mut h = Harness::new();
+        // UBFX r0, r1, #3, #5：提取 bits[7:3] 无符号
+        h.cpu.regs[1] = 0x0000_00F8; // bits[7:3] = 11111
+        assert_eq!(h.exec_word(0xF3C1_00C4), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x1F);
+        h.cpu.regs[1] = 0xFFFF_FFFF;
+        assert_eq!(h.exec_word(0xF3C1_00C4), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0x1F, "UBFX 无符号：全 1 只取 5 位");
+
+        // SBFX r0, r1, #3, #5：符号扩展
+        h.cpu.regs[1] = 0xFFFF_FFFF;
+        assert_eq!(h.exec_word(0xF341_00C4), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFFFF_FFFFu32, "SBFX 全 1 → 符号扩展后仍全 1");
+        h.cpu.regs[1] = 0x0000_0018; // bits[7:3] = 00011 → 3（符号位 0）
+        assert_eq!(h.exec_word(0xF341_00C4), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 3);
+
+        // BFI r0, r1, #3, #5：Rd[7:3] = Rn[4:0]
+        h.cpu.regs[0] = 0xFFFF_FFFF;
+        h.cpu.regs[1] = 0x0000_0000;
+        assert_eq!(h.exec_word(0xF361_00C7), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFFFF_FF07, "BFI 清 bits[7:3] 后插入 0");
+        h.cpu.regs[1] = 0x0000_001F; // 5 位全 1
+        assert_eq!(h.exec_word(0xF361_00C7), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFFFF_FFFF, "BFI 插入全 1");
+
+        // BFC r0, #3, #5：清除 bits[7:3]
+        h.cpu.regs[0] = 0xFFFF_FFFF;
+        assert_eq!(h.exec_word(0xF36F_00C7), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFFFF_FF07, "BFC 清除 bits[7:3]");
+    }
+
+    /// LDREX/STREX 家族（FRT-INS-05 SHOULD，单核语义）：
+    /// ldrex r0,[r1]=0xE851 0F00；strex r0,r1,[r2]=0xE842 1000；
+    /// ldrexb r4,[r5]=0xE8D5 4F4F；strexb r6,r7,[r8]=0xE8C8 7F46；
+    /// ldrexh r9,[r10]=0xE8DA 9F5F；strexh r11,r12,[r0]=0xE8C0 CF5B
+    #[test]
+    fn p1_ldrex_strex() {
+        let mut h = Harness::new();
+        // LDREX（字）：读内存
+        h.cpu.regs[1] = 0x2000_0000;
+        h.mem.write_u32(0x2000_0000, 0xDEAD_BEEF).unwrap();
+        assert_eq!(h.exec_word(0xE851_0F00), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xDEAD_BEEF);
+        // STREX（字）：写内存 + Rd=0（独占成功）
+        h.cpu.regs[2] = 0x2000_0000;
+        h.cpu.regs[1] = 0x1122_3344;
+        assert_eq!(h.exec_word(0xE842_1000), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u32(0x2000_0000).unwrap(), 0x1122_3344, "STREX 写入");
+        assert_eq!(h.cpu.regs[0], 0, "STREX 单核语义成功 → Rd=0");
+        // LDREXH（半字）：0xE8DA 9F5F
+        h.cpu.regs[10] = 0x2000_0000;
+        h.mem.write_u16(0x2000_0000, 0xABCD).unwrap();
+        assert_eq!(h.exec_word(0xE8DA_9F5F), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[9], 0xABCD);
+        // STREXH（半字）：0xE8C0 CF5B → r12 数据写入 [r0]，r11=0
+        h.cpu.regs[0] = 0x2000_0000;
+        h.cpu.regs[12] = 0x0000_CDEF;
+        assert_eq!(h.exec_word(0xE8C0_CF5B), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u16(0x2000_0000).unwrap(), 0xCDEF);
+        assert_eq!(h.cpu.regs[11], 0);
+        // LDREXB（字节）：0xE8D5 4F4F
+        h.cpu.regs[5] = 0x2000_0000;
+        h.mem.write_u8(0x2000_0000, 0x7F).unwrap();
+        assert_eq!(h.exec_word(0xE8D5_4F4F), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[4], 0x7F);
+        // STREXB（字节）：0xE8C8 7F46 → r7 数据写入 [r8]，r6=0
+        h.cpu.regs[8] = 0x2000_0000;
+        h.cpu.regs[7] = 0x5A;
+        assert_eq!(h.exec_word(0xE8C8_7F46), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u8(0x2000_0000).unwrap(), 0x5A);
+        assert_eq!(h.cpu.regs[6], 0);
     }
 }

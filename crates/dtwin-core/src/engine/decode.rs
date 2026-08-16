@@ -101,6 +101,15 @@ pub enum Instruction {
     },
     /// 乘法
     Mul { rd: u8, rn: u8, rm: u8, flags: bool },
+    /// 64 位长乘法: UMULL/SMULL/SMLAL（[RdHi:RdLo] = Rn×Rm [+ [RdHi:RdLo]]）
+    MullLong {
+        rdlo: u8,
+        rdhi: u8,
+        rn: u8,
+        rm: u8,
+        signed: bool,
+        accumulate: bool,
+    },
     /// 无符号除法
     Udiv { rd: u8, rn: u8, rm: u8 },
     /// 有符号除法
@@ -155,10 +164,53 @@ pub enum Instruction {
     Push { regs: u16, lr: bool },
     /// 出栈: POP {reglist}
     Pop { regs: u16, pc: bool },
-    /// 多寄存器加载: LDM
-    Ldm { rn: u8, regs: u16, writeback: bool },
-    /// 多寄存器存储: STM
-    Stm { rn: u8, regs: u16, writeback: bool },
+    /// 多寄存器加载: LDM（descending=true 为 DB 形式：先减后访存）
+    Ldm {
+        rn: u8,
+        regs: u16,
+        writeback: bool,
+        descending: bool,
+    },
+    /// 多寄存器存储: STM（descending=true 为 DB 形式：先减后访存）
+    Stm {
+        rn: u8,
+        regs: u16,
+        writeback: bool,
+        descending: bool,
+    },
+    /// 数据屏障: DSB/ISB/DMB（单核顺序模拟 = 无操作）
+    Barrier { kind: BarrierKind },
+    /// CPSIE/CPSID: 修改 PRIMASK/FAULTMASK（disable=true 为 CPSID）
+    Cps { disable: bool, i: bool, f: bool },
+    /// 前导零计数: CLZ Rd, Rm
+    Clz { rd: u8, rm: u8 },
+    /// 位反转: RBIT Rd, Rm
+    Rbit { rd: u8, rm: u8 },
+    /// 字节序反转: REV/REV16/REVSH
+    Rev { rd: u8, rm: u8, kind: RevKind },
+    /// 位域操作: UBFX/SBFX/BFI/BFC
+    BitField {
+        rd: u8,
+        rn: u8,
+        lsb: u8,
+        width: u8,
+        kind: BitFieldKind,
+    },
+    /// 独占加载: LDREX/LDREXB/LDREXH（单核语义 = LDR）
+    Ldrex {
+        rt: u8,
+        rn: u8,
+        imm: u32,
+        width: AccessWidth,
+    },
+    /// 独占存储: STREX/STREXB/STREXH（单核语义 = STR 且 Rd=0 成功）
+    Strex {
+        rd: u8,
+        rt: u8,
+        rn: u8,
+        imm: u32,
+        width: AccessWidth,
+    },
     /// 加载字: LDR Rt, [Rn, #off] / [Rn, Rm]
     Ldr {
         rt: u8,
@@ -366,6 +418,31 @@ pub enum Instruction {
     Unimplemented { bits: u32 },
     /// 非法指令
     Invalid { address: u32 },
+}
+
+/// 数据屏障种类（FRT-INS-02：单核顺序模拟下均为无操作）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierKind {
+    Dsb,
+    Isb,
+    Dmb,
+}
+
+/// 字节序反转种类（16 位 REV 家族）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevKind {
+    Rev,
+    Rev16,
+    RevSh,
+}
+
+/// 位域操作种类（UBFX/SBFX/BFI/BFC）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitFieldKind {
+    Ubfx,
+    Sbfx,
+    Bfi,
+    Bfc,
 }
 
 /// DSP 饱和指令的移位类型
@@ -679,6 +756,28 @@ impl Decoder {
         if (top & 0xFFD0) == 0xF300 || ((top & 0xFFD0) == 0xF380 && (bits & 0x8000) == 0) {
             return self.decode_sat(bits);
         }
+        // DSB/ISB/DMB（0xF3BF 8Fxx，FRT-INS-02）：编码（as 实测）
+        // dsb sy=0xF3BF 8F4F / dmb sy=0xF3BF 8F5F / isb sy=0xF3BF 8F6F——
+        // 单核顺序模拟语义 = 无操作屏障（不 fault、不改变可观测状态）
+        if top == 0xF3BF && (bits & 0xFF0F) == 0x8F0F {
+            let kind = match (bits >> 4) & 0xF {
+                0x4 => BarrierKind::Dsb,
+                0x5 => BarrierKind::Dmb,
+                0x6 => BarrierKind::Isb,
+                // 其他选项（DSB 域/共享性变体）同为屏障
+                _ => BarrierKind::Dsb,
+            };
+            return Instruction::Barrier { kind };
+        }
+        // UBFX/SBFX/BFI/BFC（位域操作，FRT-INS-05 SHOULD）：
+        // 编码（as 实测）：ubfx=0xF3C1/sbfx=0xF341/bfi=0xF361/bfc=0xF36F（Rn=1111）——
+        // 1111 0 0111 op[2:0] Rn 0 imm3 Rd imm2 0 msb/lsb
+        if (top & 0xFFF0) == 0xF3C0
+            || (top & 0xFFF0) == 0xF340
+            || (top & 0xFFF0) == 0xF360
+        {
+            return self.decode_bitfield(bits);
+        }
         // QADD/QSUB/QDADD/QDSUB (0xFA80-0xFA8F，低半字 op=1000-1011)
         if (top & 0xFFF8) == 0xFA80 && (bits & 0xF000) == 0xF000 && ((bits >> 4) & 0xC) == 0x8 {
             return self.decode_qaddsub(bits);
@@ -710,9 +809,46 @@ impl Decoder {
         if (top & 0xFFF0) == 0xFB00 && (bits & 0x00E0) == 0 {
             return self.decode_mla(bits);
         }
+        // UMULL/SMULL/SMLAL（FRT-INS-05 SHOULD，-O2 固件 64 位乘加）：
+        // 编码（as 实测）：umull r0,r1,r2,r3=0xFBA2 0103 / smull=0xFB86 4507 /
+        // smlal=0xFBC2 0103——top 0xFBA0/0xFB80/0xFBC0 家族，低半字 bits[7:4]=0000。
+        // 与 SMLALD/SMLSLD（低半字 bits[7:6]=11）及 SMUAD（0xFB20/0xFB40）互斥。
+        if matches!(top & 0xFFF0, 0xFBA0 | 0xFB80 | 0xFBC0) && (bits & 0x00F0) == 0 {
+            let rdlo = ((bits >> 12) & 0xF) as u8;
+            let rdhi = ((bits >> 8) & 0xF) as u8;
+            let rn = (top & 0xF) as u8;
+            let rm = (bits & 0xF) as u8;
+            let signed = (top & 0xFFF0) == 0xFB80;
+            let accumulate = (top & 0xFFF0) == 0xFBC0;
+            return Instruction::MullLong {
+                rdlo,
+                rdhi,
+                rn,
+                rm,
+                signed,
+                accumulate,
+            };
+        }
         // PKHBT/PKHTB（0xEAC0）
         if (top & 0xFFF0) == 0xEAC0 {
             return self.decode_pkh(bits);
+        }
+
+        // CLZ（0xFAB0，FRT-INS-04）：编码（as 实测）clz r0,r1=0xFAB1 F081——
+        // 1111 1010 1011 Rn 1111 Rd 1000 Rm
+        if (top & 0xFFF0) == 0xFAB0 && (bits & 0xF0F0) == 0xF080 {
+            return Instruction::Clz {
+                rd: ((bits >> 8) & 0xF) as u8,
+                rm: (bits & 0xF) as u8,
+            };
+        }
+        // RBIT（0xFA90，FRT-INS-05 SHOULD）：编码（as 实测）rbit r0,r1=0xFA91 F0A1——
+        // 1111 1010 1001 Rn 1111 Rd 1010 Rm（低半字 bits[7:4]=1010 与 SADD16 区分）
+        if (top & 0xFFF0) == 0xFA90 && (bits & 0xF0F0) == 0xF0A0 {
+            return Instruction::Rbit {
+                rd: ((bits >> 8) & 0xF) as u8,
+                rm: (bits & 0xF) as u8,
+            };
         }
 
         // ---- 32-bit LDR/STR 家族（A8：真实固件刚需）----
@@ -725,9 +861,48 @@ impl Decoder {
                 return instr;
             }
         }
-        // LDRD/STRD（0xE9D0/0xE9C0）
+        // LDRD/STRD（0xE9D0/0xE9C0）——须先于 32 位 LDM/STM 检查（同为 0xE8xx/0xE9xx 族）
         if (top & 0xFFF0) == 0xE9D0 || (top & 0xFFF0) == 0xE9C0 {
             return self.decode_ldrd_strd(bits);
+        }
+        // ---- 32-bit LDM/STM + LDREX/STREX（FRT-INS-03/05，0xE8xx/0xE9xx）----
+        // 编码（arm-none-eabi-as 实测）：P=bit24、U=bit23、W(回写)=bit21、L=bit20；
+        // bit22=0 → LDM/STM（IA: P=0,U=1；DB: P=1,U=0）；bit22=1 → LDREX/STREX 家族。
+        // 例：stmia.w r0!,{r4-r11,lr}=0xE8A0 4FF0 / ldmia.w r0!,{..}=0xE8B0 4FF0 /
+        //     stmdb r0!,{..}=0xE920 4FF0 / ldmdb r0!,{..}=0xE930 4FF0
+        if (top & 0xFE00) == 0xE800 {
+            if (top & 0x0040) == 0 {
+                // bit22=0：LDM/STM（32 位 IA/DB 全家族，寄存器列表 r0-r15 任意组合）
+                let p = (top >> 8) & 1; // bit24
+                let u = (top >> 7) & 1; // bit23
+                let w = (top >> 5) & 1; // bit21
+                let l = (top >> 4) & 1; // bit20
+                if !(p == 0 && u == 1) && !(p == 1 && u == 0) {
+                    // P=U（IA+DB 之外的保留组合，如 0xE800）→ 诚实 Unimplemented
+                    return Instruction::Unimplemented { bits };
+                }
+                let rn = (top & 0xF) as u8;
+                let regs = (bits & 0xFFFF) as u16;
+                let descending = p == 1 && u == 0; // DB；IA = P=0,U=1
+                if l == 1 {
+                    return Instruction::Ldm {
+                        rn,
+                        regs,
+                        writeback: w == 1,
+                        descending,
+                    };
+                } else {
+                    return Instruction::Stm {
+                        rn,
+                        regs,
+                        writeback: w == 1,
+                        descending,
+                    };
+                }
+            } else {
+                // bit22=1：LDREX/STREX 家族（单核语义，FRT-INS-05 SHOULD）
+                return self.decode_ldrex_strex(bits);
+            }
         }
 
         // ---- 32-bit 数据处理（修改立即数）: 11110 i 0 op4 S Rn / 0 imm3 Rd imm8 ----
@@ -1094,6 +1269,119 @@ impl Decoder {
             rm,
             tb,
             shift_imm: imm5 as u8,
+        }
+    }
+
+    /// UBFX/SBFX/BFI/BFC 位域操作解码（FRT-INS-05 SHOULD）
+    /// 编码（arm-none-eabi-as 实测）：
+    ///   ubfx r0,r1,#3,#5 = 0xF3C1 00C4；sbfx = 0xF341 00C4；bfi = 0xF361 00C7；bfc = 0xF36F 00C7
+    /// UBFX/SBFX：lsb = imm3:imm2（bits[14:12]:bits[7:6]），width = widthm1(bits[4:0])+1
+    /// BFI/BFC：bits[4:0] = msb，lsb = imm3:imm2，width = msb-lsb+1；BFC 的 Rn=1111
+    fn decode_bitfield(&self, bits: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let imm3 = ((bits >> 12) & 0x7) as u8;
+        let rd = ((bits >> 8) & 0xF) as u8;
+        let imm2 = ((bits >> 6) & 0x3) as u8;
+        let rn = (top & 0xF) as u8;
+        match top & 0xFFF0 {
+            // UBFX：无符号位域提取
+            0xF3C0 => {
+                let lsb = (imm3 << 2) | imm2;
+                let width = (bits & 0x1F) as u8 + 1;
+                Instruction::BitField {
+                    rd,
+                    rn,
+                    lsb,
+                    width,
+                    kind: BitFieldKind::Ubfx,
+                }
+            }
+            // SBFX：有符号位域提取（结果符号扩展）
+            0xF340 => {
+                let lsb = (imm3 << 2) | imm2;
+                let width = (bits & 0x1F) as u8 + 1;
+                Instruction::BitField {
+                    rd,
+                    rn,
+                    lsb,
+                    width,
+                    kind: BitFieldKind::Sbfx,
+                }
+            }
+            // BFI/BFC：位域插入/清除（Rn=1111 → BFC，无源寄存器）
+            _ => {
+                let msb = (bits & 0x1F) as u8;
+                let lsb = (imm3 << 2) | imm2;
+                let width = msb - lsb + 1;
+                let kind = if rn == 0xF {
+                    BitFieldKind::Bfc
+                } else {
+                    BitFieldKind::Bfi
+                };
+                Instruction::BitField {
+                    rd,
+                    rn,
+                    lsb,
+                    width,
+                    kind,
+                }
+            }
+        }
+    }
+
+    /// LDREX/STREX 家族解码（FRT-INS-05 SHOULD，单核语义）
+    /// 编码（arm-none-eabi-as 实测）：
+    ///   LDREX Rt,[Rn,#imm8×4] = 0xE850|Rn 低= Rt:1111 1001 imm8
+    ///   STREX Rd,Rt,[Rn,#imm8×4] = 0xE840|Rn 低= Rt:Rd:1111 1001 imm8
+    ///   LDREXB = 0xE8D0|Rn 低= Rt:1111 0100 1111；LDREXH 低= Rt:1111 0101 1111
+    ///   STREXB = 0xE8C0|Rn 低= Rt:1111 0100 Rd；STREXH 低= Rt:1111 0101 Rd
+    fn decode_ldrex_strex(&self, bits: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let rn = (top & 0xF) as u8;
+        let rt = ((bits >> 12) & 0xF) as u8;
+        match (top & 0xFFF0, bits & 0x0FFF, bits & 0x0FF0) {
+            (0xE850, _, _) => Instruction::Ldrex {
+                rt,
+                rn,
+                imm: (bits & 0xFF) * 4,
+                width: AccessWidth::Word,
+            },
+            (0xE840, _, _) => Instruction::Strex {
+                rd: ((bits >> 8) & 0xF) as u8,
+                rt,
+                rn,
+                imm: (bits & 0xFF) * 4,
+                width: AccessWidth::Word,
+            },
+            // LDREXB/LDREXH：低半字固定 1111 0100/0101 1111
+            (0xE8D0, 0x0F4F, _) => Instruction::Ldrex {
+                rt,
+                rn,
+                imm: 0,
+                width: AccessWidth::Byte,
+            },
+            (0xE8D0, 0x0F5F, _) => Instruction::Ldrex {
+                rt,
+                rn,
+                imm: 0,
+                width: AccessWidth::HalfWord,
+            },
+            // STREXB/STREXH：低半字固定 1111 0100/0101 + bits[3:0]=Rd
+            (0xE8C0, _, 0x0F40) => Instruction::Strex {
+                rd: (bits & 0xF) as u8,
+                rt,
+                rn,
+                imm: 0,
+                width: AccessWidth::Byte,
+            },
+            (0xE8C0, _, 0x0F50) => Instruction::Strex {
+                rd: (bits & 0xF) as u8,
+                rt,
+                rn,
+                imm: 0,
+                width: AccessWidth::HalfWord,
+            },
+            _ => Instruction::Unimplemented { bits },
         }
     }
 
@@ -1560,6 +1848,7 @@ impl Decoder {
             rn,
             regs,
             writeback: true,
+            descending: false,
         }
     }
 
@@ -1571,6 +1860,7 @@ impl Decoder {
             rn,
             regs,
             writeback: true,
+            descending: false,
         }
     }
 
@@ -1870,6 +2160,23 @@ impl Decoder {
                 regs: (bits & 0xFF) as u16,
                 lr: true,
             },
+            // CPSIE/CPSID（0xB660-0xB67F，FRT-INS-01）：
+            // 编码（arm-none-eabi-as 实测）：cpsie i=0xB662/cpsid i=0xB672/
+            // cpsie f=0xB661/cpsid f=0xB671——bit4=imod（0=IE 使能/1=ID 禁止），
+            // bit1=i（PRIMASK）、bit0=f（FAULTMASK）
+            6 => {
+                if (bits & 0xFFE0) == 0xB660 {
+                    Instruction::Cps {
+                        disable: (bits >> 4) & 1 == 1,
+                        i: bits & 0x2 != 0,
+                        f: bits & 0x1 != 0,
+                    }
+                } else {
+                    Instruction::Unimplemented {
+                        bits: bits as u32,
+                    }
+                }
+            }
             _ => Instruction::Unimplemented {
                 bits: bits as u32,
             },
@@ -1889,6 +2196,34 @@ impl Decoder {
                     rn,
                     target,
                     zero: false,
+                }
+            }
+            // REV/REV16/REVSH（0xBA00-0xBAFF，FRT-INS-05 SHOULD）：
+            // 编码（as 实测）：REV=0xBA08/REV16=0xBA48/REVSH=0xBAC8——
+            // 1011 1010 op[1:0] Rm Rd（op: 00=REV, 01=REV16, 11=REVSH；10 保留）
+            2 => {
+                let rd = (bits & 0x7) as u8;
+                let rm = ((bits >> 3) & 0x7) as u8;
+                match (bits >> 6) & 0x3 {
+                    0 => Instruction::Rev {
+                        rd,
+                        rm,
+                        kind: RevKind::Rev,
+                    },
+                    1 => Instruction::Rev {
+                        rd,
+                        rm,
+                        kind: RevKind::Rev16,
+                    },
+                    3 => Instruction::Rev {
+                        rd,
+                        rm,
+                        kind: RevKind::RevSh,
+                    },
+                    // 10（0xBA80-0xBABF）：保留，诚实 Unimplemented
+                    _ => Instruction::Unimplemented {
+                        bits: bits as u32,
+                    },
                 }
             }
             // POP {regs}（bit8=0）/ POP {regs, pc}（bit8=1）
@@ -2347,6 +2682,7 @@ mod tests {
                 rn: 0,
                 regs: 0b110,
                 writeback: true,
+                descending: false,
             }
         );
         // LDMIA r0!, {r1, r2} = 0xC806
@@ -2356,6 +2692,7 @@ mod tests {
                 rn: 0,
                 regs: 0b110,
                 writeback: true,
+                descending: false,
             }
         );
         // BEQ：0xD006 → 条件分支，目标 = pc+4+6*2
@@ -3370,6 +3707,324 @@ fn decode_32bit_movs_imm() {
             rm: None,
             imm: Some(1),
             flags: false,
+        }
+    );
+}
+
+// ============ P1：FreeRTOS 前置指令解码（FRT-INS，编码 as 实测） ============
+
+/// CPSIE/CPSID 解码（FRT-INS-01）：cpsie i=0xB662/cpsid i=0xB672/cpsie f=0xB661/cpsid f=0xB671
+#[test]
+fn decode_cpsie_cpsid() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_halfword(0xB662, 0),
+        Instruction::Cps {
+            disable: false,
+            i: true,
+            f: false,
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0xB672, 0),
+        Instruction::Cps {
+            disable: true,
+            i: true,
+            f: false,
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0xB661, 0),
+        Instruction::Cps {
+            disable: false,
+            i: false,
+            f: true,
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0xB671, 0),
+        Instruction::Cps {
+            disable: true,
+            i: false,
+            f: true,
+        }
+    );
+}
+
+/// DSB/ISB/DMB 解码（FRT-INS-02）：dsb=0xF3BF 8F4F / isb=0xF3BF 8F6F / dmb=0xF3BF 8F5F
+#[test]
+fn decode_barriers() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_word(0xF3BF_8F4F, 0),
+        Instruction::Barrier {
+            kind: BarrierKind::Dsb
+        }
+    );
+    assert_eq!(
+        d.decode_word(0xF3BF_8F5F, 0),
+        Instruction::Barrier {
+            kind: BarrierKind::Dmb
+        }
+    );
+    assert_eq!(
+        d.decode_word(0xF3BF_8F6F, 0),
+        Instruction::Barrier {
+            kind: BarrierKind::Isb
+        }
+    );
+}
+
+/// 32 位 LDM/STM 解码（FRT-INS-03）：IA/DB + 回写 + r14/PC 组合
+#[test]
+fn decode_ldm_stm_32bit() {
+    let mut d = Decoder::new();
+    // stmia.w r0!, {r4-r11, r14} = 0xE8A0 4FF0：IA + 回写
+    assert_eq!(
+        d.decode_word(0xE8A0_4FF0, 0),
+        Instruction::Stm {
+            rn: 0,
+            regs: 0b0100_1111_1111_0000,
+            writeback: true,
+            descending: false,
+        }
+    );
+    // ldmia.w r0!, {r4-r11, r14} = 0xE8B0 4FF0
+    assert_eq!(
+        d.decode_word(0xE8B0_4FF0, 0),
+        Instruction::Ldm {
+            rn: 0,
+            regs: 0b0100_1111_1111_0000,
+            writeback: true,
+            descending: false,
+        }
+    );
+    // stmdb r0!, {r4-r11, r14} = 0xE920 4FF0：DB + 回写
+    assert_eq!(
+        d.decode_word(0xE920_4FF0, 0),
+        Instruction::Stm {
+            rn: 0,
+            regs: 0b0100_1111_1111_0000,
+            writeback: true,
+            descending: true,
+        }
+    );
+    // ldmdb r0!, {r4-r11, r14} = 0xE930 4FF0
+    assert_eq!(
+        d.decode_word(0xE930_4FF0, 0),
+        Instruction::Ldm {
+            rn: 0,
+            regs: 0b0100_1111_1111_0000,
+            writeback: true,
+            descending: true,
+        }
+    );
+    // stmia.w r0, {r4, r5}（无回写）= 0xE880 0030
+    assert_eq!(
+        d.decode_word(0xE880_0030, 0),
+        Instruction::Stm {
+            rn: 0,
+            regs: 0b11_0000,
+            writeback: false,
+            descending: false,
+        }
+    );
+    // ldmia.w sp!, {r4-r11, pc} = 0xE8BD 8FF0（POP 32 位：含 r15）
+    assert_eq!(
+        d.decode_word(0xE8BD_8FF0, 0),
+        Instruction::Ldm {
+            rn: 13,
+            regs: 0b1000_1111_1111_0000,
+            writeback: true,
+            descending: false,
+        }
+    );
+    // stmdb r1!, {r0, r3} = 0xE921 0009
+    assert_eq!(
+        d.decode_word(0xE921_0009, 0),
+        Instruction::Stm {
+            rn: 1,
+            regs: 0b1001,
+            writeback: true,
+            descending: true,
+        }
+    );
+}
+
+/// CLZ/REV/RBIT 解码（FRT-INS-04/05）：clz r0,r1=0xFAB1 F081；rbit r0,r1=0xFA91 F0A1
+#[test]
+fn decode_clz_rev_rbit() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_word(0xFAB1_F081, 0),
+        Instruction::Clz { rd: 0, rm: 1 }
+    );
+    assert_eq!(
+        d.decode_word(0xFA91_F0A1, 0),
+        Instruction::Rbit { rd: 0, rm: 1 }
+    );
+    assert_eq!(
+        d.decode_halfword(0xBA08, 0),
+        Instruction::Rev {
+            rd: 0,
+            rm: 1,
+            kind: RevKind::Rev
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0xBA48, 0),
+        Instruction::Rev {
+            rd: 0,
+            rm: 1,
+            kind: RevKind::Rev16
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0xBAC8, 0),
+        Instruction::Rev {
+            rd: 0,
+            rm: 1,
+            kind: RevKind::RevSh
+        }
+    );
+}
+
+/// UBFX/SBFX/BFI/BFC 解码（FRT-INS-05 SHOULD）
+#[test]
+fn decode_bitfield_ops() {
+    let mut d = Decoder::new();
+    // ubfx r0, r1, #3, #5 = 0xF3C1 00C4
+    assert_eq!(
+        d.decode_word(0xF3C1_00C4, 0),
+        Instruction::BitField {
+            rd: 0,
+            rn: 1,
+            lsb: 3,
+            width: 5,
+            kind: BitFieldKind::Ubfx,
+        }
+    );
+    // sbfx r0, r1, #3, #5 = 0xF341 00C4
+    assert_eq!(
+        d.decode_word(0xF341_00C4, 0),
+        Instruction::BitField {
+            rd: 0,
+            rn: 1,
+            lsb: 3,
+            width: 5,
+            kind: BitFieldKind::Sbfx,
+        }
+    );
+    // bfi r0, r1, #3, #5 = 0xF361 00C7（msb=7 → lsb=3, width=5）
+    assert_eq!(
+        d.decode_word(0xF361_00C7, 0),
+        Instruction::BitField {
+            rd: 0,
+            rn: 1,
+            lsb: 3,
+            width: 5,
+            kind: BitFieldKind::Bfi,
+        }
+    );
+    // bfc r0, #3, #5 = 0xF36F 00C7（Rn=1111 → Bfc）
+    assert_eq!(
+        d.decode_word(0xF36F_00C7, 0),
+        Instruction::BitField {
+            rd: 0,
+            rn: 0xF,
+            lsb: 3,
+            width: 5,
+            kind: BitFieldKind::Bfc,
+        }
+    );
+}
+
+/// LDREX/STREX 家族解码（FRT-INS-05 SHOULD，单核语义）
+#[test]
+fn decode_ldrex_strex() {
+    let mut d = Decoder::new();
+    // ldrex r0, [r1] = 0xE851 0F00（imm=0×4）
+    assert_eq!(
+        d.decode_word(0xE851_0F00, 0),
+        Instruction::Ldrex {
+            rt: 0,
+            rn: 1,
+            imm: 0,
+            width: AccessWidth::Word,
+        }
+    );
+    // ldrex r1, [r0, #4] = 0xE850 1F01（imm=1×4）
+    assert_eq!(
+        d.decode_word(0xE850_1F01, 0),
+        Instruction::Ldrex {
+            rt: 1,
+            rn: 0,
+            imm: 4,
+            width: AccessWidth::Word,
+        }
+    );
+    // strex r0, r1, [r2] = 0xE842 1000
+    assert_eq!(
+        d.decode_word(0xE842_1000, 0),
+        Instruction::Strex {
+            rd: 0,
+            rt: 1,
+            rn: 2,
+            imm: 0,
+            width: AccessWidth::Word,
+        }
+    );
+    // strex r2, r3, [r0, #4] = 0xE840 3201
+    assert_eq!(
+        d.decode_word(0xE840_3201, 0),
+        Instruction::Strex {
+            rd: 2,
+            rt: 3,
+            rn: 0,
+            imm: 4,
+            width: AccessWidth::Word,
+        }
+    );
+    // ldrexb r4, [r5] = 0xE8D5 4F4F
+    assert_eq!(
+        d.decode_word(0xE8D5_4F4F, 0),
+        Instruction::Ldrex {
+            rt: 4,
+            rn: 5,
+            imm: 0,
+            width: AccessWidth::Byte,
+        }
+    );
+    // ldrexh r9, [r10] = 0xE8DA 9F5F
+    assert_eq!(
+        d.decode_word(0xE8DA_9F5F, 0),
+        Instruction::Ldrex {
+            rt: 9,
+            rn: 10,
+            imm: 0,
+            width: AccessWidth::HalfWord,
+        }
+    );
+    // strexb r6, r7, [r8] = 0xE8C8 7F46（Rd=r6 在低 4 位）
+    assert_eq!(
+        d.decode_word(0xE8C8_7F46, 0),
+        Instruction::Strex {
+            rd: 6,
+            rt: 7,
+            rn: 8,
+            imm: 0,
+            width: AccessWidth::Byte,
+        }
+    );
+    // strexh r11, r12, [r0] = 0xE8C0 CF5B
+    assert_eq!(
+        d.decode_word(0xE8C0_CF5B, 0),
+        Instruction::Strex {
+            rd: 11,
+            rt: 12,
+            rn: 0,
+            imm: 0,
+            width: AccessWidth::HalfWord,
         }
     );
 }
