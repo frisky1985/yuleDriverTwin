@@ -333,6 +333,9 @@ impl Engine {
         let pc = return_pc.unwrap_or(cpu.regs[15]);
         let lr = cpu.regs[14]; // LR 槽 = 被中断 r14 寄存器值（FRT-EXC-03）
         let mut frame_xpsr = cpu.xpsr;
+        // ARMv7-M B1.5.6：压栈 xPSR 的 IT 位（bits[15:10]）清 0——IT 状态不跨异常
+        // 保存/恢复（异常返回后 IT 状态机恒为 0，P1-2 小马审查项）；SPREALIGN 照常置位
+        frame_xpsr &= !(0x3F << 10);
         if sprealign {
             frame_xpsr |= 1 << 9; // SPREALIGN
         }
@@ -770,6 +773,52 @@ mod tests {
         assert_eq!(cpu.regs[15], 12);
         assert_eq!(eng.stats.faults, 0);
         assert!(!eng.executor.it_active(), "IT 块结束后状态应清空");
+    }
+
+    /// P1-2（小马审查）：ITSTATE 不跨异常——IT 块内触发 SVC，异常入口清 IT 状态机，
+    /// 压栈 xPSR 的 IT 位（bits[15:10]）清 0（ARMv7-M B1.5.6），异常返回后 IT 状态机
+    /// 恒为 0（不恢复）。
+    #[test]
+    fn e2_it_state_cleared_across_exception() {
+        use crate::system::SystemBlock;
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::m4f_default();
+        mem.attach_peripheral(SystemBlock::new());
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        // 复位语义：SP = 向量表[0]（0x20002000），与 Loader/exception_mech 一致
+        cpu.msp = 0x2000_2000;
+        cpu.regs[13] = cpu.msp;
+        cpu.regs[15] = 0;
+        // 向量 11（SVC）→ 0x40（handler：bx lr = 0x4770）
+        let vec11 = 0x40u32;
+        mem.flash[0x2C..0x30].copy_from_slice(&vec11.to_le_bytes());
+        mem.flash[0x40] = 0x70;
+        mem.flash[0x41] = 0x47;
+        // 0x2000 movs r0,#0（Z=1）| 0xBF08 it eq | 0xDF00 svc #0 | 0xBF00 nop
+        for (i, b) in [0x00u8, 0x20, 0x08, 0xBF, 0x00, 0xDF, 0x00, 0xBF]
+            .iter()
+            .enumerate()
+        {
+            mem.flash[i] = *b;
+        }
+        // WHEN: movs + it 两步后，IT 块处于活跃（条件 EQ 成立）
+        for _ in 0..2 {
+            assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        }
+        assert!(eng.executor.it_active(), "SVC 前 IT 块应处于活跃");
+        // WHEN: svc 触发异常（入口清 IT + 压栈 xPSR 清 IT 位）→ handler bx lr 返回
+        for _ in 0..2 {
+            assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        }
+        // THEN: IT 状态机关闭、xPSR IT 位为 0、返回地址正确（svc 后一条）
+        assert!(!eng.executor.it_active(), "异常返回后 IT 状态机应为 0");
+        assert_eq!(cpu.xpsr & (0x3F << 10), 0, "xPSR IT 位（bits[15:10]）应为 0");
+        assert_eq!(cpu.regs[15], 0x06, "返回 svc 下一条");
+        assert_eq!(eng.stats.exceptions, 2, "入口+出口各计 1");
+        assert_eq!(eng.stats.faults, 0);
+        // 对照：IT 位原本确实可能非 0（若无抑制则 SVC 前 IT 块活跃）——机器状态已清即可
+        assert_eq!(nvic.current_exception, 0, "返回线程模式");
     }
 
     /// P2/P3：SysTick 周期驱动接入 run 循环（FRT-SYS-02/FRT-CHIP-02 + FRT-EXC-01）

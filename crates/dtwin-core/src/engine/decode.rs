@@ -2662,7 +2662,6 @@ impl Decoder {
         if low & 0xC000 != 0x8000 {
             return Instruction::Unimplemented { bits };
         }
-        let s = ((top >> 10) & 1) as u32; // bit26：T4 符号位（T3 恒 0）
         // bit12 区分 T3/T4：T4（无条件）=1、T3（条件）=0
         // （不能用 cond 位判断：T4 向前分支 S=0 时 bits[25:22] 可全 0 伪装成 cond=EQ）
         let unconditional = low & 0x1000 != 0;

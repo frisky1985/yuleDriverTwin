@@ -1,6 +1,7 @@
 //! P3 异常机制集成测试（FRT-EXC-01~10）
 //!
-//! 固件：fixtures/p3_scenarios.bin（arm-none-eabi-as 汇编，符号地址见下）
+//! 固件：fixtures/p3_scenarios.bin（源码 fixtures/p3_scenarios.s，
+//! 重建命令见该文件头部注释；符号地址见下）
 //! 向量表 @0x0：[0]=MSP 0x20002000 [11]=common_svc_handler(0x42)
 //! [14]=common_pendsv_handler(0x6E) [15]=common_systick_handler(0x94)
 //! 符号（nm 实测）：scn_a_start=0x4A scn_a_ret=0x50 scn_b_start=0x54
