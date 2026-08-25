@@ -247,8 +247,14 @@ fn cmd_run(
     let stats = engine.stats;
     println!();
     println!(
-        "[run] 结果: {:?} | instructions={} cycles={} faults={} exceptions={}",
-        result, stats.instructions, stats.cycles, stats.faults, stats.exceptions
+        "[run] 结果: {:?} | instructions={} cycles={} faults={} exceptions={} fpu_frames={} fpu_exc_returns={}",
+        result,
+        stats.instructions,
+        stats.cycles,
+        stats.faults,
+        stats.exceptions,
+        stats.fpu_frames,
+        stats.fpu_exc_returns
     );
 
     // 退出码：Fault → 1；其余（Halted/LimitReached）→ 0

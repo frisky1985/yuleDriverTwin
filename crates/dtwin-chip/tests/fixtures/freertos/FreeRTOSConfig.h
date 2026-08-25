@@ -29,7 +29,12 @@
 
 /* 调度 */
 #define configUSE_PREEMPTION                    1
-#define configUSE_TIME_SLICING                  1
+/* 时间片：默认开启；时间片变体固件（main_freertos_timeslice.c）的对照实验
+ * 通过 -DconfigUSE_TIME_SLICING=0 覆盖构建（FRT-AC-02 证据：同固件仅此一处
+ * 配置差异 → 输出从交替退化为 A 全量先跑完） */
+#ifndef configUSE_TIME_SLICING
+    #define configUSE_TIME_SLICING              1
+#endif
 #define configMAX_PRIORITIES                    ( 8 )
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION 1
 #define configIDLE_SHOULD_YIELD                 1

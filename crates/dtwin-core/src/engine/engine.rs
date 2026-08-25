@@ -16,6 +16,10 @@ pub struct EngineStats {
     pub cycles: u64,
     pub faults: u64,
     pub exceptions: u64,
+    /// 异常入口压了 FPU 扩展帧（FRT-EXC-09 eager 保存，EXC_RETURN 为 FPU 变体）的次数
+    pub fpu_frames: u64,
+    /// 以 FPU 变体（bit4=0）异常返回（弹扩展帧恢复 S0-S15+FPSCR）的次数
+    pub fpu_exc_returns: u64,
 }
 
 /// 引擎执行结果
@@ -325,6 +329,7 @@ impl Engine {
         let fpu_frame = (cpu.control & 4) != 0;
         if fpu_frame {
             sp = sp.wrapping_sub(0x48);
+            self.stats.fpu_frames += 1;
         }
         // 压 8 字基本帧（r0,r1,r2,r3,r12,lr,pc,xpsr；小端、低地址在前，FRT-EXC-01②）
         sp = sp.wrapping_sub(32);
@@ -426,6 +431,12 @@ impl Engine {
             }
             cpu.fpu.fpscr = mem.read_u32(sp + 64).unwrap_or(0);
             sp = sp.wrapping_add(0x48);
+            // FRT-EXC-09：FPU 变体返回 → FP 上下文重新活跃（硬件语义：
+            // EXC_RETURN bit4=0 返回后 CONTROL.FPCA=1，下一次异常入口据此
+            // 再压扩展帧；缺此恢复会导致 FP 任务在两条 VFP 指令之间被抢占时
+            // EXC_RETURN 退化为非 FPU 变体，FP 现场丢失）。
+            cpu.control |= 4;
+            self.stats.fpu_exc_returns += 1;
         }
         // 恢复 r0-r3/r12/r14/PC/xPSR；SPREALIGN（xPSR bit9）→ SP+=4 并清位（FRT-EXC-04）
         cpu.regs[0] = vals[0];
@@ -862,6 +873,85 @@ mod tests {
         // SystemBlock 无残留挂起（被入口消费）
         let sb = mem.system_block_mut().expect("SystemBlock 已挂接");
         assert_eq!(sb.next_pending_exception(), None);
+    }
+
+    /// FRT-EXC-09 语义补齐（FRT-AC-07 前置）：FPU 变体异常返回后 CONTROL.FPCA=1
+    /// （FP 上下文重新活跃，下一次异常入口据此再压扩展帧）；S0-S15/FPSCR 经
+    /// 扩展帧完整往返（入口压栈 → 出口弹栈），fpu_frames/fpu_exc_returns 计数。
+    #[test]
+    fn e2_fpu_frame_roundtrip_restores_fpca() {
+        use crate::system::SystemBlock;
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::m4f_default();
+        mem.attach_peripheral(SystemBlock::new());
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+
+        // 线程模式 + PSP + FPU 上下文活跃（FRT-EXC-09 前置：CONTROL.FPCA=1）
+        cpu.control = 0b101; // bit0 SPSEL=1 + bit2 FPCA=1
+        cpu.psp = 0x2000_1000;
+        cpu.msp = 0x2000_0000;
+        for i in 0..16u32 {
+            cpu.fpu.write_s(i as usize, 0x3F80_0000u32 + i); // 1.0f 位模式 + 扰动
+        }
+        cpu.fpu.fpscr = 0x0000_8000; // 非零 FPSCR（含累计标志位）
+        cpu.regs[15] = 0x100;
+
+        // 异常 11（SVC）向量 0x2C → 0x30（handler：bx lr = 0x4770）
+        let vec = 0x31u32;
+        mem.flash[0x2C..0x30].copy_from_slice(&vec.to_le_bytes());
+        mem.flash[0x30] = 0x70;
+        mem.flash[0x31] = 0x47;
+
+        // WHEN: 异常入口（FPCA=1 → 压 S0-S15+FPSCR 扩展帧）
+        eng.take_exception(&mut cpu, &mut mem, &mut nvic, 11, Some(0x104));
+        assert_eq!(eng.stats.fpu_frames, 1, "入口应压 FPU 扩展帧");
+        assert_eq!(cpu.regs[14], 0xFFFF_FFED, "线程+PSP+FPU → ED 变体");
+        assert_eq!(cpu.control & 4, 0, "eager 压栈后 FPCA 清 0");
+        // 扩展帧内容：S0-S15 + FPSCR（位于基本帧之上 sp+32..sp+0x48）
+        let sp = cpu.psp;
+        for i in 0..16u32 {
+            assert_eq!(
+                mem.read_u32(sp + 32 + i * 4).unwrap(),
+                0x3F80_0000u32 + i,
+                "S{i} 已入扩展帧"
+            );
+        }
+        assert_eq!(mem.read_u32(sp + 32 + 64).unwrap(), 0x0000_8000, "FPSCR 已入帧");
+
+        // WHEN: handler 执行 bx lr（EXC_RETURN=ED）→ FPU 变体异常返回
+        assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        assert_eq!(eng.stats.fpu_exc_returns, 1, "出口应弹扩展帧");
+        for i in 0..16u32 {
+            assert_eq!(cpu.fpu.read_s(i as usize), 0x3F80_0000u32 + i, "S{i} 恢复");
+        }
+        assert_eq!(cpu.fpu.fpscr, 0x0000_8000, "FPSCR 恢复");
+        assert_eq!(cpu.control & 4, 4, "FPU 变体返回后 FPCA=1（FP 上下文重新活跃）");
+        assert_eq!(nvic.current_exception, 0, "返回线程模式");
+    }
+
+    /// 对照：FPCA=0 时异常入口不压扩展帧、EXC_RETURN 为非 FPU 变体（FRT-AC-06 场景）
+    #[test]
+    fn e2_non_fpu_frame_uses_fd_variant() {
+        use crate::system::SystemBlock;
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::m4f_default();
+        mem.attach_peripheral(SystemBlock::new());
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        cpu.control = 0b001; // SPSEL=1，FPCA=0（任务未用浮点）
+        cpu.psp = 0x2000_1000;
+        cpu.regs[15] = 0x100;
+        let vec = 0x31u32;
+        mem.flash[0x2C..0x30].copy_from_slice(&vec.to_le_bytes());
+        mem.flash[0x30] = 0x70;
+        mem.flash[0x31] = 0x47;
+
+        eng.take_exception(&mut cpu, &mut mem, &mut nvic, 11, Some(0x104));
+        assert_eq!(eng.stats.fpu_frames, 0, "FPCA=0 → 不压扩展帧");
+        assert_eq!(cpu.regs[14], 0xFFFF_FFFD, "线程+PSP+无FPU → FD 变体");
+        assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        assert_eq!(eng.stats.fpu_exc_returns, 0, "FD 变体不弹扩展帧");
     }
 
     /// P2：SYSTEM 区访问经 Memory 路由到 SystemBlock（FRT-CHIP-02）

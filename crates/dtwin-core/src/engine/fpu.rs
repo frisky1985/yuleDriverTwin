@@ -1688,6 +1688,32 @@ mod tests {
         assert_ne!(h.cpu.fpu.fpscr & 1, 0);
     }
 
+    /// VFPv4 融合乘加家族（VFMA/VFMS/VFNMA/VFNMS）——QEMU v11.0.2 探针实测语义
+    /// （a=1.5, b=2.0, c=4.0）：vfma=7.0、vfms=1.0、vfnma=−7.0、vfnms=−1.0。
+    #[test]
+    fn golden_vfma_family_qemu_reference() {
+        let mut h = Harness::new();
+        // S0=a=1.5, S1=b=2.0, S2=c=4.0
+        h.cpu.fpu.write_s(0, f32(1.5));
+        h.cpu.fpu.write_s(1, f32(2.0));
+        h.cpu.fpu.write_s(2, f32(4.0));
+        // VFMA S2, S0, S1（0xEEA0 1A20）= Vd+Vn*Vm = 7.0
+        assert_eq!(h.exec_word(0xEEA0_1A20), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(2), f32(7.0));
+        // VFMS S2, S0, S1（0xEEA0 1A60）= Vd−Vn*Vm = 1.0
+        h.cpu.fpu.write_s(2, f32(4.0));
+        assert_eq!(h.exec_word(0xEEA0_1A60), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(2), f32(1.0));
+        // VFNMA S2, S0, S1（0xEE90 1A60）= −(Vd+Vn*Vm) = −7.0
+        h.cpu.fpu.write_s(2, f32(4.0));
+        assert_eq!(h.exec_word(0xEE90_1A60), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(2), f32(-7.0));
+        // VFNMS S2, S0, S1（0xEE90 1A20）= Vn*Vm−Vd = −1.0
+        h.cpu.fpu.write_s(2, f32(4.0));
+        assert_eq!(h.exec_word(0xEE90_1A20), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(2), f32(-1.0));
+    }
+
     #[test]
     fn golden_vcvt_f32_f64() {
         let mut h = Harness::new();

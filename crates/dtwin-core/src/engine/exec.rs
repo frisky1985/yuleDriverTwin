@@ -1750,7 +1750,13 @@ impl Executor {
                 load,
                 double,
             } => {
-                let base = cpu.regs[*rn as usize];
+                // PC 相对字面量（rn=15）：Thumb 语义 addr = Align(PC+4, 4) + offset
+                // （与 LdrLiteral 一致；FPU 字面量池经此加载，P5 补）
+                let base = if *rn == 15 {
+                    (cpu.regs[15].wrapping_add(4)) & !3
+                } else {
+                    cpu.regs[*rn as usize]
+                };
                 let addr = base.wrapping_add(*offset);
                 let fpu = &mut cpu.fpu;
                 // 对齐：单精度 4 字节，双精度 8 字节

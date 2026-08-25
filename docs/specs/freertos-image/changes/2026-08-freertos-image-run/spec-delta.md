@@ -106,11 +106,13 @@ yuleDriverTwin 已完成 M4F 引擎 + yuleASR 打通（E2E 27/27）+ E2E 固件 
 |----|-------|------|------|
 | **FRT-AC-01** 多任务不同优先级轮转 | FreeRTOS 固件含 HIGH(pri2,delay2)/MID(pri1,delay3)/LOW(pri0,delay5) 三任务，各打印 ≥5 次 | `scripts/build_freertos_demo.sh && scripts/e2e_freertos.sh` | 输出含全部任务行且顺序符合优先级/延迟语义（HIGH 先于 MID 先于 LOW 启动，各自 seq 单调递增）；与 QEMU 黄金输出对应行逐字一致 |
 | **FRT-AC-02** 时间片轮转 | 固件含 2 个同优先级(pri2)任务，循环内打印后不阻塞 | 同上 | `[TS]` 两任务行交替出现（每 tick 轮换，configUSE_TIME_SLICING=1），交替序列与黄金输出一致 |
+| **FRT-AC-02v** 时间片真实触发（变体固件） | `scripts/build_freertos_timeslice.sh` 产 `freertos_timeslice.elf`：2 个同优先级(pri2)任务忙循环打印 `[TS]`（无任何阻塞调用），每任务固定 40 次迭代，轮次标志驱动交替 | `scripts/run_qemu_golden_freertos_timeslice.sh && scripts/e2e_freertos_timeslice.sh` | `[TS]` 严格交替（B,A,B,A…，每任务恰 40 行）且与 QEMU 黄金逐行一致；时间片开关对照（同源码 `-DconfigUSE_TIME_SLICING=0`）输出止于 `[TS] B 0`（第二任务永不运行）——交替确由时间片旋转触发，非其他机制 |
 | **FRT-AC-03** SysTick 周期中断驱动节拍 | 固件启动即使能 SysTick（vPortSetupTimerInterrupt） | 引擎运行至输出完整（max-instructions 上限内） | SysTick 异常 15 被周期触发：任务按 tick 节奏运行（delay 语义正确），引擎侧 SysTick 计数器行为与黄金输出可观察效果一致（无死锁、无 tick 丢失导致的序列偏差） |
 | **FRT-AC-04** SVC 启动调度器 + 自定义 SVC | 固件 vTaskStartScheduler 走 svc 0；任务内另有 svc #N 用例 | 同上 | 首个任务正常启动（调度器 SVC#0 出口后执行任务代码）；`[SVC]` 标记打印且 SVC 处理器返回后任务现场正确（后续 seq 连续）；与黄金输出一致 |
 | **FRT-AC-05** PendSV 上下文切换现场正确 | 固件任务用 r4-r11 工作寄存器 + 栈变量，经多次延迟切换 | 同上 | 切换后各任务计数器/局部状态无错乱（输出 seq 无跳变/重复）；引擎 fault 数 = 0；与黄金输出一致 |
 | **FRT-AC-06** FPU 场景 A（任务无浮点） | 任务不含浮点指令（场景 A），port 仍使能 VFP/FPCCR | 同上 | 运行正确；PendSV 按 `tst r14,#0x10` 跳过 s16-s31 保存（EXC_RETURN 非 FPU 变体）；输出与黄金一致 |
 | **FRT-AC-07** FPU 场景 B（任务用浮点，SHOULD） | 固件另含浮点任务（VADD/VCVT 工作负载）变体 | 构建 FPU 变体固件双跑 | FPU 上下文切换正确：任务浮点累计结果打印与黄金一致（EXC_RETURN FPU 变体 + S0-S31/FPSCR 现场正确） |
+| **FRT-AC-07v** FPU 场景 B 变体（补充实现） | `scripts/build_freertos_fpu.sh` 产 `freertos_fpu.elf`：浮点任务 vFpuTask(pri2)（VADD/VFMA/VCVT 累计跨 vTaskDelay 存活，float 局部落 callee-saved s16-s31）+ 纯整数任务 vIntTask(pri1) | `scripts/run_qemu_golden_freertos_fpu.sh && scripts/e2e_freertos_fpu.sh` | 浮点累计结果与 QEMU 黄金逐行一致；dtwin 侧 `fpu_frames>0`（异常入口压 S0-S15+FPSCR，EXC_RETURN=FPU 变体 ED）且 `fpu_exc_returns>0`（FPU 变体返回恢复现场）——FPU 上下文切换真实触发且正确 |
 | **FRT-AC-08** QEMU 黄金双跑序列一致 | 同一 ELF + 两侧运行 | `scripts/e2e_freertos.sh` | 归一化后 dtwin 输出与黄金输出逐行一致（diff 0 差异）；核心检查行（`[TASK]`/`[TS]`/`[SVC]`/`[CRIT]`/`[PASS]`）全命中 |
 | **FRT-AC-09** 临界区（BASEPRI 屏蔽）正确 | 固件含 taskENTER_CRITICAL 保护计数用例 | 同上 | `[CRIT]` 行打印的计数无丢失、无重入错误；与黄金输出一致（BASEPRI 屏蔽期间 SysTick 不抢占） |
 | **FRT-AC-10** 全量回归 | 仓库现有 191 单测 + 2 个既有 E2E（yuleASR 27/27、driver_stress 70 项） | `cargo test` | 全绿；新增测试后总数 ≥ 191 且既有断言无一修改为弱化（如有语义修正须在变更说明中列明） |
@@ -144,6 +146,21 @@ yuleDriverTwin 已完成 M4F 引擎 + yuleASR 打通（E2E 27/27）+ E2E 固件 
 | 既有 E2E | yuleASR 27/27、driver_stress 70 项（无异常路径固件） | 必须保持全绿（异常机制对无异常固件不可观测） |
 | 单测总数 | 新增指令级/异常级/寄存器级单测 + e2e_freertos.rs | ≥ 191，只增不减 |
 
+### 5.1 AC-02v/AC-07v 补充实现记录（2026-08-26，小克）
+
+为达成 FRT-AC-02（时间片真实触发）与 FRT-AC-07（FPU 场景 B）原验收标准，新增
+专用变体固件与引擎修正（均为只增不改或行为补正，主固件 677 行黄金 e2e 保持全绿）：
+
+| 变更 | 说明 | 验证 |
+|------|------|------|
+| 时间片变体固件 | `main_freertos_timeslice.c`：2 个 pri2 任务忙循环打印 `[TS]`（无阻塞调用），轮次标志驱动严格交替；`build_freertos_timeslice.sh` 同时产出 noslice 对照（`-DconfigUSE_TIME_SLICING=0`，同源码唯一配置差异） | e2e_freertos_timeslice.sh + Rust 测试：逐行一致 + 严格交替 + noslice 对照无交替 |
+| FPU 变体固件 | `main_freertos_fpu.c`：浮点任务（VADD/VFMA/VCVT 累计，float 局部落 callee-saved s16-s31）+ 纯整数任务；`build_freertos_fpu.sh` | e2e_freertos_fpu.sh + Rust 测试：逐行一致 + fpu_frames/fpu_exc_returns>0 |
+| FreeRTOSConfig.h | `configUSE_TIME_SLICING` 加 `#ifndef` 保护（默认仍 1，主固件不变） | noslice 对照构建 |
+| 引擎：VFMA 家族 | VFPv4 融合乘加 VFMA/VFMS/VFNMA/VFNMS 解码执行（GCC -O2 收缩产物；QEMU v11.0.2 探针实测语义：Vd±Vn*Vm / −(Vd+Vn*Vm) / Vn*Vm−Vd） | golden_vfma_family_qemu_reference 单测 |
+| 引擎：VLDR/VSTR PC 相对 | rn=15 时按 Thumb 语义 `Align(PC+4,4)+offset`（与 LdrLiteral 一致；此前按裸 PC 计算差 4 字节，FPU 字面量池加载错误） | FPU 变体 e2e（acc 初值加载） |
+| 引擎：FPCA 恢复 | FPU 变体异常返回（EXC_RETURN bit4=0）后恢复 `CONTROL.FPCA=1`（硬件语义，FRT-EXC-09；此前遗漏导致两条 VFP 指令之间被抢占时 EXC_RETURN 退化为非 FPU 变体） | e2_fpu_frame_roundtrip_restores_fpca / e2_non_fpu_frame_uses_fd_variant 单测 |
+| 引擎：FPU 帧统计 | `EngineStats.fpu_frames/fpu_exc_returns`（异常入口压扩展帧次数 / FPU 变体返回次数）；dtwin CLI 结果行输出 | e2e_freertos_fpu 断言 >0 |
+
 ---
 
 ## 6. 验收命令（可复现路径）
@@ -171,10 +188,33 @@ cargo test --test e2e_freertos
 
 # 4. 全量回归
 cargo test      # 全绿（≥191 测试 + 既有 2 个 E2E）
+
+# ---- FRT-AC-02v：时间片真实触发（变体固件，busy loop 不阻塞）----
+# 0. 构建时间片变体（含 noslice 对照：同源码 -DconfigUSE_TIME_SLICING=0）
+scripts/build_freertos_timeslice.sh
+# 1. QEMU 黄金输出（82 行：PASS + [TS] B/A 各 40 严格交替）
+scripts/run_qemu_golden_freertos_timeslice.sh
+# 2. dtwin 双跑 + 逐行对比 + 交替断言 + noslice 对照断言（退出码 0 = 通过）
+scripts/e2e_freertos_timeslice.sh
+# 3. Rust 集成测试（fixtures 内嵌，CI 可复现）
+cargo test --test e2e_freertos_timeslice
+
+# ---- FRT-AC-07v：FPU 场景 B（变体固件，VADD/VFMA/VCVT 累计）----
+# 0. 构建 FPU 变体（float 局部落 callee-saved s16-s31，跨切换存活）
+scripts/build_freertos_fpu.sh
+# 1. QEMU 黄金输出（[FPU]/[INT] 行，tick 计数驱动）
+scripts/run_qemu_golden_freertos_fpu.sh
+# 2. dtwin 双跑 + 逐行对比 + fpu_frames/fpu_exc_returns>0 断言（退出码 0 = 通过）
+scripts/e2e_freertos_fpu.sh
+# 3. Rust 集成测试（fixtures 内嵌，CI 可复现）
+cargo test --test e2e_freertos_fpu
 ```
 
 **判定汇总**：FRT-AC-01 至 AC-06、AC-08 至 AC-11 全部通过 = 本阶段验收通过；
-FRT-AC-07（FPU 场景 B）为 SHOULD，未通过不阻塞验收但须在结论中如实标注。
+FRT-AC-02（时间片）与 FRT-AC-07（FPU 场景 B）经**变体固件补充实现**（AC-02v/AC-07v）
+后已达成原验收标准（不弱化）：AC-02v 以忙循环变体真实触发时间片旋转（含
+noslice 对照证据），AC-07v 以浮点变体验证 FPU 上下文切换（EXC_RETURN FPU 变体
+统计 + 浮点累计与 QEMU 黄金逐行一致）。
 
 ---
 

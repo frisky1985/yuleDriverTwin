@@ -1705,6 +1705,71 @@ impl Decoder {
                         double: sz_is_double,
                     });
                 }
+                // ---- VFPv4 融合乘加家族（FMA/FMS/FNMA/FNMS）----
+                // opc2=1P10（bit21=1）→ VFMA/VFMS；opc2=1P01（bit20=1）→ VFNMA/VFNMS。
+                // 子操作由低半字 bit6 区分（QEMU v11.0.2 探针实测）：
+                //   VFMA = Vd+Vn*Vm（bit6=0）；VFMS = Vd−Vn*Vm（bit6=1）
+                //   VFNMA = −(Vd+Vn*Vm)（bit6=1）；VFNMS = Vn*Vm−Vd（bit6=0）
+                // 语义分别复用既有 Vmla/Vmls/Vnmla/Vnmls（引擎乘加为融合单舍入，
+                // 与 FMA 硬件语义一致；VMLA 家族的融合近似为既有约定）。
+                5 if (top & 0x30) == 0x10 => {
+                    let vd = if sz_is_double {
+                        ((low >> 12) & 0xF) as u8
+                    } else {
+                        (((low >> 12) as u8) << 1) | ((top >> 6) & 1) as u8
+                    };
+                    let vn = if sz_is_double {
+                        (top & 0xF) as u8
+                    } else {
+                        (((top & 0xF) as u8) << 1) | ((low >> 7) & 1) as u8
+                    };
+                    let vm = if sz_is_double {
+                        (low & 0xF) as u8
+                    } else {
+                        (((low & 0xF) as u8) << 1) | ((low >> 5) & 1) as u8
+                    };
+                    let op = if (low & 0x40) != 0 {
+                        FpArithOp::Vnmla // VFNMA = −(Vd+Vn*Vm)
+                    } else {
+                        FpArithOp::Vnmls // VFNMS = Vn*Vm−Vd
+                    };
+                    return Some(Instruction::FpArith3 {
+                        op,
+                        vd,
+                        vn,
+                        vm,
+                        double: sz_is_double,
+                    });
+                }
+                6 if (top & 0x30) == 0x20 => {
+                    let vd = if sz_is_double {
+                        ((low >> 12) & 0xF) as u8
+                    } else {
+                        (((low >> 12) as u8) << 1) | ((top >> 6) & 1) as u8
+                    };
+                    let vn = if sz_is_double {
+                        (top & 0xF) as u8
+                    } else {
+                        (((top & 0xF) as u8) << 1) | ((low >> 7) & 1) as u8
+                    };
+                    let vm = if sz_is_double {
+                        (low & 0xF) as u8
+                    } else {
+                        (((low & 0xF) as u8) << 1) | ((low >> 5) & 1) as u8
+                    };
+                    let op = if (low & 0x40) != 0 {
+                        FpArithOp::Vmls // VFMS = Vd−Vn*Vm
+                    } else {
+                        FpArithOp::Vmla // VFMA = Vd+Vn*Vm
+                    };
+                    return Some(Instruction::FpArith3 {
+                        op,
+                        vd,
+                        vn,
+                        vm,
+                        double: sz_is_double,
+                    });
+                }
                 7 if (top & 0x30) == 0x30 => {
                     // ---- 二寄存器家族（VMOV/VABS/VNEG/VSQRT/VCMP/VCVT/VMOV-imm）----
                     return Some(self.decode_fpu_2reg(bits));
