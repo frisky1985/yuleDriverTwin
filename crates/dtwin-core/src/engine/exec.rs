@@ -5,7 +5,7 @@
 
 use super::decode::{
     AccessWidth, BitFieldKind, Cond, DspShiftKind, FpArithOp, FpCvtOp, FpUnaryOp,
-    Instruction, LoadStoreOffset, QAddKind, RevKind, ShiftAmount, ShiftKind, SpecialReg,
+    Instruction, LoadStoreOffset, QAddKind, ExtendKind, RevKind, ShiftAmount, ShiftKind, SpecialReg,
 };
 use super::{dsp, fpu};
 use crate::memory::{Memory, MemoryFault};
@@ -48,6 +48,10 @@ pub struct Executor {
     it_mask: u8,
     /// 本指令是否处于 IT 块内（已被 IT 条件门控）
     it_was_active: bool,
+    /// 当前指令是否为 16 位编码（IT 块内隐式 S 指令抑制标志更新，ARMv7-M B1.5.10）
+    pub cur_is_16bit: bool,
+    /// 本指令是否应抑制标志更新（IT 块内 16 位隐式 S 指令）
+    it_suppress_flags: bool,
 }
 
 impl Default for Executor {
@@ -60,6 +64,8 @@ impl Default for Executor {
             it_firstcond: Cond::Al,
             it_mask: 0,
             it_was_active: false,
+            cur_is_16bit: false,
+            it_suppress_flags: false,
         }
     }
 }
@@ -132,6 +138,7 @@ impl Executor {
         // 条件 = firstcond 的 bits[3:1] 拼 mask 对应位作 bit0（ARM 实测语义，非增量翻转）；
         // 跳过的指令同样推进 ITSTATE。
         self.it_was_active = false;
+        self.it_suppress_flags = false;
         if self.it_remaining > 0 {
             let k = self.it_block_len - self.it_remaining; // 当前块内序号（0 起）
             let holds = self.cond_holds(cpu, self.it_cond_at(k));
@@ -140,6 +147,11 @@ impl Executor {
                 return ExecOutcome::Skipped;
             }
             self.it_was_active = true;
+            // ARMv7-M B1.5.10：IT 块内 16 位隐式 S 指令（MOVS/ADDS/SUBS/ANDS/
+            // ORRS/EORS/BICS/MVNS/ASRS/LSRS/LSLS/RORS/NEGS）执行时不更新条件标志，
+            // 32 位显式 S 指令正常更新。编译器依赖此语义生成 ite 模式
+            // （例：ite eq; moveq r5,#1; movne r5,#0）。
+            self.it_suppress_flags = self.cur_is_16bit && Self::is_implicit_s_16bit(instr);
         }
         // FPU 门控（CPACR，P5-补）：CP10/CP11 未使能时浮点指令 → NOCP UsageFault
         if !cpu.fpu_enabled() && is_fpu_instr(instr) {
@@ -207,6 +219,30 @@ impl Executor {
                 }
                 ExecOutcome::Continue
             }
+            // ADD Rd, Rn, Rm, LSL#n（32 位寄存器形式带移位）
+            Instruction::AddShifted {
+                rd,
+                rn,
+                rm,
+                lsl,
+                flags,
+            } => {
+                let a = if *rn == 15 {
+                    (cpu.regs[15].wrapping_add(4)) & !3
+                } else {
+                    cpu.regs[*rn as usize]
+                };
+                let b = cpu.regs[*rm as usize].wrapping_shl(*lsl as u32);
+                let (result, carry) = a.overflowing_add(b);
+                if *flags {
+                    self.update_flags_add(cpu, a, b, result, carry);
+                }
+                cpu.regs[*rd as usize] = result;
+                if *rd == 13 {
+                    self.sync_sp(cpu);
+                }
+                ExecOutcome::Continue
+            }
             Instruction::Sub {
                 rd,
                 rn,
@@ -220,6 +256,26 @@ impl Executor {
                     (_, Some(v)) => *v,
                     _ => 0,
                 };
+                let (result, borrow) = a.overflowing_sub(b);
+                if *flags {
+                    self.update_flags_sub(cpu, a, b, result, borrow);
+                }
+                cpu.regs[*rd as usize] = result;
+                if *rd == 13 {
+                    self.sync_sp(cpu);
+                }
+                ExecOutcome::Continue
+            }
+            // SUB Rd, Rn, Rm, LSL#n（32 位寄存器形式带移位）
+            Instruction::SubShifted {
+                rd,
+                rn,
+                rm,
+                lsl,
+                flags,
+            } => {
+                let a = cpu.regs[*rn as usize];
+                let b = cpu.regs[*rm as usize].wrapping_shl(*lsl as u32);
                 let (result, borrow) = a.overflowing_sub(b);
                 if *flags {
                     self.update_flags_sub(cpu, a, b, result, borrow);
@@ -365,8 +421,38 @@ impl Executor {
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
             }
-            Instruction::Mvn { rd, rm, flags } => {
-                let result = !cpu.regs[*rm as usize];
+            // 反向减法: RSB Rd, Rn, #imm/Rm（Rd = imm - Rn 或 Rm - Rn）
+            Instruction::Rsb {
+                rd,
+                rn,
+                rm,
+                imm,
+                flags,
+            } => {
+                let lhs = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
+                let rhs = cpu.regs[*rn as usize];
+                let (result, borrow) = lhs.overflowing_sub(rhs);
+                if *flags {
+                    self.update_flags_sub(cpu, lhs, rhs, result, borrow);
+                }
+                cpu.regs[*rd as usize] = result;
+                ExecOutcome::Continue
+            }
+            Instruction::Mvn {
+                rd,
+                rm,
+                imm,
+                flags,
+            } => {
+                let src = match imm {
+                    Some(v) => *v,
+                    None => cpu.regs[*rm as usize],
+                };
+                let result = !src;
                 if *flags {
                     self.update_flags_logical(cpu, result);
                 }
@@ -639,8 +725,14 @@ impl Executor {
                         }
                     };
                     cpu.regs[13] = sp.wrapping_add((count + 1) * 4);
-                    cpu.regs[15] = val & !1; // 清 Thumb 位后直接写入 PC（与 LDM 写 PC 语义一致）
                     self.sync_sp(cpu);
+                    // POP{.., pc} 装入 EXC_RETURN 值 → 异常返回（ARMv7-M B1.5.6：
+                    // 任一 PC 装载 EXC_RETURN 即触发返回，不限于 BX；xPortSysTickHandler
+                    // 的 pop {r3, pc} 返回路径依赖此语义）
+                    if crate::nvic::ExcReturn::from_value(val) != crate::nvic::ExcReturn::Invalid {
+                        return ExecOutcome::ExceptionReturn { exc_return: val };
+                    }
+                    cpu.regs[15] = val & !1; // 清 Thumb 位后直接写入 PC（与 LDM 写 PC 语义一致）
                     return ExecOutcome::Branch { target: val & !1 };
                 }
                 cpu.regs[13] = sp.wrapping_add(count * 4);
@@ -663,6 +755,7 @@ impl Executor {
                 };
                 let mut addr = start;
                 let mut pc_val: Option<u32> = None;
+                let mut pc_exc_return = false;
                 for i in 0..16 {
                     if regs & (1 << i) != 0 {
                         let val = match memory.read_u32(addr) {
@@ -674,8 +767,16 @@ impl Executor {
                             }
                         };
                         if i == 15 {
-                            // LDM {.., pc}：以 Branch 语义设置 PC（避免 +width）
-                            pc_val = Some(val & !1);
+                            // LDM {.., pc}：装入 EXC_RETURN 值 → 异常返回（同 POP{pc}）；
+                            // 否则以 Branch 语义设置 PC（避免 +width）
+                            if crate::nvic::ExcReturn::from_value(val)
+                                != crate::nvic::ExcReturn::Invalid
+                            {
+                                pc_val = Some(val);
+                                pc_exc_return = true;
+                            } else {
+                                pc_val = Some(val & !1);
+                            }
                         } else {
                             cpu.regs[i] = val;
                         }
@@ -690,9 +791,10 @@ impl Executor {
                         self.sync_sp(cpu);
                     }
                 }
-                match pc_val {
-                    Some(t) => ExecOutcome::Branch { target: t },
-                    None => ExecOutcome::Continue,
+                match (pc_val, pc_exc_return) {
+                    (Some(v), true) => ExecOutcome::ExceptionReturn { exc_return: v },
+                    (Some(t), false) => ExecOutcome::Branch { target: t },
+                    (None, _) => ExecOutcome::Continue,
                 }
             }
             Instruction::Stm {
@@ -740,6 +842,8 @@ impl Executor {
                 let addr = match offset {
                     LoadStoreOffset::Immediate(imm) => base.wrapping_add(*imm),
                     LoadStoreOffset::Register(rm) => base.wrapping_add(cpu.regs[*rm as usize]),
+                    LoadStoreOffset::RegisterShifted { rm: rms, lsl } => base
+                        .wrapping_add(cpu.regs[*rms as usize].wrapping_shl(*lsl as u32)),
                 };
                 let val = match width {
                     AccessWidth::Byte => memory.read_u8(addr).map(|v| v as u32),
@@ -767,6 +871,8 @@ impl Executor {
                 let addr = match offset {
                     LoadStoreOffset::Immediate(imm) => base.wrapping_add(*imm),
                     LoadStoreOffset::Register(rm) => base.wrapping_add(cpu.regs[*rm as usize]),
+                    LoadStoreOffset::RegisterShifted { rm: rms, lsl } => base
+                        .wrapping_add(cpu.regs[*rms as usize].wrapping_shl(*lsl as u32)),
                 };
                 let val = match width {
                     AccessWidth::Byte => memory.read_u8(addr).map(|v| (v as i8) as u32),
@@ -793,6 +899,8 @@ impl Executor {
                 let addr = match offset {
                     LoadStoreOffset::Immediate(imm) => base.wrapping_add(*imm),
                     LoadStoreOffset::Register(rm) => base.wrapping_add(cpu.regs[*rm as usize]),
+                    LoadStoreOffset::RegisterShifted { rm: rms, lsl } => base
+                        .wrapping_add(cpu.regs[*rms as usize].wrapping_shl(*lsl as u32)),
                 };
                 let val = cpu.regs[*rt as usize];
                 let result = match width {
@@ -1002,6 +1110,22 @@ impl Executor {
                     }
                     // REVSH：低半字字节反转 + 符号扩展到 32 位
                     RevKind::RevSh => ((v & 0xFFFF) as u16).swap_bytes() as i16 as i32 as u32,
+                };
+                cpu.regs[*rd as usize] = r;
+                ExecOutcome::Continue
+            }
+            // SXTH/SXTB/UXTH/UXTB（16 位 T1，FRT-INS-05）：符号/零扩展
+            Instruction::Extend { rd, rm, kind } => {
+                let v = cpu.regs[*rm as usize];
+                let r = match kind {
+                    // SXTH：低半字符号扩展到 32 位
+                    ExtendKind::Sxth => (v & 0xFFFF) as u16 as i16 as i32 as u32,
+                    // SXTB：低字节符号扩展到 32 位
+                    ExtendKind::Sxtb => (v & 0xFF) as u8 as i8 as i32 as u32,
+                    // UXTH：低半字零扩展
+                    ExtendKind::Uxth => v & 0xFFFF,
+                    // UXTB：低字节零扩展
+                    ExtendKind::Uxtb => v & 0xFF,
                 };
                 cpu.regs[*rd as usize] = r;
                 ExecOutcome::Continue
@@ -1943,7 +2067,11 @@ impl Executor {
     /// （A7 修复：MSP/PSP 与 SP 运算保持一致性）
     fn sync_sp(&self, cpu: &mut CpuState) {
         let sp = cpu.regs[13];
-        if cpu.control & 1 == 0 {
+        // ARMv7-M：Handler 模式（IPSR!=0）SP 恒为 MSP（与 SPSEL 无关）；
+        // Thread 模式才按 CONTROL.SPSEL 选择 MSP/PSP。
+        // （卡点 3 根因：自定义 SVC handler 内 push/sub sp 修改的是 MSP，
+        //   旧实现按 SPSEL=1 误写 PSP → 异常返回弹错栈）
+        if cpu.xpsr & 0x1FF != 0 || cpu.control & 1 == 0 {
             cpu.msp = sp;
         } else {
             cpu.psp = sp;
@@ -1951,7 +2079,32 @@ impl Executor {
     }
 
     /// 逻辑操作更新标志（N/Z，C/V 由调用方处理）
+    /// ARMv7-M B1.5.10：16 位隐式 S 指令（IT 块内不更新标志）
+    /// MOVS/ADDS/SUBS/ANDS/ORRS/EORS/BICS/MVNS/ASRS/LSRS/LSLS/RORS/NEGS/ADCS/SBCS
+    /// （CMP/CMN/TST 恒更新标志不在此列；MULS 在 v7-M 恒不更新 flags，无需抑制）
+    fn is_implicit_s_16bit(instr: &Instruction) -> bool {
+        matches!(
+            instr,
+            Instruction::Mov { flags: true, .. }
+                | Instruction::Add { flags: true, .. }
+                | Instruction::Sub { flags: true, .. }
+                | Instruction::And { flags: true, .. }
+                | Instruction::Orr { flags: true, .. }
+                | Instruction::Eor { flags: true, .. }
+                | Instruction::Bic { flags: true, .. }
+                | Instruction::Mvn { flags: true, .. }
+                | Instruction::Neg { flags: true, .. }
+                | Instruction::Shift { flags: true, .. }
+                | Instruction::Rsb { flags: true, .. }
+                | Instruction::Adc { flags: true, .. }
+                | Instruction::Sbc { flags: true, .. }
+        )
+    }
+
     fn update_flags_logical(&self, cpu: &mut CpuState, result: u32) {
+        if self.it_suppress_flags {
+            return;
+        }
         // APSR N/Z 位（bit31/bit30）
         if result & 0x8000_0000 != 0 {
             cpu.xpsr |= 1 << 31; // N
@@ -1967,6 +2120,9 @@ impl Executor {
 
     /// 加法更新标志
     fn update_flags_add(&self, cpu: &mut CpuState, a: u32, b: u32, result: u32, carry: bool) {
+        if self.it_suppress_flags {
+            return;
+        }
         self.update_flags_logical(cpu, result);
         // C = carry out
         if carry {
@@ -1985,6 +2141,9 @@ impl Executor {
 
     /// 减法更新标志
     fn update_flags_sub(&self, cpu: &mut CpuState, a: u32, b: u32, result: u32, borrow: bool) {
+        if self.it_suppress_flags {
+            return;
+        }
         self.update_flags_logical(cpu, result);
         // C = NOT borrow
         if !borrow {
@@ -2005,6 +2164,9 @@ impl Executor {
     /// 推导：S（33 位）= a + b + C；sum_31 = a_31 ^ b_31 ^ carry_in31，
     /// 故 carry_in31 = a_31 ^ b_31 ^ S_31；V = carry_in31 ^ S_32。
     fn update_flags_add3(&self, cpu: &mut CpuState, a: u32, b: u32, ext: u64, result: u32) {
+        if self.it_suppress_flags {
+            return;
+        }
         self.update_flags_logical(cpu, result);
         // C = bit32（进位输出）
         if ext & (1 << 32) != 0 {
@@ -3324,5 +3486,243 @@ mod tests {
         assert_eq!(h.exec_word(0xF911_0F03), ExecOutcome::Continue);
         assert_eq!(h.cpu.regs[0], 0xFFFF_FF80, "LDRSB 符号扩展");
         assert_eq!(h.cpu.regs[1], 0x2000_0063, "LDRSB 回写");
+    }
+
+    // ============ P5 WIP：32 位数据处理（寄存器）/ RSB / 负偏移存取 ============
+    // 编码与 arm-none-eabi-as 实测一致（见 decode_data_proc_reg_32bit_wip）。
+
+    /// ADD/SUB（寄存器 LSL#n 移位形式）：add.w lr,r1,r0,lsl #2 = 0xEB01 0E80；
+    /// sub.w r2,r3,r4,lsl #1 = 0xEBA3 0244
+    #[test]
+    fn wip_add_sub_shifted_exec() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // add.w lr, r1, r0, lsl #2：0x10 + (3 << 2) = 0x1C
+        h.cpu.regs[1] = 0x10;
+        h.cpu.regs[0] = 3;
+        assert_eq!(h.exec_word(0xEB01_0E80), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[14], 0x1C, "ADD 带 LSL#2 移位");
+        // sub.w r2, r3, r4, lsl #1：0x20 - (3 << 1) = 0x1A
+        h.cpu.regs[3] = 0x20;
+        h.cpu.regs[4] = 3;
+        assert_eq!(h.exec_word(0xEBA3_0244), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[2], 0x1A, "SUB 带 LSL#1 移位");
+        // ADD 带 S：0x7FFFFFFF + (1<<2) 溢出 → N=1 V=1
+        h.cpu.regs[1] = 0x7FFF_FFFF;
+        h.cpu.regs[0] = 1;
+        assert_eq!(h.exec_word(0xEB11_0E80), ExecOutcome::Continue); // S=1（bit20）
+        assert_eq!(h.cpu.regs[14], 0x8000_0003, "0x7FFFFFFF + (1<<2)");
+        assert_eq!(h.nzcv(), 0b1001, "正+正溢出：N=1 V=1 C=0");
+    }
+
+    /// RSB：立即数 rsb r3,r0,#1 = 0xF1C0 0301（1 - 0x10 = 0xFFFFFFF1）；
+    /// 寄存器 rsb r5,r1,r2 = 0xEBC1 0502（5 - 0x20 = 0xFFFFFFE5）
+    #[test]
+    fn wip_rsb_exec() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[0] = 0x10;
+        assert_eq!(h.exec_word(0xF1C0_0301), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[3], 0xFFFF_FFF1, "RSB imm：imm - Rn");
+        // RSBS 标志：1 - 0x10 = -15 → N=1；1 < 16 无符号借位 → C=0
+        h.cpu.regs[0] = 0x10;
+        assert_eq!(h.exec_word(0xF1C0_0301 | 0x0010_0000), ExecOutcome::Continue);
+        assert_eq!(h.nzcv(), 0b1000, "RSBS：N=1 C=0（无符号借位）");
+        h.cpu.regs[1] = 0x20;
+        h.cpu.regs[2] = 5;
+        assert_eq!(h.exec_word(0xEBC1_0502), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[5], 0xFFFF_FFE5, "RSB reg：Rm - Rn");
+    }
+
+    /// LDR/STR.W 负立即数偏移：str.w r3,[r0,#-4]=0xF840 3C04 写 [base-4]、
+    /// ldr.w=0xF850 3C04 读回
+    #[test]
+    fn wip_ldr_str_negative_offset_exec() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[0] = 0x2000_0004;
+        h.cpu.regs[3] = 0xDEAD_BEEF;
+        assert_eq!(h.exec_word(0xF840_3C04), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u32(0x2000_0000).unwrap(), 0xDEAD_BEEF, "STR 负偏移");
+        assert_eq!(h.cpu.regs[0], 0x2000_0004, "STR 不回写基址");
+        assert_eq!(h.exec_word(0xF850_3C04), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[3], 0xDEAD_BEEF, "LDR 负偏移读回");
+    }
+
+    /// LDR.W 寄存器偏移 + LSL#n：ldr.w r3,[r1,r0,lsl #2] = 0xF851 3020
+    /// → addr = r1 + (r0 << 2)
+    #[test]
+    fn wip_ldr_reg_shifted_offset_exec() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x2000_0010;
+        h.cpu.regs[0] = 4; // 4 << 2 = 16
+        h.mem.write_u32(0x2000_0020, 0xCAFE_F00D).unwrap();
+        assert_eq!(h.exec_word(0xF851_3020), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[3], 0xCAFE_F00D, "LDR 寄存器移位偏移");
+    }
+
+    /// 32 位数据处理的 S=1 标志语义抽查：mvn.w 与 adc.w/sbc.w（寄存器形式）
+    #[test]
+    fn wip_data_proc_reg_flags() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // MVNS.W r0, r1 = 0xEA6F 0001 | S=1 → ~0x0F00 = 0xFFFFF0FF → N=1
+        h.cpu.regs[1] = 0x0F00;
+        assert_eq!(h.exec_word(0xEA6F_0001 | 0x0010_0000), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xFFFF_F0FF);
+        assert_eq!(h.nzcv(), 0b1000, "MVNS：N=1");
+        // ADCS.W r6, r7, r8 = 0xEB47 0608 | S=1：1 + 1 + C(1) = 3
+        h.cpu.regs[7] = 1;
+        h.cpu.regs[8] = 1;
+        h.cpu.xpsr = 1 << 29;
+        assert_eq!(h.exec_word(0xEB47_0608 | 0x0010_0000), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[6], 3);
+        assert_eq!(h.nzcv(), 0, "ADCS：1+1+C=3，无进位出");
+        // SBCS.W r9, r10, r11 = 0xEB6A 090B | S=1：a - b - ~C，C=1 → 5 - 2 - 0 = 3
+        h.cpu.regs[10] = 5;
+        h.cpu.regs[11] = 2;
+        h.cpu.xpsr = 1 << 29; // C=1 → ~C=0 不借位
+        assert_eq!(h.exec_word(0xEB6A_090B | 0x0010_0000), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[9], 3, "SBC：a - b - ~C，C=1 → 5-2-0=3");
+        assert_eq!(h.nzcv(), 0b0010, "SBCS：无借位 C=1，N/Z 清零");
+    }
+
+    // ================= P4 FreeRTOS：SXTH/SXTB/UXTH/UXTB（16 位 T1）=================
+    // 编码 as 实测：sxth r2,r3=0xB21A / sxtb=0xB25A / uxth=0xB29A / uxtb=0xB2DA
+    #[test]
+    fn freertos_extend_16bit() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[3] = 0xFFFF_80FF;
+        // SXTH r2, r3：低半字符号扩展 → 0xFFFF80FF 低 16 位 = 0x80FF → 0xFFFF80FF
+        assert_eq!(h.exec_halfword(0xB21A), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[2], 0xFFFF_80FF, "SXTH：0x80FF 符号扩展");
+        // SXTB r2, r3：低字节 0xFF 符号扩展 → 0xFFFFFFFF
+        assert_eq!(h.exec_halfword(0xB25A), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[2], 0xFFFF_FFFF, "SXTB：0xFF 符号扩展");
+        // UXTH r2, r3：低半字零扩展 → 0x80FF
+        assert_eq!(h.exec_halfword(0xB29A), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[2], 0x0000_80FF, "UXTH：零扩展");
+        // UXTB r3, r3（固件实测 0xB2DB = uxtb r3,r3）：低字节零扩展 → 0xFF
+        assert_eq!(h.exec_halfword(0xB2DB), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[3], 0x0000_00FF, "UXTB：零扩展");
+    }
+
+    // ================= P4 FreeRTOS：32 位寄存器移位（LSL.W/LSR.W/ASR.W/ROR.W）=================
+    // 编码 as 实测：lsl.w r1,r7,r1=0xFA07 F101 / lsr.w=0xFA23 F204 /
+    // asr.w=0xFA46 F507 / ror.w=0xFA61 F002（移位量 = Rs[7:0]）
+    #[test]
+    fn freertos_shift_register_32bit() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // LSL.W r1, r7, r1：0x80000001 << 1 = 0x00000002
+        h.cpu.regs[7] = 0x8000_0001;
+        h.cpu.regs[1] = 1;
+        assert_eq!(h.exec_word(0xFA07_F101), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[1], 0x0000_0002, "LSL.W 寄存器移位量");
+        // LSR.W r2, r3, r4：0x80000000 >> 4 = 0x08000000
+        h.cpu.regs[3] = 0x8000_0000;
+        h.cpu.regs[4] = 4;
+        assert_eq!(h.exec_word(0xFA23_F204), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[2], 0x0800_0000, "LSR.W");
+        // ASR.W r5, r6, r7：0x80000000 算术右移 4 = 0xF8000000
+        h.cpu.regs[6] = 0x8000_0000;
+        h.cpu.regs[7] = 4;
+        assert_eq!(h.exec_word(0xFA46_F507), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[5], 0xF800_0000, "ASR.W 符号填充");
+        // ROR.W r0, r1, r2：0x80000001 循环右移 1 = 0xC0000000
+        h.cpu.regs[1] = 0x8000_0001;
+        h.cpu.regs[2] = 1;
+        assert_eq!(h.exec_word(0xFA61_F002), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 0xC000_0000, "ROR.W");
+    }
+
+    // ================= P4 FreeRTOS：前变址负偏移回写 [Rn, #-imm8]! ================
+    // 编码 as 实测：strb.w r2,[ip,#-1]! = 0xF80C 2D01（print_num 栈缓冲回写依赖）
+    #[test]
+    fn freertos_strb_neg_pre_index_wb() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.regs[12] = 0x2000_0020;
+        h.cpu.regs[2] = 0x41; // 'A'
+        assert_eq!(h.exec_word(0xF80C_2D01), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u8(0x2000_001F).unwrap(), 0x41, "写入 [ip-1]");
+        assert_eq!(h.cpu.regs[12], 0x2000_001F, "前变址回写 ip -= 1");
+        // 无回写形式 [ip, #-1] = 0xF80C 2C01：地址正确但 ip 不变
+        h.cpu.regs[12] = 0x2000_0030;
+        assert_eq!(h.exec_word(0xF80C_2C01), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u8(0x2000_002F).unwrap(), 0x41);
+        assert_eq!(h.cpu.regs[12], 0x2000_0030, "无回写形式 ip 不变");
+        // 加载方向 ldrb.w r2,[ip,#-1]! = 0xF81C 2D01
+        h.mem.write_u8(0x2000_004E, 0x7F).unwrap();
+        h.cpu.regs[12] = 0x2000_004F;
+        assert_eq!(h.exec_word(0xF81C_2D01), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[2], 0x7F, "LDRB 前变址负偏移");
+        assert_eq!(h.cpu.regs[12], 0x2000_004E, "回写");
+    }
+
+    // ================= P4 语义修正：16 位 ADDS/SUBS 恒置标志 =================
+    // （旧 A9 逻辑误将 0x1800-0x187F ADD 寄存器形式置 flags=false，导致 C 标志
+    //  泄漏进后续 bcc → FreeRTOS 延迟列表插入选错 overflow 列表；ARMv7-M
+    //  0x1800-0x1AFF 全部为隐式 S 的 ADDS/SUBS）
+    #[test]
+    fn freertos_adds_reg_sets_flags() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        h.cpu.xpsr = 1 << 29; // 预置 C=1，验证 ADDS 会重写
+        h.cpu.regs[4] = 0xFFFF_FFFF;
+        h.cpu.regs[6] = 1;
+        // adds r4, r4, r6 = 0x19A4：0xFFFFFFFF + 1 = 0 → Z=1，C=1（进位出）
+        assert_eq!(h.exec_halfword(0x19A4), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[4], 0);
+        assert_eq!(h.nzcv(), 0b0110, "ADDS：Z=1 且 C=1（进位出）");
+        // adds r4, r4, r6：0 + 1 = 1 → Z=0，C=0（无进位）——bcc 依赖此语义
+        assert_eq!(h.exec_halfword(0x19A4), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[4], 1);
+        assert_eq!(h.nzcv(), 0b0000, "ADDS：C=0（无进位）");
+        // subs r3, r3, r2 = 0x1A9B：5 - 5 = 0 → Z=1，C=1（无借位）
+        h.cpu.regs[3] = 5;
+        h.cpu.regs[2] = 5;
+        assert_eq!(h.exec_halfword(0x1A9B), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[3], 0);
+        assert_eq!(h.nzcv(), 0b0110, "SUBS：Z=1 且 C=1");
+    }
+
+    // ================= P4 FreeRTOS：AddShifted/SubShifted（32 位寄存器 LSL#n）=================
+    // 编码 as 实测：add.w r2,r3,r3,lsl #2 = 0xEB03 0283 / sub.w r2,r4,r2,lsl #1 = 0xEBA4 0242
+    #[test]
+    fn freertos_addsub_shifted_reg() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // add.w r2, r3, r3, lsl #2：4 + (4<<2) = 20
+        h.cpu.regs[3] = 4;
+        assert_eq!(h.exec_word(0xEB03_0283), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[2], 20, "ADD Rd, Rn, Rm, LSL#2");
+        // sub.w r2, r4, r2, lsl #1：42 - (20<<1) = 2
+        h.cpu.regs[4] = 42;
+        assert_eq!(h.exec_word(0xEBA4_0242), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[2], 2, "SUB Rd, Rn, Rm, LSL#1");
+    }
+
+    // ================= P4 FreeRTOS：POP{..,pc} 装入 EXC_RETURN → 异常返回 ================
+    // （ARMv7-M B1.5.6：任一 PC 装载 EXC_RETURN 即触发返回，不限于 BX；
+    //  xPortSysTickHandler 的 pop {r3, pc} 返回路径依赖此语义）
+    #[test]
+    fn freertos_pop_pc_exc_return() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // 布置栈：SP 处 = 占位 r3，+4 处 = EXC_RETURN（线程+PSP = 0xFFFFFFFD）
+        h.cpu.regs[13] = 0x2000_0800;
+        h.mem.write_u32(0x2000_0800, 0x1111_1111).unwrap();
+        h.mem.write_u32(0x2000_0804, 0xFFFF_FFFD).unwrap();
+        let outcome = h.exec_halfword(0xBD08); // pop {r3, pc}
+        assert_eq!(
+            outcome,
+            ExecOutcome::ExceptionReturn { exc_return: 0xFFFF_FFFD },
+            "POP{{pc}} 装入 EXC_RETURN 应产生异常返回"
+        );
+        assert_eq!(h.cpu.regs[13], 0x2000_0808, "SP 已弹 8 字节");
+        assert_eq!(h.cpu.regs[3], 0x1111_1111);
     }
 }

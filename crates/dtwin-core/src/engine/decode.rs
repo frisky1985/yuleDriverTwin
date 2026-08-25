@@ -33,12 +33,28 @@ pub enum Instruction {
         imm: Option<u32>,
         flags: bool,
     },
+    /// 加法（寄存器 LSL#n 移位）: ADD Rd, Rn, Rm, LSL#n
+    AddShifted {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        lsl: u8,
+        flags: bool,
+    },
     /// 减法: SUB Rd, Rn, Rm/imm
     Sub {
         rd: u8,
         rn: u8,
         rm: Option<u8>,
         imm: Option<u32>,
+        flags: bool,
+    },
+    /// 减法（寄存器 LSL#n 移位）: SUB Rd, Rn, Rm, LSL#n
+    SubShifted {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+        lsl: u8,
         flags: bool,
     },
     /// 按位与（Rd = Rn & Rm/imm）
@@ -93,10 +109,19 @@ pub enum Instruction {
         rn: u8,
         flags: bool,
     },
-    /// 按位取反: MVN Rd, Rm（Rd = ~Rm）
+    /// 反向减法: RSB Rd, Rn, #imm / Rm（Rd = imm - Rn 或 Rm - Rn）
+    Rsb {
+        rd: u8,
+        rn: u8,
+        rm: Option<u8>,
+        imm: Option<u32>,
+        flags: bool,
+    },
+    /// 按位取反: MVN Rd, Rm/imm（Rd = ~Rm 或 ~imm）
     Mvn {
         rd: u8,
         rm: u8,
+        imm: Option<u32>,
         flags: bool,
     },
     /// 乘法
@@ -188,6 +213,11 @@ pub enum Instruction {
     Rbit { rd: u8, rm: u8 },
     /// 字节序反转: REV/REV16/REVSH
     Rev { rd: u8, rm: u8, kind: RevKind },
+    /// 半字/字节扩展（16 位 SXTH/SXTB/UXTH/UXTB，0xB200-0xB2FF）：
+    /// 1011 0010 op[1:0] Rm Rd（as 实测：sxth=0xB21A/sxtb=0xB25A/uxth=0xB29A/uxtb=0xB2DA）
+    /// op[1:0] = bits[7:6]：00=SXTH、01=SXTB、10=UXTH、11=UXTB；T1 无旋转
+    /// （32 位带旋转形式 sxth.w ror#n 为 0xFA0F/0xFA5F 族，固件未暴露，后续按需补）
+    Extend { rd: u8, rm: u8, kind: ExtendKind },
     /// 位域操作: UBFX/SBFX/BFI/BFC
     BitField {
         rd: u8,
@@ -449,6 +479,15 @@ pub enum RevKind {
     RevSh,
 }
 
+/// 半字/字节扩展种类（16 位 SXTH/SXTB/UXTH/UXTB）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtendKind {
+    Sxth,
+    Sxtb,
+    Uxth,
+    Uxtb,
+}
+
 /// 位域操作种类（UBFX/SBFX/BFI/BFC）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitFieldKind {
@@ -630,6 +669,8 @@ impl Cond {
 pub enum LoadStoreOffset {
     Immediate(u32),
     Register(u8),
+    /// 寄存器偏移 + 立即数左移（LSL#imm2，0-3）
+    RegisterShifted { rm: u8, lsl: u8 },
 }
 
 /// 访问宽度
@@ -747,14 +788,18 @@ impl Decoder {
             };
         }
 
-        // BL（11110 S imm10 → 11111 J1 J2 imm11）；BLX（低半字 11101 开头）见下一分支
-        if (top & 0xF800) == 0xF000 && (bits & 0xF800) == 0xF800 {
+        // BL（11110 S A(8) I1 I2 → 11 J1 1 J2 imm11，低半字 bit12=1）；BLX（11101 开头）见下一分支
+        // 注意：BL 低半字为 11 J1 1 J2 imm11 —— 判别须含 bit12=1，且 J1（bit13）可为 0
+        // （旧 0xF800 掩码把 J1 当固定 1，J1=0 的合法 BL 会被误拒，小马 P1-1 审查项）
+        if (top & 0xF800) == 0xF000 && (bits & 0xD000) == 0xD000 {
             return self.decode_bl(bits, pc);
         }
         // BLX 32-bit（11110 S imm10 → 1110 1 imm11[10:0]）：低半字 11101 开头
         if (top & 0xF800) == 0xF000 && (bits & 0xF800) == 0xE800 {
             return self.decode_blx(bits, pc);
         }
+        // 注：B.W（11110 S imm10 → 10 J1 1/0 J2 imm11）在 decode_word 末尾兜底判定，
+        // 避免误抢 MRS/MSR/SSAT/DSB/UBFX 等 0xF3xx 系统指令（同为 11110 高半字 + 10 开头低半字）。
 
         // ---- Phase 3: DSP ----
         // MRS (0xF3EF，低半字 bit15=1)：读特殊寄存器到 Rd
@@ -847,6 +892,32 @@ impl Decoder {
             return self.decode_pkh(bits);
         }
 
+        // 32 位寄存器移位（LSL.W/LSR.W/ASR.W/ROR.W，FRT-INS-05 编译器常用位操作）：
+        // 编码（as 实测）：lsl.w r1,r7,r1=0xFA07 F101 / lsr.w=0xFA23 F204 /
+        // asr.w=0xFA46 F507 / ror.w=0xFA61 F002——top bits[6:5]：00=LSL、01=LSR、
+        // 10=ASR、11=ROR；Rn=top bits[3:0]；低半字 1111 Rd 0000 Rs（移位量 = Rs[7:0]）。
+        // 范围 0xFA00-0xFA7F（bit7=0）；CLZ(0xFAB0)/RBIT(0xFA90)/QADD(0xFA80) 不重叠。
+        if (top & 0xFF80) == 0xFA00
+            && (bits & 0xF000) == 0xF000
+            && (bits & 0x00F0) == 0
+        {
+            let rm = (top & 0xF) as u8;
+            let rd = ((bits >> 8) & 0xF) as u8;
+            let rs = (bits & 0xF) as u8;
+            let kind = match (top >> 5) & 0x3 {
+                0 => ShiftKind::Lsl,
+                1 => ShiftKind::Lsr,
+                2 => ShiftKind::Asr,
+                _ => ShiftKind::Ror,
+            };
+            return Instruction::Shift {
+                rd,
+                rm,
+                kind,
+                amount: ShiftAmount::Register(rs),
+                flags: false,
+            };
+        }
         // CLZ（0xFAB0，FRT-INS-04）：编码（as 实测）clz r0,r1=0xFAB1 F081——
         // 1111 1010 1011 Rn 1111 Rd 1000 Rm
         if (top & 0xFFF0) == 0xFAB0 && (bits & 0xF0F0) == 0xF080 {
@@ -874,8 +945,13 @@ impl Decoder {
                 return instr;
             }
         }
-        // LDRD/STRD（0xE9D0/0xE9C0）——须先于 32 位 LDM/STM 检查（同为 0xE8xx/0xE9xx 族）
-        if (top & 0xFFF0) == 0xE9D0 || (top & 0xFFF0) == 0xE9C0 {
+        // LDRD/STRD（0xE9D0/0xE950/0xE9C0/0xE940：U=bit23 正/负）——须先于 32 位
+        // LDM/STM 检查（同为 0xE8xx/0xE9xx 族；as 实测：ldrd 负=0xE952、strd 负=0xE942）
+        if (top & 0xFFF0) == 0xE9D0
+            || (top & 0xFFF0) == 0xE950
+            || (top & 0xFFF0) == 0xE9C0
+            || (top & 0xFFF0) == 0xE940
+        {
             return self.decode_ldrd_strd(bits);
         }
         // ---- 32-bit LDM/STM + LDREX/STREX（FRT-INS-03/05，0xE8xx/0xE9xx）----
@@ -923,6 +999,16 @@ impl Decoder {
             return self.decode_data_proc_imm(bits);
         }
 
+        // ---- 32-bit 数据处理（寄存器）: 11101 0 1 op4 S Rn / 0 imm3 Rd imm2 Rm ----
+        // op4 映射与立即数形式相同（实测）：0=AND/TST(rd=15)、1=BIC、2=ORR/MOV(rn=15)、
+        // 3=ORN/MVN(rn=15)、4=EOR/TEQ(rd=15)、8=ADD/CMN(rd=15)、A=ADC、B=SBC、
+        // D=SUB/CMP(rd=15)、E=RSB。仅 EOR/TEQ 等 rd=15 与 S 语义按 M-profile 区分。
+        // 位布局：11101 0 1 op4 S Rn | 0 imm3 Rd imm2 Rm（arm-none-eabi-as 实测）。
+        // 覆盖 FreeRTOS 固件刚需：add.w/sub.w/orr.w/bic.w/tst.w/adc.w/mvn.w（寄存器形式）。
+        if (top & 0xFE00) == 0xEA00 && (bits & 0x8000) == 0 {
+            return self.decode_data_proc_reg(bits);
+        }
+
         // ---- Phase 4: FPU ----
         if (top & 0xFF00) == 0xEE00 {
             if let Some(instr) = self.try_decode_fpu(bits) {
@@ -952,6 +1038,14 @@ impl Decoder {
             && (bits & 0x60) == 0
         {
             return self.decode_vmov_core_d(bits);
+        }
+
+        // B.W 32-bit 分支（11110 S imm10 → 10 J1 1/0 J2 imm11，bit12=1 无条件 T4 / 0 条件 T3）：
+        // 低半字 10 开头。放在末尾兜底：避免误抢 MRS/MSR/SSAT/DSB/UBFX 等 0xF3xx 系统指令
+        // （同为 11110 高半字 + 10 开头低半字，如 msr BASEPRI=0xF383 8811）。
+        // GNU as 实测 0xF7FF BF22 / 0xF000 B802；FreeRTOS port 的 b.w 跳转依赖此路径。
+        if (top & 0xF800) == 0xF000 && (bits & 0xC000) == 0x8000 {
+            return self.decode_bw(bits, pc);
         }
 
         Instruction::Unimplemented { bits }
@@ -1061,14 +1155,60 @@ impl Decoder {
         let form = (bits >> 9) & 0x7;
         let imm8 = bits & 0xFF;
         match form {
-            // 寄存器偏移：rm = bits[3:0]（无移位；带移位的 LSL#n 形态暂 Unimplemented，
-            // 诚实迭代：固件暴露后补）
-            0 => {
-                if bits & 0xE0 != 0 {
-                    return None; // bits[7:5] 非 0 → 移位形式 → Unimplemented
+            // 负立即数偏移（低半字 bits[11:9]=110；as 实测 str.w r3,[r0,#-4]=0xF840 3C04 /
+            // ldr.w=0xF850 3C04，top 家族位 U=0 半区 0x0840/0x0850）：imm8 取反为负偏移。
+            // bit8=W（1=回写）：strb.w r2,[ip,#-1]! = 0xF80C 2D01（print_num 栈缓冲回写依赖）；
+            // strb.w r2,[ip,#-1]（无回写）= 0xF80C 2C01。
+            6 => {
+                let neg = (!imm8).wrapping_add(1);
+                if bits & 0x100 != 0 {
+                    // 前变址 + 回写：[Rn, #-imm8]!
+                    return Some(Instruction::LdrStrWb {
+                        rt,
+                        rn,
+                        imm: neg,
+                        width,
+                        load: is_load,
+                        sign_extend,
+                        pre: true,
+                    });
                 }
+                let offset = LoadStoreOffset::Immediate(neg);
+                return Some(if is_load {
+                    if sign_extend {
+                        Instruction::LdrSignExtend {
+                            rt,
+                            rn,
+                            offset,
+                            width,
+                        }
+                    } else {
+                        Instruction::Ldr {
+                            rt,
+                            rn,
+                            offset,
+                            width,
+                        }
+                    }
+                } else {
+                    Instruction::Str {
+                        rt,
+                        rn,
+                        offset,
+                        width,
+                    }
+                });
+            }
+            // 寄存器偏移：rm = bits[3:0]，bits[5:4] 为 LSL#n 移位量（as 实测：
+            // ldr.w r3,[r1,r0,lsl #2]=0xF851 3020，imm2=bits[5:4]=0b10）
+            0 => {
                 let rm = (bits & 0xF) as u8;
-                let offset = LoadStoreOffset::Register(rm);
+                let lsl = (bits >> 4) & 0x3; // bits[5:4] 移位量 0-3
+                let offset = if lsl == 0 {
+                    LoadStoreOffset::Register(rm)
+                } else {
+                    LoadStoreOffset::RegisterShifted { rm, lsl: lsl as u8 }
+                };
                 return Some(if is_load {
                     if sign_extend {
                         Instruction::LdrSignExtend {
@@ -1128,8 +1268,15 @@ impl Decoder {
         let rn = (top & 0xF) as u8;
         let rt = ((bits >> 12) & 0xF) as u8;
         let rt2 = ((bits >> 8) & 0xF) as u8;
-        let imm = ((bits & 0xFF) as u32) * 4;
-        if (top & 0xFFF0) == 0xE9D0 {
+        // U=bit23：1=正偏移，0=负偏移（as 实测：strd r3,r4,[r0,#-8]=0xE940 3402）
+        let u = (top >> 7) & 1;
+        let imm_raw = (bits & 0xFF) as u32;
+        let imm = if u == 1 {
+            imm_raw * 4
+        } else {
+            (imm_raw * 4).wrapping_neg()
+        };
+        if (top & 0xFFF0) == 0xE9D0 || (top & 0xFFF0) == 0xE950 {
             Instruction::LdrD { rt, rt2, rn, imm }
         } else {
             Instruction::StrD { rt, rt2, rn, imm }
@@ -1985,9 +2132,13 @@ impl Decoder {
             // 立即数形式：imm3 = bits[8:6]
             (None, Some(((bits >> 6) & 0x7) as u32))
         };
-        // A9 实测修正：立即数形式恒置标志（ADDS/SUBS）；寄存器形式仅
-        // SUB（SUBS，0x1A00-0x1A7F）置标志，ADD（0x1800-0x187F）不置标志。
-        let flags = ((bits >> 10) & 1) == 1 || op == 1;
+        // ARMv7-M：0x1800-0x1AFF（op5=00011）全部为 ADDS/SUBS 隐式 S 形式——
+        // 寄存器（00011 0 op）与立即数（00011 1 op）恒置标志。
+        // （P4 修正：旧 A9 注释误称 0x1800-0x187F ADD 寄存器形式不置标志——
+        //   实测为 0x19A4=adds r4,r4,r6 且 ARMv7-M ADDS 恒更新 NZCV；
+        //   不置标志的 ADD(reg) 是 010001xx（0x44xx 高寄存器）另一编码。
+        //   旧逻辑导致 C 标志泄漏进后续 bcc，FreeRTOS 延迟列表插入选错 overflow 列表）
+        let flags = true;
         if op == 0 {
             Instruction::Add {
                 rd,
@@ -2133,7 +2284,7 @@ impl Decoder {
                     flags: true,
                 },
                 // 1111 MVNS Rd, Rm
-                _ => Instruction::Mvn { rd, rm, flags: true },
+                _ => Instruction::Mvn { rd, rm, imm: None, flags: true },
             }
         } else {
             let h1 = (bits >> 7) & 1;
@@ -2220,7 +2371,8 @@ impl Decoder {
                     }
                 }
             }
-            // CBZ（0xB100-0xB1FF）：i=bit9，imm5=bits[7:3]，Rn=bits[2:0]
+            // CBZ（0xB100-0xB1FF / 0xB300-0xB3FF，i=bit9）：1011 0 i 1 imm5 Rn
+            // 判别：bit11=0 且 bit10=0 且 bit8=1（(bits & 0x0B00) == 0x0100 覆盖 i=0/1 两半）
             1 => {
                 let rn = (bits & 0x7) as u8;
                 let imm5 = ((bits >> 3) & 0x1F) as u32;
@@ -2231,6 +2383,33 @@ impl Decoder {
                     target,
                     zero: true,
                 }
+            }
+            // CBZ i=1 变体：0xB300-0xB3FF（bit11=0、bit10=0、bit9=1、bit8=1）
+            // → (bits>>8)&7 = 3，但 3 原用于 PUSH{lr}（0xB5xx：bit11=1）——按 bit11 区分
+            3 if bits & 0x0800 == 0 => {
+                let rn = (bits & 0x7) as u8;
+                let imm5 = ((bits >> 3) & 0x1F) as u32;
+                let i = ((bits >> 9) & 1) as u32;
+                let target = pc.wrapping_add(4).wrapping_add((i << 6) | (imm5 << 1));
+                Instruction::CompareBranch {
+                    rn,
+                    target,
+                    zero: true,
+                }
+            }
+            // SXTH/SXTB/UXTH/UXTB（0xB200-0xB2FF，FRT-INS-05 编译器常用位操作）：
+            // 1011 0010 op[1:0] Rm Rd（as 实测：sxth=0xB21A/sxtb=0xB25A/uxth=0xB29A/uxtb=0xB2DA）——
+            // op = bits[7:6]（00=SXTH、01=SXTB、10=UXTH、11=UXTB）、Rm = bits[5:3]、Rd = bits[2:0]
+            2 => {
+                let rm = ((bits >> 3) & 0x7) as u8;
+                let rd = (bits & 0x7) as u8;
+                let kind = match (bits >> 6) & 0x3 {
+                    0 => ExtendKind::Sxth,
+                    1 => ExtendKind::Sxtb,
+                    2 => ExtendKind::Uxth,
+                    _ => ExtendKind::Uxtb,
+                };
+                Instruction::Extend { rd, rm, kind }
             }
             // PUSH {regs}（bit8=0）/ PUSH {regs, lr}（bit8=1）
             4 => Instruction::Push {
@@ -2267,8 +2446,9 @@ impl Decoder {
     /// 0xB800-0xBFFF：CBNZ（001）、POP（100/101）、BKPT（110）、IT/提示（111）
     fn decode_b_top(&self, bits: u16, pc: u32) -> Instruction {
         match (bits >> 8) & 0x7 {
-            // CBNZ（0xB900-0xB9FF）
-            1 => {
+            // CBNZ（0xB900-0xB9FF / 0xBB00-0xBBFF，i=bit9）：1011 1 i 1 imm5 Rn
+            // （0xB900 的 (bits>>8)&7=1；0xBB00 的 =3，按 bit11=1 且 bit10=0 且 bit8=1 判别）
+            1 | 3 if bits & 0x0800 != 0 => {
                 let rn = (bits & 0x7) as u8;
                 let imm5 = ((bits >> 3) & 0x1F) as u32;
                 let i = ((bits >> 9) & 1) as u32;
@@ -2418,34 +2598,94 @@ impl Decoder {
         FaultReason::IllegalInstruction { pc: address }
     }
 
-    /// 32-bit BL: 11110 S imm10 → 11111 J1 J2 imm11
+    /// 解码 B.W（T4）与 BL 共享的 25 位偏移字段（GNU as + objdump 实测 25 样本推导）
     ///
-    /// I1 = J1 XOR NOT(S)，I2 = J2 XOR NOT(S)；
-    /// imm25 = S:imm10:I1:I2:imm11:0（25 位有符号，PC = 指令地址 + 4）。
-    /// 编码位布局经固件字节实测：0xF000 0xF80F @0x86E → 0x890；0xF7FF 0xFF93 @0x54A → 0x474。
-    fn decode_bl(&self, bits: u32, pc: u32) -> Instruction {
+    /// 编码布局：top = 11110 S A(8) B C；low = 10/11 J1 1 J2 imm11
+    ///   A = bits[25:18] → 字段 imm10[7:0]
+    ///   B = bit17 → 字段 I1（位 13）；C = bit16 → 字段 I2（位 12）
+    ///   J1 = low bit13；J2 = low bit11
+    ///   imm10[9] = NOT(J1 EOR S)；imm10[8] = NOT(J2 EOR S)
+    /// 字段（25 位有符号）：S : imm10 : I1 : I2 : imm11 : 0
+    ///
+    /// 注意：编码的 bits[25:16] 并非 imm10 直存——低 2 位是 I1/I2，imm10[9:8]
+    /// 由 J 位反推（旧实现直读 bits[25:16] 且 J 位取 bit14/bit13，仅对 J 全 1 的
+    /// 编码碰巧正确；0xF7FC FFFB（BL 向后 -0x300A）等 J1=0 或 I 位非全 1 时错算）。
+    fn decode_bw_bl_offset(&self, bits: u32) -> u32 {
         let top = (bits >> 16) as u16;
         let low = bits as u16;
-        // BL 低半字以 11111 开头；11101 开头为 BLX（decode_blx，A-profile 语义，M-profile UNDEF）
-        if low & 0xF800 != 0xF800 {
-            return Instruction::Unimplemented { bits };
-        }
-        let s = ((top >> 10) & 1) as u32;
-        let imm10 = (top & 0x3FF) as u32;
-        let j1 = ((low >> 14) & 1) as u32;
-        let j2 = ((low >> 13) & 1) as u32;
+        let s = ((top >> 10) & 1) as u32; // bit26
+        let a = ((top >> 2) & 0xFF) as u32; // bits[25:18]
+        let b = ((top >> 1) & 1) as u32; // bit17 → I1
+        let c = (top & 1) as u32; // bit16 → I2
+        let j1 = ((low >> 13) & 1) as u32;
+        let j2 = ((low >> 11) & 1) as u32;
+        let n1 = ((j1 ^ s) ^ 1) & 1; // NOT(J1 EOR S) → imm10[9]
+        let n2 = ((j2 ^ s) ^ 1) & 1; // NOT(J2 EOR S) → imm10[8]
+        let imm10 = (n1 << 9) | (n2 << 8) | a;
         let imm11 = (low & 0x7FF) as u32;
-        let i1 = j1 ^ (s ^ 1);
-        let i2 = j2 ^ (s ^ 1);
-        let imm25 = (s << 24) | (imm10 << 14) | (i1 << 13) | (i2 << 12) | (imm11 << 1);
-        // 25 位有符号扩展
-        let offset = if imm25 & (1 << 24) != 0 {
+        let imm25 = (s << 24) | (imm10 << 14) | (b << 13) | (c << 12) | (imm11 << 1);
+        if imm25 & (1 << 24) != 0 {
             imm25 | 0xFF00_0000
         } else {
             imm25
-        };
+        }
+    }
+
+    /// 32-bit BL: 11110 S A(8) I1 I2 → 11 J1 1 J2 imm11（共享 decode_bw_bl_offset）
+    ///
+    /// 低半字判别：bits[15:14]=11 且 bit12=1（BL）；11101 开头（bit12=0）为 BLX。
+    /// 偏移字段与 B.W T4 相同（25 位，I1/I2 反推规则一致）。
+    /// 实测：0xF000 F80F @0x86E → 0x890；0xF7FF FF93 @0x54A → 0x474；
+    /// 0xF7FC FFFB @0x3006 → 0x0（J 位非全 1 反例，旧实现错算 -0xC00A）。
+    fn decode_bl(&self, bits: u32, pc: u32) -> Instruction {
+        let low = bits as u16;
+        // BL 低半字 11 J1 1 J2 imm11：bits[15:14]=11 且 bit12=1；11101 开头为 BLX
+        if low & 0xD000 != 0xD000 {
+            return Instruction::Unimplemented { bits };
+        }
+        let offset = self.decode_bw_bl_offset(bits);
         let target = pc.wrapping_add(4).wrapping_add(offset);
         Instruction::BranchLink { target }
+    }
+
+    /// 32-bit B.W（分支）: T4 无条件 `11110 S A(8) I1 I2 → 10 J1 1 J2 imm11`；T3 条件 `11110 0 cond imm6 → 10 J1 0 J2 imm11`
+    ///
+    /// T4 低半字 bit12=1、T3=0（判别位）；T4 偏移字段与 BL 相同（decode_bw_bl_offset，
+    /// imm10 = NOT(J1 EOR S):NOT(J2 EOR S):bits[25:18]，I1/I2 = bit17/bit16）。
+    /// T3 为 21 位字段：S(0):imm6:I1:I2:imm11:0，J 位直用不反转（GNU as 实测）。
+    /// 实测：0xF7FF BF22 @0xd1c → 0xb64；0xF000 B802 @0x0 → 0x8（T4 向前）；
+    /// 0xF040 8003 @0x0 → 0xa（T3 条件 bne）；0xF002 B001（T4 向前 I1=1）→ 偏移 0x2002。
+    fn decode_bw(&self, bits: u32, pc: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let low = bits as u16;
+        // B.W 低半字以 10 开头（0x8000-0xBFFF）；11 开头为 BL，11101 为 BLX
+        if low & 0xC000 != 0x8000 {
+            return Instruction::Unimplemented { bits };
+        }
+        let s = ((top >> 10) & 1) as u32; // bit26：T4 符号位（T3 恒 0）
+        // bit12 区分 T3/T4：T4（无条件）=1、T3（条件）=0
+        // （不能用 cond 位判断：T4 向前分支 S=0 时 bits[25:22] 可全 0 伪装成 cond=EQ）
+        let unconditional = low & 0x1000 != 0;
+        let (offset, cond) = if unconditional {
+            (self.decode_bw_bl_offset(bits), None)
+        } else {
+            // T3：cond = bits[25:22]（top bit9:6）、imm6 = bits[21:16]（top bit5:0）
+            // I1/I2 直用 J1/J2（GNU as 实测：bne.w 0xF040 8003 的 J1=J2=0 ↔ 偏移 +6）
+            let cond_bits = ((top >> 6) & 0xF) as u8;
+            let imm6 = (top & 0x3F) as u32;
+            let j1 = ((low >> 13) & 1) as u32;
+            let j2 = ((low >> 11) & 1) as u32;
+            let imm11 = (low & 0x7FF) as u32;
+            let imm21 = (imm6 << 14) | (j1 << 13) | (j2 << 12) | (imm11 << 1);
+            let off = if imm21 & (1 << 20) != 0 {
+                imm21 | 0xFFE0_0000
+            } else {
+                imm21
+            };
+            (off, Cond::from_bits(cond_bits))
+        };
+        let target = pc.wrapping_add(4).wrapping_add(offset);
+        Instruction::Branch { cond, target }
     }
 
     /// 32-bit BLX: 11110 S imm10 → 1110 1 imm11[10:0]
@@ -2457,25 +2697,12 @@ impl Decoder {
     /// 诚实注：BLX(立即数) 仅 A-profile 有效，ARMv7-M 上该编码空间 UNDEF
     /// （QEMU translate.c 注释确认），此处建模供完整性/工具链使用；目标 bit0
     /// 恒清（引擎仅 Thumb 态）。
+    /// BLX（T2，低半字 11101 开头）：A-profile 语义，ARMv7-M 上 UNDEFINED
+    /// → 诚实 Unimplemented（M-profile 无 BLX 指令；旧实现返回 BranchLinkExchangeImm
+    ///   按 A-profile 分支处理，与注释意图相悖，P1-1 顺带修正）
     fn decode_blx(&self, bits: u32, pc: u32) -> Instruction {
-        let top = (bits >> 16) as u16;
-        let low = bits as u16;
-        let s = ((top >> 10) & 1) as u32;
-        let imm10 = (top & 0x3FF) as u32;
-        let imm11 = (low & 0x7FF) as u32;
-        // 22 位有符号 → 32 位符号扩展
-        let imm22 = (s << 21) | (imm10 << 11) | imm11;
-        let offset = if imm22 & (1 << 21) != 0 {
-            (imm22 | 0xFFC0_0000) as i32
-        } else {
-            imm22 as i32
-        };
-        // 目标 = Align(PC,4) + 4 + (imm22 << 1)；清 bit0（Thumb 态）
-        let target = (pc & !3)
-            .wrapping_add(4)
-            .wrapping_add((offset.wrapping_shl(1)) as u32)
-            & !1;
-        Instruction::BranchLinkExchangeImm { target }
+        let _ = (bits, pc);
+        Instruction::Unimplemented { bits }
     }
 
     /// 32-bit 数据处理（修改立即数）: 11110 i 0 op4 S Rn / 0 imm3 Rd imm8
@@ -2518,9 +2745,9 @@ impl Decoder {
             },
             // ORR（Rn=1111 → MOV）/ MOVS.W（S=1）
             // ARMv7-M：op4=0x2 且 Rn=1111 恒为 MOV（imm），与 S 无关；
-            // MOVS.W r15,#imm（Rd=1111 且 S=1）为 UNPREDICTABLE → 诚实 Unimplemented，
+            // MOV.W r15,#imm（Rd=1111，含 S=1）为 UNPREDICTABLE → 诚实 Unimplemented，
             // 不静默写 PC（P0-1 家族残留修复）。
-            0x2 if rn == 0xF && rd == 0xF && s => Instruction::Unimplemented { bits },
+            0x2 if rn == 0xF && rd == 0xF => Instruction::Unimplemented { bits },
             0x2 if rn == 0xF => Instruction::Mov {
                 rd,
                 rm: 0,
@@ -2534,7 +2761,17 @@ impl Decoder {
                 imm: Some(imm),
                 flags: s,
             },
-            // ORN / MVN 未建模
+            // ORN（Rn=1111 → MVN imm）：Rd = ~imm
+            // （ARMv7-M：op4=0x3 且 Rn=1111 恒为 MVN，与 S 无关；as 实测 0xF06F）
+            // MVN.W r15,#imm（Rd=1111）为 UNPREDICTABLE → 诚实 Unimplemented（不静默写 PC）
+            0x3 if rn == 0xF && rd == 0xF => Instruction::Unimplemented { bits },
+            0x3 if rn == 0xF => Instruction::Mvn {
+                rd,
+                rm: 0,
+                imm: Some(imm),
+                flags: s,
+            },
+            // ORN imm 无指令变体 → 诚实 Unimplemented（固件暴露后补）
             0x3 => Instruction::Unimplemented { bits },
             // EOR/EORS；Rd=1111 → TEQ（只更新标志，不写 PC）
             0x4 if rd == 0xF => Instruction::Teq {
@@ -2579,8 +2816,178 @@ impl Decoder {
                 imm: Some(imm),
                 flags: s,
             },
-            // 其余（ADC/SBC/RSB/ORN/MVN 等）无 imm 变体 → 诚实 Unimplemented
-            // 0xA=ADC、0xB=SBC、0xE=RSB（汇编实测 0xF143/0xF163/0xF1C3）
+            // RSB/RSBS：Rd = imm - Rn（0xE，汇编实测 0xF1C3 03xx）
+            0xE => Instruction::Rsb {
+                rd,
+                rn,
+                rm: None,
+                imm: Some(imm),
+                flags: s,
+            },
+            // 其余（ADC/SBC/ORN/MVN 等）无 imm 变体 → 诚实 Unimplemented
+            // 0xA=ADC、0xB=SBC（汇编实测 0xF143/0xF163）
+            _ => Instruction::Unimplemented { bits },
+        }
+    }
+
+    /// 32-bit 数据处理（寄存器）: 11101 0 1 op4 S Rn / 0 imm3 Rd imm2 Rm
+    ///
+    /// op4 映射（arm-none-eabi-as 实测，与立即数形式相同）：
+    /// 0=AND（Rd=15→TST）、1=BIC、2=ORR（Rn=15→MOV）、3=ORN（Rn=15→MVN）、
+    /// 4=EOR（Rd=15→TEQ）、8=ADD（Rd=15→CMN）、A=ADC、B=SBC、D=SUB（Rd=15→CMP）、
+    /// E=RSB。低半字 bit15=0（0 imm3 Rd imm2 Rm）。imm2 移位形式（LSL#n 等）
+    /// 暂 Unimplemented（诚实迭代：固件暴露后补）。
+    fn decode_data_proc_reg(&self, bits: u32) -> Instruction {
+        let top = (bits >> 16) as u16;
+        let op4 = ((top >> 5) & 0xF) as u8;
+        let s = ((top >> 4) & 1) == 1;
+        let rn = (top & 0xF) as u8;
+        let rd = ((bits >> 8) & 0xF) as u8;
+        let rm = (bits & 0xF) as u8;
+        // imm2 移位形式（bits[7:6]）与 imm3（bits[14:12]）组合为 LSL#n：
+        // n = (imm3 << 2) | imm2（0-31）。ARMv7-M 寄存器形式仅支持 LSL 立即数
+        // 移位（RRX/ASR/LSR 由其他编码处理，本函数不涉及）。as 实测：
+        // add.w lr,r1,r0,lsl #2 = 0xEB01 0E80（imm3=0, imm2=2）。
+        let imm2 = (bits >> 6) & 0x3;
+        let imm3 = (bits >> 12) & 0x7;
+        let lsl_shift = (imm3 << 2) | imm2;
+        let has_shift = lsl_shift != 0;
+        // 带 LSL#n 移位的寄存器操作数：源 = Rm << n。imm3≠0（LSL#4-31）暂
+        // Unimplemented（诚实迭代）；imm3==0 且 imm2∈{1,2,3} → LSL#1/2/3。
+        if has_shift {
+            if imm3 != 0 {
+                return Instruction::Unimplemented { bits };
+            }
+            return match op4 {
+                0x8 if rd == 0xF => Instruction::Unimplemented { bits },
+                0x8 => Instruction::AddShifted {
+                    rd,
+                    rn,
+                    rm,
+                    lsl: imm2 as u8,
+                    flags: s,
+                },
+                0xD if rd == 0xF => Instruction::Unimplemented { bits },
+                0xD => Instruction::SubShifted {
+                    rd,
+                    rn,
+                    rm,
+                    lsl: imm2 as u8,
+                    flags: s,
+                },
+                _ => Instruction::Unimplemented { bits },
+            };
+        }
+        match op4 {
+            // AND/ANDS；Rd=1111 → TST（只更新标志，不写 PC）
+            0x0 if rd == 0xF => Instruction::Tst {
+                rn,
+                rm: Some(rm),
+                imm: None,
+            },
+            // AND/ANDS
+            0x0 => Instruction::And {
+                rd,
+                rn,
+                rm: Some(rm),
+                imm: None,
+                flags: s,
+            },
+            // BIC/BICS
+            0x1 => Instruction::Bic {
+                rd,
+                rn,
+                rm: Some(rm),
+                imm: None,
+                flags: s,
+            },
+            // ORR（Rn=1111 → MOV reg）——Rn=1111 恒为 MOV（与 S 无关）
+            // MOV.W r15,Rm（Rd=1111）为 UNPREDICTABLE → 诚实 Unimplemented（不静默写 PC）
+            0x2 if rn == 0xF && rd == 0xF => Instruction::Unimplemented { bits },
+            0x2 if rn == 0xF => Instruction::Mov {
+                rd,
+                rm,
+                imm: None,
+                flags: s,
+            },
+            // ORR/ORRS
+            0x2 => Instruction::Orr {
+                rd,
+                rn,
+                rm: Some(rm),
+                imm: None,
+                flags: s,
+            },
+            // ORN（Rn=1111 → MVN）
+            // MVN.W r15,Rm（Rd=1111）为 UNPREDICTABLE → 诚实 Unimplemented（不静默写 PC）
+            0x3 if rn == 0xF && rd == 0xF => Instruction::Unimplemented { bits },
+            0x3 if rn == 0xF => Instruction::Mvn { rd, rm, imm: None, flags: s },
+            // ORN 无指令变体 → 诚实 Unimplemented（固件暴露后补）
+            0x3 => Instruction::Unimplemented { bits },
+            // EOR/EORS；Rd=1111 → TEQ
+            0x4 if rd == 0xF => Instruction::Teq {
+                rn,
+                rm: Some(rm),
+                imm: None,
+            },
+            // EOR/EORS
+            0x4 => Instruction::Eor {
+                rd,
+                rn,
+                rm: Some(rm),
+                imm: None,
+                flags: s,
+            },
+            // ADD/ADDS；Rd=1111 → CMN
+            0x8 if rd == 0xF => Instruction::Cmn {
+                rn,
+                rm: Some(rm),
+                imm: None,
+            },
+            // ADD/ADDS
+            0x8 => Instruction::Add {
+                rd,
+                rn,
+                rm: Some(rm),
+                imm: None,
+                flags: s,
+            },
+            // ADC/ADCS
+            0xA => Instruction::Adc {
+                rd,
+                rn,
+                rm,
+                flags: s,
+            },
+            // SBC/SBCS
+            0xB => Instruction::Sbc {
+                rd,
+                rn,
+                rm,
+                flags: s,
+            },
+            // SUB/SUBS；Rd=1111 → CMP
+            0xD if rd == 0xF => Instruction::Cmp {
+                rn,
+                rm: Some(rm),
+                imm: None,
+            },
+            // SUB/SUBS
+            0xD => Instruction::Sub {
+                rd,
+                rn,
+                rm: Some(rm),
+                imm: None,
+                flags: s,
+            },
+            // RSB/RSBS（寄存器形式）：Rd = Rm - Rn（op4=0xE）
+            0xE => Instruction::Rsb {
+                rd,
+                rn,
+                rm: Some(rm),
+                imm: None,
+                flags: s,
+            },
             _ => Instruction::Unimplemented { bits },
         }
     }
@@ -3410,11 +3817,22 @@ fn decode_bl_targets() {
         d.decode_word(0xF7FF_FF93, 0x54A),
         Instruction::BranchLink { target: 0x474 }
     );
-    // BLX（低半字 11110 开头）→ 诚实 Unimplemented
+    // BLX（低半字 11101 开头，如 0xF000 E800）→ M-profile UNDEF → 诚实 Unimplemented
     assert!(matches!(
-        d.decode_word(0xF000_F000, 0),
+        d.decode_word(0xF000_E800, 0),
         Instruction::Unimplemented { .. }
     ));
+    // P1-1 修复反例：BL 低半字非 11111 前缀（J 位非全 1）仍须正确解码。
+    // GNU as 实测 0xF7FC FFFB @0x3006 → bl 0x0（offset=-0x300A，旧实现错算 -0xC00A）
+    assert_eq!(
+        d.decode_word(0xF7FC_FFFB, 0x3006),
+        Instruction::BranchLink { target: 0x0 }
+    );
+    // as 实测 0xF2AA D922 @0x0 → bl 0xAAA248（offset=+0xAAA244，I1=1/I2=0 大正偏移）
+    assert_eq!(
+        d.decode_word(0xF2AA_D922, 0),
+        Instruction::BranchLink { target: 0xAAA248 }
+    );
 }
 
 /// Thumb-2 修改立即数展开（与 GNU objdump 实测一致）
@@ -3670,6 +4088,7 @@ fn decode_data_proc_reg_16ops() {
         Instruction::Mvn {
             rd: 2,
             rm: 3,
+            imm: None,
             flags: true,
         }
     );
@@ -4109,4 +4528,489 @@ fn decode_ldrex_strex() {
         }
     );
 }
+
+/// B.W（T4 无条件 / T3 条件）：GNU as + objdump 实测三例 +
+/// 作者既有反例 0xF7FF BF22（@0xd1c → 0xb64，offset=-0x1BC）
+///
+/// WIP 修复验证（P5）：T4 的 I1/I2 须反转（同 BL），且 T3/T4 判别用低半字
+/// bit12（T4=1/T3=0）而非 cond 位——T4 向前分支 S=0 时 bits[25:22] 可为 0
+/// 伪装成 cond=EQ。无反转时 0xF000 B802（偏移+4）会错算成 +0x3004。
+#[test]
+fn decode_bw_t3_t4() {
+    let mut d = Decoder::new();
+    // T4 向前：b.w 0x8 @0x0（offset=+4，S=0，J1=J2=1 → I1=I2=0）
+    assert_eq!(
+        d.decode_word(0xF000_B802, 0),
+        Instruction::Branch {
+            cond: None,
+            target: 8,
+        }
+    );
+    // T4 向后：b.w 0x0 @0xa（offset=-4）
+    assert_eq!(
+        d.decode_word(0xF7FF_BFFE, 0xa),
+        Instruction::Branch {
+            cond: None,
+            target: 0xa,
+        }
+    );
+    // T4 向后（作者反例）：b.w 0xb64 @0xd1c
+    assert_eq!(
+        d.decode_word(0xF7FF_BF22, 0xd1c),
+        Instruction::Branch {
+            cond: None,
+            target: 0xb64,
+        }
+    );
+    // T3 条件：bne.w 0xa @0x0（offset=+6，J 位直用不反转）
+    assert_eq!(
+        d.decode_word(0xF040_8003, 0),
+        Instruction::Branch {
+            cond: Some(Cond::Ne),
+            target: 0xa,
+        }
+    );
+    // T4 向前 I1=1：b.w 0x2006 @0x0（as 实测 0xF002 B801，offset=+0x2002，
+    // I1=bit17=1 直接参与字段——旧实现读 bits[25:16] 会错算 +0x8002）
+    assert_eq!(
+        d.decode_word(0xF002_B801, 0),
+        Instruction::Branch {
+            cond: None,
+            target: 0x2006,
+        }
+    );
 }
+
+/// B.W 大偏移 + BL 共享字段一致性（P1-1 反例回归）：as 实测 0xF200 F81F →
+/// 偏移 +0x20003E（imm10=0x80 需从 bits[25:18] 取，非 bits[25:16]）
+#[test]
+fn decode_bw_bl_shared_offset_field() {
+    let mut d = Decoder::new();
+    // b.w 偏移 +0x20003E @0x0（as 实测 top=0xF200：A=0x80，J1=J2=1→imm10[9:8]=00）
+    // B.W 低半字 10 前缀：0xB81F = 10 J1(1) 1 J2(1) imm11(0x01F)
+    assert_eq!(
+        d.decode_word(0xF200_B81F, 0),
+        Instruction::Branch {
+            cond: None,
+            target: 0x200042,
+        }
+    );
+    // 对照 BL 同偏移（低半字 11 前缀，as 实测原样 0xF200 F81F）——
+    // B.W T4 与 BL 偏移字段必须一致（共享 decode_bw_bl_offset）
+    assert_eq!(
+        d.decode_word(0xF200_F81F, 0),
+        Instruction::BranchLink { target: 0x200042 }
+    );
+}
+
+/// 32-bit 数据处理（寄存器）WIP 家族：as 实测编码逐条 golden
+/// （add.w lr,r1,r0,lsl #2 = 0xEB01 0E80 等；orn → 诚实 Unimplemented）
+#[test]
+fn decode_data_proc_reg_32bit_wip() {
+    let mut d = Decoder::new();
+    // add.w lr, r1, r0, lsl #2
+    assert_eq!(
+        d.decode_word(0xEB01_0E80, 0),
+        Instruction::AddShifted {
+            rd: 14,
+            rn: 1,
+            rm: 0,
+            lsl: 2,
+            flags: false,
+        }
+    );
+    // sub.w r2, r3, r4, lsl #1
+    assert_eq!(
+        d.decode_word(0xEBA3_0244, 0),
+        Instruction::SubShifted {
+            rd: 2,
+            rn: 3,
+            rm: 4,
+            lsl: 1,
+            flags: false,
+        }
+    );
+    // rsb r5, r1, r2（寄存器形式）
+    assert_eq!(
+        d.decode_word(0xEBC1_0502, 0),
+        Instruction::Rsb {
+            rd: 5,
+            rn: 1,
+            rm: Some(2),
+            imm: None,
+            flags: false,
+        }
+    );
+    // tst.w r0, r1（rd=15 → TST）
+    assert_eq!(
+        d.decode_word(0xEA10_0F01, 0),
+        Instruction::Tst {
+            rn: 0,
+            rm: Some(1),
+            imm: None,
+        }
+    );
+    // adc.w r6, r7, r8
+    assert_eq!(
+        d.decode_word(0xEB47_0608, 0),
+        Instruction::Adc {
+            rd: 6,
+            rn: 7,
+            rm: 8,
+            flags: false,
+        }
+    );
+    // sbc.w r9, r10, r11（sl/fp 即 r10/r11）
+    assert_eq!(
+        d.decode_word(0xEB6A_090B, 0),
+        Instruction::Sbc {
+            rd: 9,
+            rn: 10,
+            rm: 11,
+            flags: false,
+        }
+    );
+    // mvn.w r0, r1（rn=15 → MVN）
+    assert_eq!(
+        d.decode_word(0xEA6F_0001, 0),
+        Instruction::Mvn {
+            rd: 0,
+            rm: 1,
+            imm: None,
+            flags: false,
+        }
+    );
+    // and.w r0, r1, r2
+    assert_eq!(
+        d.decode_word(0xEA01_0002, 0),
+        Instruction::And {
+            rd: 0,
+            rn: 1,
+            rm: Some(2),
+            imm: None,
+            flags: false,
+        }
+    );
+    // bic.w r3, r4, r5
+    assert_eq!(
+        d.decode_word(0xEA24_0305, 0),
+        Instruction::Bic {
+            rd: 3,
+            rn: 4,
+            rm: Some(5),
+            imm: None,
+            flags: false,
+        }
+    );
+    // orr.w r6, r7, r8
+    assert_eq!(
+        d.decode_word(0xEA47_0608, 0),
+        Instruction::Orr {
+            rd: 6,
+            rn: 7,
+            rm: Some(8),
+            imm: None,
+            flags: false,
+        }
+    );
+    // eor.w r9, r10, r11
+    assert_eq!(
+        d.decode_word(0xEA8A_090B, 0),
+        Instruction::Eor {
+            rd: 9,
+            rn: 10,
+            rm: Some(11),
+            imm: None,
+            flags: false,
+        }
+    );
+    // orn r0, r1, r2（无指令变体 → 诚实 Unimplemented）
+    assert!(matches!(
+        d.decode_word(0xEA61_0002, 0),
+        Instruction::Unimplemented { .. }
+    ));
+}
+
+/// RSB 立即数形式：rsb r3, r0, #1 = 0xF1C0 0301（op4=0xE）
+#[test]
+fn decode_rsb_imm() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_word(0xF1C0_0301, 0),
+        Instruction::Rsb {
+            rd: 3,
+            rn: 0,
+            rm: None,
+            imm: Some(1),
+            flags: false,
+        }
+    );
+}
+
+/// MOV/MVN 写 PC（Rd=15）→ UNPREDICTABLE → 诚实 Unimplemented（不静默写 PC，
+/// P0-1 家族残留修复延续；GNU as 对 `mov.w r15,...` 直接报 "r15 not allowed"）
+///
+/// 编码手工构造（as 拒绝汇编）：imm 形式 11110 i 0 op4 S 1111 / 0 000 1111 imm8；
+/// reg 形式 11101 0 1 op4 S 1111 / 0 000 1111 00 Rm
+#[test]
+fn decode_mov_mvn_rd15_unpredictable() {
+    let mut d = Decoder::new();
+    // MOV.W r15, #0（op4=2，S=1，Rn=15）
+    assert!(matches!(
+        d.decode_word(0xF05F_0F00, 0),
+        Instruction::Unimplemented { .. }
+    ));
+    // MOV.W r15, r0（reg 形式，op4=2，Rn=15）
+    assert!(matches!(
+        d.decode_word(0xEA4F_0F00, 0),
+        Instruction::Unimplemented { .. }
+    ));
+    // MVN.W r15, r0（reg 形式，op4=3，Rn=15）
+    assert!(matches!(
+        d.decode_word(0xEA6F_0F00, 0),
+        Instruction::Unimplemented { .. }
+    ));
+    // MVN.W r15, #0（imm 形式，op4=3，Rn=15）
+    assert!(matches!(
+        d.decode_word(0xF07F_0F00, 0),
+        Instruction::Unimplemented { .. }
+    ));
+    // 对照：MOV.W r0, r1（合法，rd≠15 不受影响）
+    assert!(matches!(
+        d.decode_word(0xEA4F_0001, 0),
+        Instruction::Mov {
+            rd: 0,
+            rm: 1,
+            imm: None,
+            flags: false,
+        }
+    ));
+}
+
+/// CBZ/CBNZ i=1 变体（0xB3xx / 0xBBxx）：as 实测 0xB38A @0 → 0x66、
+/// 0xBB8B @0x66 → 0xcc（offset=+98，i=1，imm5=0x11）
+#[test]
+fn decode_cbz_cbnz_i1_variants() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_halfword(0xB38A, 0),
+        Instruction::CompareBranch {
+            rn: 2,
+            target: 0x66,
+            zero: true,
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0xBB8B, 0x66),
+        Instruction::CompareBranch {
+            rn: 3,
+            target: 0xcc,
+            zero: false,
+        }
+    );
+}
+
+/// LDR/STR.W 负立即数偏移（低半字 bits[11:9]=110）：str.w r3,[r0,#-4]=0xF840 3C04、
+/// ldr.w=0xF850 3C04（WIP 新增 form 6）
+#[test]
+fn decode_ldr_str_negative_imm() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_word(0xF850_3C04, 0),
+        Instruction::Ldr {
+            rt: 3,
+            rn: 0,
+            offset: LoadStoreOffset::Immediate(0xFFFF_FFFC),
+            width: AccessWidth::Word,
+        }
+    );
+    assert_eq!(
+        d.decode_word(0xF840_3C04, 0),
+        Instruction::Str {
+            rt: 3,
+            rn: 0,
+            offset: LoadStoreOffset::Immediate(0xFFFF_FFFC),
+            width: AccessWidth::Word,
+        }
+    );
+}
+
+/// LDR.W 寄存器偏移 + LSL#n：ldr.w r3,[r1,r0,lsl #2] = 0xF851 3020
+#[test]
+fn decode_ldr_reg_shifted_offset() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_word(0xF851_3020, 0),
+        Instruction::Ldr {
+            rt: 3,
+            rn: 1,
+            offset: LoadStoreOffset::RegisterShifted { rm: 0, lsl: 2 },
+            width: AccessWidth::Word,
+        }
+    );
+}
+
+/// LDRD/STRD 负偏移（U=bit23=0）：strd r3,r4,[r0,#-8]=0xE940 3402、
+/// ldrd=0xE950 3402（WIP 修复：旧实现只认正偏移 0xE9D0/0xE9C0）
+#[test]
+fn decode_ldrd_strd_negative() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_word(0xE950_3402, 0),
+        Instruction::LdrD {
+            rt: 3,
+            rt2: 4,
+            rn: 0,
+            imm: 0xFFFF_FFF8,
+        }
+    );
+    assert_eq!(
+        d.decode_word(0xE940_3402, 0),
+        Instruction::StrD {
+            rt: 3,
+            rt2: 4,
+            rn: 0,
+            imm: 0xFFFF_FFF8,
+        }
+    );
+}
+
+/// P4 FreeRTOS：16 位扩展家族 SXTH/SXTB/UXTH/UXTB（as 实测编码）
+#[test]
+fn decode_extend_16bit() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_halfword(0xB21A, 0),
+        Instruction::Extend {
+            rd: 2,
+            rm: 3,
+            kind: ExtendKind::Sxth,
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0xB25A, 0),
+        Instruction::Extend {
+            rd: 2,
+            rm: 3,
+            kind: ExtendKind::Sxtb,
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0xB29A, 0),
+        Instruction::Extend {
+            rd: 2,
+            rm: 3,
+            kind: ExtendKind::Uxth,
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0xB2DA, 0),
+        Instruction::Extend {
+            rd: 2,
+            rm: 3,
+            kind: ExtendKind::Uxtb,
+        }
+    );
+}
+
+/// P4 FreeRTOS：32 位寄存器移位（as 实测编码：lsl.w=0xFA07 F101 等）
+#[test]
+fn decode_shift_register_32bit() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_word(0xFA07_F101, 0),
+        Instruction::Shift {
+            rd: 1,
+            rm: 7,
+            kind: ShiftKind::Lsl,
+            amount: ShiftAmount::Register(1),
+            flags: false,
+        }
+    );
+    assert_eq!(
+        d.decode_word(0xFA23_F204, 0),
+        Instruction::Shift {
+            rd: 2,
+            rm: 3,
+            kind: ShiftKind::Lsr,
+            amount: ShiftAmount::Register(4),
+            flags: false,
+        }
+    );
+    assert_eq!(
+        d.decode_word(0xFA46_F507, 0),
+        Instruction::Shift {
+            rd: 5,
+            rm: 6,
+            kind: ShiftKind::Asr,
+            amount: ShiftAmount::Register(7),
+            flags: false,
+        }
+    );
+    assert_eq!(
+        d.decode_word(0xFA61_F002, 0),
+        Instruction::Shift {
+            rd: 0,
+            rm: 1,
+            kind: ShiftKind::Ror,
+            amount: ShiftAmount::Register(2),
+            flags: false,
+        }
+    );
+}
+
+/// P4 FreeRTOS：前变址负偏移回写（strb.w r2,[ip,#-1]! = 0xF80C 2D01，bit8=W）
+#[test]
+fn decode_strb_neg_pre_index_wb() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_word(0xF80C_2D01, 0),
+        Instruction::LdrStrWb {
+            rt: 2,
+            rn: 12,
+            imm: 0xFFFF_FFFF,
+            width: AccessWidth::Byte,
+            load: false,
+            sign_extend: false,
+            pre: true,
+        }
+    );
+    // 无回写形式 [ip, #-1] = 0xF80C 2C01（bit8=0 → 普通 Str 负偏移）
+    assert_eq!(
+        d.decode_word(0xF80C_2C01, 0),
+        Instruction::Str {
+            rt: 2,
+            rn: 12,
+            offset: LoadStoreOffset::Immediate(0xFFFF_FFFF),
+            width: AccessWidth::Byte,
+        }
+    );
+}
+
+/// P4 FreeRTOS：16 位 ADDS/SUBS 恒置标志（0x19A4 = adds r4,r4,r6 隐式 S）
+#[test]
+fn decode_adds_reg_sets_flags() {
+    let mut d = Decoder::new();
+    assert_eq!(
+        d.decode_halfword(0x19A4, 0),
+        Instruction::Add {
+            rd: 4,
+            rn: 4,
+            rm: Some(6),
+            imm: None,
+            flags: true,
+        }
+    );
+    assert_eq!(
+        d.decode_halfword(0x1A9B, 0),
+        Instruction::Sub {
+            rd: 3,
+            rn: 3,
+            rm: Some(2),
+            imm: None,
+            flags: true,
+        }
+    );
+}
+}
+

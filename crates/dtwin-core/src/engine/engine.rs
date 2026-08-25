@@ -80,8 +80,10 @@ impl Engine {
                 }
             };
             let full = ((raw as u32) << 16) | hi as u32;
+            self.executor.cur_is_16bit = false;
             self.decoder.decode_word(full, pc)
         } else {
+            self.executor.cur_is_16bit = true;
             self.decoder.decode_halfword(raw, pc)
         };
 
@@ -643,6 +645,10 @@ mod tests {
     /// 注：QEMU 11.0.2 二进制对该编码表现为 [Eq,Eq]，与其自身源码及 gas 编码语义相悖
     /// （已实测 ite ne/itee ne/itte ne/ittte ne/iteee eq/itttt eq 全部一致，仅此一例异常）；
     /// dtwin 按架构语义（gas 编码权威）实现。
+    ///
+    /// P4 语义修正（ARMv7-M B1.5.10）：IT 块内 16 位隐式 S 指令（此处 moveq 即
+    /// 16 位 MOVS）不更新条件标志 → movs r5,#0 置的 Z=1 在块内保持，movne 因
+    /// NE 需 Z=0 而被跳过（旧实现 moveq 误写 Z=0 使 movne 错误执行，现修正）。
     #[test]
     fn e2_ite_eq_else_executes() {
         let mut cpu = CpuState::default();
@@ -657,8 +663,9 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
         }
-        assert_eq!(cpu.regs[1], 0xA1, "instr0 moveq 执行（Z=1）");
-        assert_eq!(cpu.regs[2], 0xB2, "instr1 movne 执行（else 分支，Z=0 时 Ne 成立）");
+        assert_eq!(cpu.regs[1], 0xA1, "instr0 moveq 执行（Z=1，EQ 成立）");
+        // B1.5.10：moveq 不更新标志，Z=1 保持 → instr1 movne（NE 需 Z=0）被跳过
+        assert_eq!(cpu.regs[2], 0, "instr1 movne 跳过（16 位 MOVS 块内不更新标志，Z=1 保持）");
         assert!(!eng.executor.it_active());
     }
 
@@ -714,6 +721,55 @@ mod tests {
         }
         assert_eq!(eng.stats.exceptions, 0, "条件不成立的 BKPT 被跳过");
         assert_eq!(cpu.regs[15], 6);
+    }
+
+    /// B1.5.10 扩展验证（P5 补）：IT 块内 16 位隐式 S 的 ADCS 同样被抑制
+    /// （WIP 修复：is_implicit_s_16bit 补 Adc/Sbc）；32 位显式 S（ADDS.W）
+    /// 不受抑制，仍正常更新标志。
+    ///
+    /// 序列：movs r5,#0（Z=1）| it eq | adcs r0,r1（0x7FFFFFFF+1 → 0x80000000，
+    /// 若更新标志则 N=1/V=1/Z=0，被抑制 → Z=1 保持）| it eq | adds.w r0,r1,r2
+    /// （32 位，正常更新 → N=1/V=1/Z=0）。
+    #[test]
+    fn e2_it_block_adcs_suppressed_32bit_s_updates() {
+        let mut cpu = CpuState::default();
+        let mut mem = Memory::test_ram();
+        let mut nvic = Nvic::new();
+        let mut eng = Engine::new();
+        cpu.regs[15] = 0;
+        cpu.regs[0] = 0x7FFF_FFFF; // adcs 输入（rd=rn=0）
+        cpu.regs[1] = 1; // adcs 加数
+        cpu.regs[2] = 0x7FFF_FFFF; // adds.w 输入
+        cpu.regs[3] = 1; // adds.w 加数
+        // 0x2500 movs r5,#0（Z=1）| 0xBF08 it eq | 0x4148 adcs r0,r1 |
+        // 0xBF08 it eq | 0xEB12 0003 adds.w r0,r2,r3（小端 12 EB 03 00）
+        for (i, b) in [
+            0x00u8, 0x25, 0x08, 0xBF, 0x48, 0x41, 0x08, 0xBF, 0x12, 0xEB, 0x03, 0x00,
+        ]
+        .iter()
+        .enumerate()
+        {
+            mem.flash[i] = *b;
+        }
+        // WHEN: 前 3 步（movs + it + adcs）后检查抑制
+        for _ in 0..3 {
+            assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        }
+        // THEN：adcs 结果写入但标志被抑制（Z=1 保持、N 未置位）
+        assert_eq!(cpu.regs[0], 0x8000_0000, "ADCS 结果仍写入");
+        assert_ne!(cpu.xpsr & (1 << 30), 0, "Z=1 保持（16 位隐式 S 被抑制）");
+        assert_eq!(cpu.xpsr & (1 << 31), 0, "N 未被 ADCS 置位");
+        // WHEN: 再 2 步（it + adds.w）
+        for _ in 0..2 {
+            assert_eq!(eng.step(&mut cpu, &mut mem, &mut nvic), EngineResult::Halted);
+        }
+        // THEN：32 位 ADDS.W（显式 S）不受抑制 → N=1 V=1 Z=0
+        assert_ne!(cpu.xpsr & (1 << 31), 0, "ADDS.W 正常更新 N");
+        assert_ne!(cpu.xpsr & (1 << 28), 0, "ADDS.W 正常更新 V");
+        assert_eq!(cpu.xpsr & (1 << 30), 0, "ADDS.W 清除 Z");
+        assert_eq!(cpu.regs[15], 12);
+        assert_eq!(eng.stats.faults, 0);
+        assert!(!eng.executor.it_active(), "IT 块结束后状态应清空");
     }
 
     /// P2/P3：SysTick 周期驱动接入 run 循环（FRT-SYS-02/FRT-CHIP-02 + FRT-EXC-01）
