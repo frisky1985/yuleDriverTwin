@@ -42,6 +42,13 @@ impl S32K312 {
                     region_type: "Peripheral".to_string(),
                     writable: true,
                 },
+                MemoryDef {
+                    name: "SYSTEM".to_string(),
+                    start: 0xE000_0000,
+                    size: 0x0010_0000, // 1MB 系统区（SysTick/SCB/NVIC，FRT-CHIP-01）
+                    region_type: "System".to_string(),
+                    writable: true,
+                },
             ],
             peripherals: vec![
                 // 串口（UART 模型后续接入）
@@ -141,11 +148,12 @@ mod tests {
         assert_eq!(p.peripherals.len(), 10);
     }
 
-    /// 内存映射与任务规格一致
+    /// 内存映射与任务规格一致（FRT-CHIP-01：新增 SYSTEM 区）
     #[test]
     fn memory_map_matches_spec() {
         let p = S32K312::new();
-        assert_eq!(p.memory.len(), 3);
+        // FLASH / SRAM / PERIPH / SYSTEM（FRT-CHIP-01：系统区 0xE0000000-0xE0100000）
+        assert_eq!(p.memory.len(), 4);
         let flash = &p.memory[0];
         assert_eq!(
             (flash.name.as_str(), flash.start, flash.size),
@@ -164,6 +172,12 @@ mod tests {
             ("PERIPH", 0x4000_0000)
         );
         assert_eq!(periph.region_type, "Peripheral");
+        let system = &p.memory[3];
+        assert_eq!(
+            (system.name.as_str(), system.start, system.size),
+            ("SYSTEM", 0xE000_0000, 0x0010_0000)
+        );
+        assert_eq!(system.region_type, "System");
     }
 
     /// profile 校验通过（内存无重叠、外设无冲突）
