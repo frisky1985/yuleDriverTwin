@@ -2376,7 +2376,9 @@ mod tests {
         assert_eq!(h.cpu.regs[15], 0x86E, "PC 由引擎推进/分支目标写入");
     }
 
-    /// E2: BLX 32-bit 执行 — 目标 = Align(PC,4)+4+imm（0xF000 E80C @0x4 → 0x20，as 实测），LR=(PC+4)|1
+    /// E2: BLX(立即数) 在 ARMv7-M 上 UNDEFINED（仅 A-profile 有效）
+    /// P4 语义修正（P1-1）：decode_blx 诚实返回 Unimplemented，引擎产出 Fault
+    /// 而非 A-profile Branch 行为；编码 0xF000 E80C @0x4（as 实测，A-profile 目标 0x20）
     #[test]
     fn e2_blx_sets_lr_and_branches() {
         use crate::engine::test_util::Harness;
@@ -2384,12 +2386,14 @@ mod tests {
         h.cpu.regs[15] = 0x4;
         assert_eq!(
             h.exec_word(0xF000_E80C),
-            ExecOutcome::Branch { target: 0x20 }
+            ExecOutcome::Fault {
+                reason: crate::engine::FaultReason::UnimplementedInstr,
+            }
         );
-        assert_eq!(h.cpu.regs[14], (0x4 + 4) | 1, "LR = (PC+4)|1");
+        assert_eq!(h.cpu.regs[14], 0, "LR 不被写入（未执行跳转）");
     }
 
-    /// E2: BLX 负偏移 — 0xF7FF EFFE @0x0 → 0x0（Align 基址 + (-4)，as 实测）
+    /// E2: BLX 负偏移 — 0xF7FF EFFE @0x0（A-profile 目标 0x0）：ARMv7-M 上 UNDEF → Fault
     #[test]
     fn e2_blx_negative_offset() {
         use crate::engine::test_util::Harness;
@@ -2397,11 +2401,13 @@ mod tests {
         h.cpu.regs[15] = 0x0;
         assert_eq!(
             h.exec_word(0xF7FF_EFFE),
-            ExecOutcome::Branch { target: 0x0 }
+            ExecOutcome::Fault {
+                reason: crate::engine::FaultReason::UnimplementedInstr,
+            }
         );
     }
 
-    /// E2: BLX 非 4 对齐 PC — Align(PC,4)+4 基址（0xF000 E808 @0x6 → 0x18，as 实测）
+    /// E2: BLX 非 4 对齐 PC — 0xF000 E808 @0x6（A-profile 目标 0x18）：ARMv7-M 上 UNDEF → Fault
     #[test]
     fn e2_blx_aligned_base() {
         use crate::engine::test_util::Harness;
@@ -2409,9 +2415,11 @@ mod tests {
         h.cpu.regs[15] = 0x6;
         assert_eq!(
             h.exec_word(0xF000_E808),
-            ExecOutcome::Branch { target: 0x18 }
+            ExecOutcome::Fault {
+                reason: crate::engine::FaultReason::UnimplementedInstr,
+            }
         );
-        assert_eq!(h.cpu.regs[14], (0x6 + 4) | 1);
+        assert_eq!(h.cpu.regs[14], 0, "LR 不被写入（未执行跳转）");
     }
 
     #[test]
