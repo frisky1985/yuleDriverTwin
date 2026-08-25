@@ -1,0 +1,677 @@
+
+[PASS] freertos demo start
+[SVC] 42
+[CRIT] n=1000
+[TASK] HIGH 0
+[TS] A 0
+[TS] B 0
+[TASK] MID 0
+[TASK] LOW 0
+[TS] A 1
+[TS] B 1
+[TASK] HIGH 1
+[TS] A 2
+[TS] B 2
+[TS] A 3
+[TS] B 3
+[TASK] MID 1
+[SVC] 42
+[TASK] HIGH 2
+[TS] A 4
+[TS] B 4
+[TS] A 5
+[TS] B 5
+[TASK] LOW 1
+[TASK] HIGH 3
+[TS] A 6
+[TS] B 6
+[TASK] MID 2
+[TS] A 7
+[TS] B 7
+[SVC] 42
+[TASK] HIGH 4
+[TS] A 8
+[TS] B 8
+[TS] A 9
+[TS] B 9
+[TASK] MID 3
+[CRIT] n=2000
+[TASK] HIGH 5
+[TS] A 10
+[TS] B 10
+[TASK] LOW 2
+[TS] A 11
+[TS] B 11
+[SVC] 42
+[TASK] HIGH 6
+[TS] A 12
+[TS] B 12
+[TASK] MID 4
+[TS] A 13
+[TS] B 13
+[TASK] HIGH 7
+[TS] A 14
+[TS] B 14
+[TS] A 15
+[TS] B 15
+[TASK] MID 5
+[TASK] LOW 3
+[SVC] 42
+[TASK] HIGH 8
+[TS] A 16
+[TS] B 16
+[TS] A 17
+[TS] B 17
+[TASK] HIGH 9
+[TS] A 18
+[TS] B 18
+[TASK] MID 6
+[TS] A 19
+[TS] B 19
+[SVC] 42
+[CRIT] n=3000
+[TASK] HIGH 10
+[TS] A 20
+[TS] B 20
+[TASK] LOW 4
+[TS] A 21
+[TS] B 21
+[TASK] MID 7
+[TASK] HIGH 11
+[TS] A 22
+[TS] B 22
+[TS] A 23
+[TS] B 23
+[SVC] 42
+[TASK] HIGH 12
+[TS] A 24
+[TS] B 24
+[TASK] MID 8
+[TS] A 25
+[TS] B 25
+[TASK] LOW 5
+[TASK] HIGH 13
+[TS] A 26
+[TS] B 26
+[TS] A 27
+[TS] B 27
+[TASK] MID 9
+[SVC] 42
+[TASK] HIGH 14
+[TS] A 28
+[TS] B 28
+[TS] A 29
+[TS] B 29
+[CRIT] n=4000
+[TASK] HIGH 15
+[TS] A 30
+[TS] B 30
+[TASK] MID 10
+[TASK] LOW 6
+[TS] A 31
+[TS] B 31
+[SVC] 42
+[TASK] HIGH 16
+[TS] A 32
+[TS] B 32
+[TS] A 33
+[TS] B 33
+[TASK] MID 11
+[TASK] HIGH 17
+[TS] A 34
+[TS] B 34
+[TS] A 35
+[TS] B 35
+[TASK] LOW 7
+[SVC] 42
+[TASK] HIGH 18
+[TS] A 36
+[TS] B 36
+[TASK] MID 12
+[TS] A 37
+[TS] B 37
+[TASK] HIGH 19
+[TS] A 38
+[TS] B 38
+[TS] A 39
+[TS] B 39
+[TASK] MID 13
+[SVC] 42
+[CRIT] n=5000
+[TASK] HIGH 20
+[TS] A 40
+[TS] B 40
+[TASK] LOW 8
+[TS] A 41
+[TS] B 41
+[TASK] HIGH 21
+[TS] A 42
+[TS] B 42
+[TASK] MID 14
+[TS] A 43
+[TS] B 43
+[SVC] 42
+[TASK] HIGH 22
+[TS] A 44
+[TS] B 44
+[TS] A 45
+[TS] B 45
+[TASK] MID 15
+[TASK] LOW 9
+[TASK] HIGH 23
+[TS] A 46
+[TS] B 46
+[TS] A 47
+[TS] B 47
+[SVC] 42
+[TASK] HIGH 24
+[TS] A 48
+[TS] B 48
+[TASK] MID 16
+[TS] A 49
+[TS] B 49
+[CRIT] n=6000
+[TASK] HIGH 25
+[TS] A 50
+[TS] B 50
+[TASK] LOW 10
+[TS] A 51
+[TS] B 51
+[TASK] MID 17
+[SVC] 42
+[TASK] HIGH 26
+[TS] A 52
+[TS] B 52
+[TS] A 53
+[TS] B 53
+[TASK] HIGH 27
+[TS] A 54
+[TS] B 54
+[TASK] MID 18
+[TS] A 55
+[TS] B 55
+[TASK] LOW 11
+[SVC] 42
+[TASK] HIGH 28
+[TS] A 56
+[TS] B 56
+[TS] A 57
+[TS] B 57
+[TASK] MID 19
+[TASK] HIGH 29
+[TS] A 58
+[TS] B 58
+[TS] A 59
+[TS] B 59
+[SVC] 42
+[CRIT] n=7000
+[TASK] HIGH 30
+[TS] A 60
+[TS] B 60
+[TASK] MID 20
+[TASK] LOW 12
+[TS] A 61
+[TS] B 61
+[TASK] HIGH 31
+[TS] A 62
+[TS] B 62
+[TS] A 63
+[TS] B 63
+[TASK] MID 21
+[SVC] 42
+[TASK] HIGH 32
+[TS] A 64
+[TS] B 64
+[TS] A 65
+[TS] B 65
+[TASK] LOW 13
+[TASK] HIGH 33
+[TS] A 66
+[TS] B 66
+[TASK] MID 22
+[TS] A 67
+[TS] B 67
+[SVC] 42
+[TASK] HIGH 34
+[TS] A 68
+[TS] B 68
+[TS] A 69
+[TS] B 69
+[TASK] MID 23
+[CRIT] n=8000
+[TASK] HIGH 35
+[TS] A 70
+[TS] B 70
+[TASK] LOW 14
+[TS] A 71
+[TS] B 71
+[SVC] 42
+[TASK] HIGH 36
+[TS] A 72
+[TS] B 72
+[TASK] MID 24
+[TS] A 73
+[TS] B 73
+[TASK] HIGH 37
+[TS] A 74
+[TS] B 74
+[TS] A 75
+[TS] B 75
+[TASK] MID 25
+[TASK] LOW 15
+[SVC] 42
+[TASK] HIGH 38
+[TS] A 76
+[TS] B 76
+[TS] A 77
+[TS] B 77
+[TASK] HIGH 39
+[TS] A 78
+[TS] B 78
+[TASK] MID 26
+[TS] A 79
+[TS] B 79
+[SVC] 42
+[CRIT] n=9000
+[TASK] HIGH 40
+[TS] A 80
+[TS] B 80
+[TASK] LOW 16
+[TS] A 81
+[TS] B 81
+[TASK] MID 27
+[TASK] HIGH 41
+[TS] A 82
+[TS] B 82
+[TS] A 83
+[TS] B 83
+[SVC] 42
+[TASK] HIGH 42
+[TS] A 84
+[TS] B 84
+[TASK] MID 28
+[TS] A 85
+[TS] B 85
+[TASK] LOW 17
+[TASK] HIGH 43
+[TS] A 86
+[TS] B 86
+[TS] A 87
+[TS] B 87
+[TASK] MID 29
+[SVC] 42
+[TASK] HIGH 44
+[TS] A 88
+[TS] B 88
+[TS] A 89
+[TS] B 89
+[CRIT] n=10000
+[TASK] HIGH 45
+[TS] A 90
+[TS] B 90
+[TASK] MID 30
+[TASK] LOW 18
+[TS] A 91
+[TS] B 91
+[SVC] 42
+[TASK] HIGH 46
+[TS] A 92
+[TS] B 92
+[TS] A 93
+[TS] B 93
+[TASK] MID 31
+[TASK] HIGH 47
+[TS] A 94
+[TS] B 94
+[TS] A 95
+[TS] B 95
+[TASK] LOW 19
+[SVC] 42
+[TASK] HIGH 48
+[TS] A 96
+[TS] B 96
+[TASK] MID 32
+[TS] A 97
+[TS] B 97
+[TASK] HIGH 49
+[TS] A 98
+[TS] B 98
+[TS] A 99
+[TS] B 99
+[TASK] MID 33
+[SVC] 42
+[CRIT] n=11000
+[TASK] HIGH 50
+[TS] A 100
+[TS] B 100
+[TASK] LOW 20
+[TS] A 101
+[TS] B 101
+[TASK] HIGH 51
+[TS] A 102
+[TS] B 102
+[TASK] MID 34
+[TS] A 103
+[TS] B 103
+[SVC] 42
+[TASK] HIGH 52
+[TS] A 104
+[TS] B 104
+[TS] A 105
+[TS] B 105
+[TASK] MID 35
+[TASK] LOW 21
+[TASK] HIGH 53
+[TS] A 106
+[TS] B 106
+[TS] A 107
+[TS] B 107
+[SVC] 42
+[TASK] HIGH 54
+[TS] A 108
+[TS] B 108
+[TASK] MID 36
+[TS] A 109
+[TS] B 109
+[CRIT] n=12000
+[TASK] HIGH 55
+[TS] A 110
+[TS] B 110
+[TASK] LOW 22
+[TS] A 111
+[TS] B 111
+[TASK] MID 37
+[SVC] 42
+[TASK] HIGH 56
+[TS] A 112
+[TS] B 112
+[TS] A 113
+[TS] B 113
+[TASK] HIGH 57
+[TS] A 114
+[TS] B 114
+[TASK] MID 38
+[TS] A 115
+[TS] B 115
+[TASK] LOW 23
+[SVC] 42
+[TASK] HIGH 58
+[TS] A 116
+[TS] B 116
+[TS] A 117
+[TS] B 117
+[TASK] MID 39
+[TASK] HIGH 59
+[TS] A 118
+[TS] B 118
+[TS] A 119
+[TS] B 119
+[SVC] 42
+[CRIT] n=13000
+[TASK] HIGH 60
+[TS] A 120
+[TS] B 120
+[TASK] MID 40
+[TASK] LOW 24
+[TS] A 121
+[TS] B 121
+[TASK] HIGH 61
+[TS] A 122
+[TS] B 122
+[TS] A 123
+[TS] B 123
+[TASK] MID 41
+[SVC] 42
+[TASK] HIGH 62
+[TS] A 124
+[TS] B 124
+[TS] A 125
+[TS] B 125
+[TASK] LOW 25
+[TASK] HIGH 63
+[TS] A 126
+[TS] B 126
+[TASK] MID 42
+[TS] A 127
+[TS] B 127
+[SVC] 42
+[TASK] HIGH 64
+[TS] A 128
+[TS] B 128
+[TS] A 129
+[TS] B 129
+[TASK] MID 43
+[CRIT] n=14000
+[TASK] HIGH 65
+[TS] A 130
+[TS] B 130
+[TASK] LOW 26
+[TS] A 131
+[TS] B 131
+[SVC] 42
+[TASK] HIGH 66
+[TS] A 132
+[TS] B 132
+[TASK] MID 44
+[TS] A 133
+[TS] B 133
+[TASK] HIGH 67
+[TS] A 134
+[TS] B 134
+[TS] A 135
+[TS] B 135
+[TASK] MID 45
+[TASK] LOW 27
+[SVC] 42
+[TASK] HIGH 68
+[TS] A 136
+[TS] B 136
+[TS] A 137
+[TS] B 137
+[TASK] HIGH 69
+[TS] A 138
+[TS] B 138
+[TASK] MID 46
+[TS] A 139
+[TS] B 139
+[SVC] 42
+[CRIT] n=15000
+[TASK] HIGH 70
+[TS] A 140
+[TS] B 140
+[TASK] LOW 28
+[TS] A 141
+[TS] B 141
+[TASK] MID 47
+[TASK] HIGH 71
+[TS] A 142
+[TS] B 142
+[TS] A 143
+[TS] B 143
+[SVC] 42
+[TASK] HIGH 72
+[TS] A 144
+[TS] B 144
+[TASK] MID 48
+[TS] A 145
+[TS] B 145
+[TASK] LOW 29
+[TASK] HIGH 73
+[TS] A 146
+[TS] B 146
+[TS] A 147
+[TS] B 147
+[TASK] MID 49
+[SVC] 42
+[TASK] HIGH 74
+[TS] A 148
+[TS] B 148
+[TS] A 149
+[TS] B 149
+[CRIT] n=16000
+[TASK] HIGH 75
+[TS] A 150
+[TS] B 150
+[TASK] MID 50
+[TASK] LOW 30
+[TS] A 151
+[TS] B 151
+[SVC] 42
+[TASK] HIGH 76
+[TS] A 152
+[TS] B 152
+[TS] A 153
+[TS] B 153
+[TASK] MID 51
+[TASK] HIGH 77
+[TS] A 154
+[TS] B 154
+[TS] A 155
+[TS] B 155
+[TASK] LOW 31
+[SVC] 42
+[TASK] HIGH 78
+[TS] A 156
+[TS] B 156
+[TASK] MID 52
+[TS] A 157
+[TS] B 157
+[TASK] HIGH 79
+[TS] A 158
+[TS] B 158
+[TS] A 159
+[TS] B 159
+[TASK] MID 53
+[SVC] 42
+[CRIT] n=17000
+[TASK] HIGH 80
+[TS] A 160
+[TS] B 160
+[TASK] LOW 32
+[TS] A 161
+[TS] B 161
+[TASK] HIGH 81
+[TS] A 162
+[TS] B 162
+[TASK] MID 54
+[TS] A 163
+[TS] B 163
+[SVC] 42
+[TASK] HIGH 82
+[TS] A 164
+[TS] B 164
+[TS] A 165
+[TS] B 165
+[TASK] MID 55
+[TASK] LOW 33
+[TASK] HIGH 83
+[TS] A 166
+[TS] B 166
+[TS] A 167
+[TS] B 167
+[SVC] 42
+[TASK] HIGH 84
+[TS] A 168
+[TS] B 168
+[TASK] MID 56
+[TS] A 169
+[TS] B 169
+[CRIT] n=18000
+[TASK] HIGH 85
+[TS] A 170
+[TS] B 170
+[TASK] LOW 34
+[TS] A 171
+[TS] B 171
+[TASK] MID 57
+[SVC] 42
+[TASK] HIGH 86
+[TS] A 172
+[TS] B 172
+[TS] A 173
+[TS] B 173
+[TASK] HIGH 87
+[TS] A 174
+[TS] B 174
+[TASK] MID 58
+[TS] A 175
+[TS] B 175
+[TASK] LOW 35
+[SVC] 42
+[TASK] HIGH 88
+[TS] A 176
+[TS] B 176
+[TS] A 177
+[TS] B 177
+[TASK] MID 59
+[TASK] HIGH 89
+[TS] A 178
+[TS] B 178
+[TS] A 179
+[TS] B 179
+[SVC] 42
+[CRIT] n=19000
+[TASK] HIGH 90
+[TS] A 180
+[TS] B 180
+[TASK] MID 60
+[TASK] LOW 36
+[TS] A 181
+[TS] B 181
+[TASK] HIGH 91
+[TS] A 182
+[TS] B 182
+[TS] A 183
+[TS] B 183
+[TASK] MID 61
+[SVC] 42
+[TASK] HIGH 92
+[TS] A 184
+[TS] B 184
+[TS] A 185
+[TS] B 185
+[TASK] LOW 37
+[TASK] HIGH 93
+[TS] A 186
+[TS] B 186
+[TASK] MID 62
+[TS] A 187
+[TS] B 187
+[SVC] 42
+[TASK] HIGH 94
+[TS] A 188
+[TS] B 188
+[TS] A 189
+[TS] B 189
+[TASK] MID 63
+[CRIT] n=20000
+[TASK] HIGH 95
+[TS] A 190
+[TS] B 190
+[TASK] LOW 38
+[TS] A 191
+[TS] B 191
+[SVC] 42
+[TASK] HIGH 96
+[TS] A 192
+[TS] B 192
+[TASK] MID 64
+[TS] A 193
+[TS] B 193
+[TASK] HIGH 97
+[TS] A 194
+[TS] B 194
+[TS] A 195
+[TS] B 195
+[TASK] MID 65
+[TASK] LOW 39
+[SVC] 42
+[TASK] HIGH 98
+[TS] A 196
+[TS] B 196
+[TS] A 197
+[TS] B 197
+[TASK] HIGH 99
+[TS] A 198
+[TS] B 198
+[TASK] MID 66
