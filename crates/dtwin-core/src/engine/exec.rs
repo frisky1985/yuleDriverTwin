@@ -396,17 +396,22 @@ impl Executor {
                 let result = (ext & 0xFFFF_FFFF) as u32;
                 if *flags {
                     self.update_flags_logical(cpu, result);
-                    // C = 无借位（无符号比较 a >= b + NOT(C)）
-                    if (a as u64) >= (b as u64) + (notc as u64) {
-                        cpu.xpsr |= 1 << 29;
-                    } else {
-                        cpu.xpsr &= !(1 << 29);
-                    }
-                    // V = 有符号结果超出 i32 范围
-                    if ext > i32::MAX as i64 || ext < i32::MIN as i64 {
-                        cpu.xpsr |= 1 << 28;
-                    } else {
-                        cpu.xpsr &= !(1 << 28);
+                    // P3-1（codex 检视）：Sbc 与 Shift 同病——IT 块内 16 位隐式 S 指令
+                    // 不更新任何标志（B1.5.10），C/V 更新须入守卫（update_flags_logical
+                    // 内部已有守卫，但 C/V 此前在守卫外直接更新）。
+                    if !self.it_suppress_flags {
+                        // C = 无借位（无符号比较 a >= b + NOT(C)）
+                        if (a as u64) >= (b as u64) + (notc as u64) {
+                            cpu.xpsr |= 1 << 29;
+                        } else {
+                            cpu.xpsr &= !(1 << 29);
+                        }
+                        // V = 有符号结果超出 i32 范围
+                        if ext > i32::MAX as i64 || ext < i32::MIN as i64 {
+                            cpu.xpsr |= 1 << 28;
+                        } else {
+                            cpu.xpsr &= !(1 << 28);
+                        }
                     }
                 }
                 cpu.regs[*rd as usize] = result;
@@ -529,17 +534,21 @@ impl Executor {
                 };
                 if *flags {
                     self.update_flags_logical(cpu, result);
-                    // 移位指令更新 C 标志 = 最后移出位（P1-6 修复）
-                    let c = match amount {
-                        ShiftAmount::Immediate(n) => self.shift_carry(val, *kind, *n),
-                        ShiftAmount::Register(r) => {
-                            self.shift_carry(val, *kind, (cpu.regs[*r as usize] & 0xFF) as u8)
+                    // P3-1（codex 检视）：IT 块内 16 位隐式 S 移位指令不更新任何标志（ARMv7-M
+                    // B1.5.10）——C 更新同样须入守卫，否则 C 标志泄漏（旧实现只抑制 N/Z）。
+                    if !self.it_suppress_flags {
+                        // 移位指令更新 C 标志 = 最后移出位（P1-6 修复）
+                        let c = match amount {
+                            ShiftAmount::Immediate(n) => self.shift_carry(val, *kind, *n),
+                            ShiftAmount::Register(r) => {
+                                self.shift_carry(val, *kind, (cpu.regs[*r as usize] & 0xFF) as u8)
+                            }
+                        };
+                        if c {
+                            cpu.xpsr |= 1 << 29;
+                        } else {
+                            cpu.xpsr &= !(1 << 29);
                         }
-                    };
-                    if c {
-                        cpu.xpsr |= 1 << 29;
-                    } else {
-                        cpu.xpsr &= !(1 << 29);
                     }
                 }
                 cpu.regs[*rd as usize] = result;
@@ -3732,5 +3741,164 @@ mod tests {
         );
         assert_eq!(h.cpu.regs[13], 0x2000_0808, "SP 已弹 8 字节");
         assert_eq!(h.cpu.regs[3], 0x1111_1111);
+    }
+
+    // ============ codex 检视修复（P2-1/P2-2/P3-1）golden 测试 ============
+
+    /// P2-1：nop.w（0xF3AF 8000）执行 = 无操作（不得误解码为 bge.w 跳转）。
+    /// 引擎 Nop 语义：PC 照常推进，无分支、无副作用。
+    #[test]
+    fn golden_nopw_executes_as_nop() {
+        let mut h = crate::engine::test_util::Harness::new();
+        h.cpu.regs[15] = 0x1000;
+        // WHEN: nop.w（0xF3AF 8000）
+        let out = h.exec_word(0xF3AF_8000);
+        // THEN: 正常继续，非分支
+        assert_eq!(out, ExecOutcome::Continue);
+        // 解码层断言（防回归误解码为 bge.w）：
+        assert_eq!(h.decoder.decode_word(0xF3AF_8000, 0x1000), Instruction::Nop);
+        // wfe.w（0xF3AF 8003）同为 HINT → NOP
+        assert_eq!(h.decoder.decode_word(0xF3AF_8003, 0x1000), Instruction::Nop);
+    }
+
+    /// P2-2：VLDMIA/VSTMDB 大寄存器列表（{s16-s31}，imm8=16）完整执行。
+    /// 模拟 ARM_CM4F PendSV 上下文切换（vldmiaeq 0xECB0 8A10 / vstmdbeq 0xED20 8A10）：
+    /// 写 16 个寄存器 → 栈上 16 字 → 读回一致；SP 回写/递减正确。
+    #[test]
+    fn golden_vldm_vstm_s16_s31_roundtrip() {
+        let mut h = crate::engine::test_util::Harness::new();
+        h.cpu.regs[0] = 0x2000_1000; // R0 基址（栈顶）
+        // GIVEN: s16-s31 写满可辨识值
+        for i in 0..16u32 {
+            h.cpu.fpu.write_s((16 + i) as usize, 0x5A00_0000 + i);
+        }
+        // WHEN: vstmdbeq r0!, {s16-s31}（0xED20 8A10，DB+回写，先减后存）
+        let out = h.exec_word(0xED20_8A10);
+        assert_eq!(out, ExecOutcome::Continue);
+        // THEN: SP 递减 16 字（0x40）且回写
+        assert_eq!(h.cpu.regs[0], 0x2000_1000 - 0x40, "VSTMDB 回写 SP");
+        // 栈内容与寄存器一致（s16 → 0x2000_0FC0）
+        for i in 0..16u32 {
+            let addr = 0x2000_0FC0 + i * 4;
+            let v = h.mem.read_u32(addr).expect("栈读取");
+            assert_eq!(v, 0x5A00_0000 + i, "栈[{addr:#x}] = s{}", 16 + i);
+        }
+        // WHEN: 清空寄存器后 vldmiaeq r0!, {s16-s31}（0xECB0 8A10，IA+回写）
+        for i in 0..16u32 {
+            h.cpu.fpu.write_s((16 + i) as usize, 0);
+        }
+        let out = h.exec_word(0xECB0_8A10);
+        assert_eq!(out, ExecOutcome::Continue);
+        // THEN: 寄存器恢复，SP 回到原值
+        assert_eq!(h.cpu.regs[0], 0x2000_1000, "VLDMIA 回写 SP");
+        for i in 0..16u32 {
+            assert_eq!(
+                h.cpu.fpu.read_s((16 + i) as usize),
+                0x5A00_0000 + i,
+                "s{} 恢复",
+                16 + i
+            );
+        }
+    }
+
+    /// P2-2：VLDR/VSTR 大偏移（imm8=0x10 → +64 字节）执行。
+    /// 编码 as 实测：vldr s0,[r1,#64]=0xED91 0A10 / vstr s0,[r1,#64]=0xED81 0A10。
+    #[test]
+    fn golden_vldr_vstr_large_offset_exec() {
+        let mut h = crate::engine::test_util::Harness::new();
+        h.cpu.regs[1] = 0x2000_0040;
+        h.cpu.fpu.write_s(0, 0xDEAD_BEEF);
+        // VSTR s0, [r1, #64]（0xED81 0A10）→ 0x2000_0040 + 0x40 = 0x2000_0080
+        assert_eq!(h.exec_word(0xED81_0A10), ExecOutcome::Continue);
+        assert_eq!(h.mem.read_u32(0x2000_0080).unwrap(), 0xDEAD_BEEF);
+        // VLDR s0, [r1, #64]（0xED91 0A10）→ 读回
+        h.cpu.fpu.write_s(0, 0);
+        assert_eq!(h.exec_word(0xED91_0A10), ExecOutcome::Continue);
+        assert_eq!(h.cpu.fpu.read_s(0), 0xDEAD_BEEF);
+    }
+
+    /// P3-1：IT 块内 16 位隐式 S 移位指令不更新任何标志（含 C）。
+    /// ARMv7-M B1.5.10：IT 块内 16 位 LSLS/LSRS 等标志被抑制——N/Z/C/V 全部保持。
+    /// 走 Engine 全路径（cur_is_16bit 由 run 循环设置；Harness 直调 execute 不设该位）。
+    /// 构造：C=1、Z=1（EQ 成立）→ lsleq r0,r0,#1（0x0040）：0x40000000 << 1 =
+    /// 0x80000000（N 应置 1、Z 清 0、移出位 0 → C 清 0）但标志必须保持。
+    #[test]
+    fn golden_it_block_shift_preserves_c() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // GIVEN: C=1, Z=1（xpsr bit29/bit30），r0=0x40000000（LSL#1 → 0x80000000，移出位=0）
+        h.cpu.xpsr = (1 << 29) | (1 << 30);
+        h.cpu.regs[0] = 0x4000_0000;
+        // 写入指令流：0xBF0C ite eq | 0x0040 lsleq r0,r0,#1（IT 块内条件后缀形式）
+        for (i, b) in [0x0C, 0xBF, 0x40, 0x00].iter().enumerate() {
+            h.mem.flash[i] = *b;
+        }
+        let mut nvic = crate::nvic::Nvic::new();
+        let mut eng = crate::engine::Engine::new();
+        // WHEN: ite + 块内 lsleq（EQ 成立，执行）
+        for _ in 0..2 {
+            assert_eq!(
+                eng.step(&mut h.cpu, &mut h.mem, &mut nvic),
+                crate::engine::EngineResult::Halted
+            );
+        }
+        // THEN: 结果写入（r0 = 0x80000000），但标志全部保持：C 仍=1、Z 仍=1（不被更新）
+        assert_eq!(h.cpu.regs[0], 0x8000_0000, "移位结果照常写入");
+        assert_eq!(
+            h.cpu.xpsr & ((1 << 29) | (1 << 30)),
+            (1 << 29) | (1 << 30),
+            "IT 块内移位不更新 C/Z（N/Z/C/V 全抑制）"
+        );
+        // 对照：块外同指令正常更新（结果 0x80000000 → N=1、Z=0、移出位 0 → C=0）
+        let mut h2 = Harness::new();
+        h2.cpu.xpsr = (1 << 29) | (1 << 30);
+        h2.cpu.regs[0] = 0x4000_0000;
+        assert_eq!(h2.exec_halfword(0x0040), ExecOutcome::Continue);
+        assert_eq!(h2.cpu.xpsr & (1 << 29), 0, "块外 LSLS 正常更新 C=0");
+        assert_eq!(h2.cpu.xpsr & (1 << 30), 0, "块外 LSLS 正常更新 Z=0");
+        assert_eq!(h2.cpu.xpsr & (1 << 31), 1 << 31, "块外 LSLS 正常更新 N=1");
+    }
+
+    /// P3-1：IT 块内 16 位 SBC（隐式 S）不更新 C/V——与 Shift 同病修复。
+    /// 编码 as 实测：sbceq r0, r1 = 0x4188（IT 块内条件后缀形式，编码与 sbcs 相同）。
+    /// SBC 语义：Rd = Rd - Rm - NOT(C)。构造初始 C=0：5-3-NOT(0)=5-3-1=1 无借位
+    /// （a >= b+NOT(C) → 5>=4）→ 块外 C 应更新为 1；IT 块内 C 必须保持 0。
+    /// 走 Engine 全路径（cur_is_16bit 由 run 循环设置）。
+    #[test]
+    fn golden_it_block_sbc_preserves_flags() {
+        use crate::engine::test_util::Harness;
+        let mut h = Harness::new();
+        // GIVEN: 初始标志 N=1,Z=1,C=0,V=1（EQ 成立：Z=1；全部非默认，可观测泄漏）
+        h.cpu.xpsr = (1 << 31) | (1 << 30) | (1 << 28); // N=1, Z=1, C=0, V=1
+        h.cpu.regs[0] = 5;
+        h.cpu.regs[1] = 3;
+        // 写入指令流：0xBF0C ite eq | 0x4188 sbceq r0,r1（IT 块内条件后缀形式）
+        for (i, b) in [0x0C, 0xBF, 0x88, 0x41].iter().enumerate() {
+            h.mem.flash[i] = *b;
+        }
+        let mut nvic = crate::nvic::Nvic::new();
+        let mut eng = crate::engine::Engine::new();
+        // WHEN: ite + 块内 sbceq（EQ 成立，执行）
+        for _ in 0..2 {
+            assert_eq!(
+                eng.step(&mut h.cpu, &mut h.mem, &mut nvic),
+                crate::engine::EngineResult::Halted
+            );
+        }
+        // THEN: 结果写入（5-3-1=1），标志保持初始值（C 不置 1、N/Z/V 不动）
+        assert_eq!(h.cpu.regs[0], 1);
+        assert_eq!(
+            h.cpu.xpsr,
+            (1 << 31) | (1 << 30) | (1 << 28),
+            "IT 块内 SBC 不更新任何标志"
+        );
+        // 对照：块外同指令正常更新（无借位 → C=1、结果 1 → N=0/Z=0/V=0）
+        let mut h2 = Harness::new();
+        h2.cpu.xpsr = (1 << 31) | (1 << 30) | (1 << 28);
+        h2.cpu.regs[0] = 5;
+        h2.cpu.regs[1] = 3;
+        assert_eq!(h2.exec_halfword(0x4188), ExecOutcome::Continue);
+        assert_eq!(h2.cpu.regs[0], 1);
+        assert_eq!(h2.cpu.xpsr & (1 << 29), 1 << 29, "块外 SBC 正常更新 C=1（无借位）");
     }
 }

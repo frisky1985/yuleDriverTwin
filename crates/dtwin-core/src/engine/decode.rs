@@ -1015,18 +1015,23 @@ impl Decoder {
                 return instr;
             }
         }
-        // VLDM/VSTM（0xECxx IA 家族；0xED2x/0xED3x DB 家族需 W=1，避开 VLDR/VSTR）
-        if ((top & 0xFF00) == 0xEC00 || ((top & 0xFF00) == 0xED00 && (top & 0x20) != 0))
+        // VLDM/VSTM（IA：0xEC80-0xECFF（P=0,U=1，bit23=1）；DB：0xED20-0xED3F（P=1,U=0,W=1））
+        // P2-2（codex 检视）：imm8 为寄存器字数，单精度最大 32（0x20）、双精度最大 16（0x10）
+        // → 原 (bits & 0x00F0)==0 拒绝 imm8≥16，vldmiaeq r0!,{s16-s31}（0xECB0 8A10，
+        // ARM_CM4F PendSV 上下文切换）被误判 Unimplemented。放宽为 imm8 上限检查；
+        // 同时收紧 top 掩码（IA 须 U=1：0xEC80+；DB 须 W=1：0xED2x），避免误吞 VMOV Dd
+        // （0xEC4x/0xEC5x，bits[11:8]=1011 与 VLDM 双精度同形）。
+        if (((top & 0xFF80) == 0xEC80) || ((top & 0xFFE0) == 0xED20))
             && (bits & 0x0E00) == 0x0A00
-            && (bits & 0x00F0) == 0
+            && (bits & 0xFF) <= 0x20
         {
             return self.decode_vldm_vstm(bits);
         }
-        // VLDR/VSTR（0xED00，bit21=0）
+        // VLDR/VSTR（0xED00，bit21=0：P=1,U=0,W=0 或 P=1,U=1,W=0，正负偏移）
+        // P2-2：imm8 为偏移量（imm8×4 字节，0-255 合法）→ 原 (bits & 0x00F0)==0 同样过严，放宽
         if (top & 0xFF00) == 0xED00
             && (top & 0x20) == 0
             && (bits & 0x0E00) == 0x0A00
-            && (bits & 0x00F0) == 0
         {
             return self.decode_fpu_loadstore(bits);
         }
@@ -1044,6 +1049,13 @@ impl Decoder {
         // 低半字 10 开头。放在末尾兜底：避免误抢 MRS/MSR/SSAT/DSB/UBFX 等 0xF3xx 系统指令
         // （同为 11110 高半字 + 10 开头低半字，如 msr BASEPRI=0xF383 8811）。
         // GNU as 实测 0xF7FF BF22 / 0xF000 B802；FreeRTOS port 的 b.w 跳转依赖此路径。
+        //
+        // P2-1（codex 检视）：0xF3AF 8xxx（HINT 家族，nop.w=0xF3AF 8000）低半字 10 开头
+        // 会落入本兜底被误解码为 bge.w（T3 路径 imm6=0x2F 参与偏移，0xF3AF 8000 →
+        // pc+4+0xBC000），违反 FRT-INS-06。HINT 指令对引擎无副作用 → 显式 NOP。
+        if (top & 0xFFF0) == 0xF3A0 && (bits & 0xF000) == 0x8000 {
+            return Instruction::Nop;
+        }
         if (top & 0xF800) == 0xF000 && (bits & 0xC000) == 0x8000 {
             return self.decode_bw(bits, pc);
         }
@@ -1899,6 +1911,13 @@ impl Decoder {
         } else {
             (vd_field << 1) | d as u8
         };
+        // P2-2：寄存器范围检查——单精度 S0-S31（32 个）、双精度 D0-D15（16 个）
+        // imm8 上限已由调用侧保证（≤0x20=32 字）；此处防 vd+count 越界（如
+        // vd=30,count=8 → S30-S37 超 S31）
+        let reg_limit = if double { 16 } else { 32 };
+        if vd as u32 + count as u32 > reg_limit {
+            return Instruction::Unimplemented { bits };
+        }
         Instruction::FpLoadStoreMulti {
             vd,
             rn,
@@ -5008,6 +5027,113 @@ fn decode_adds_reg_sets_flags() {
             rm: Some(2),
             imm: None,
             flags: true,
+        }
+    );
+}
+
+/// P2-1（codex 检视）：nop.w（0xF3AF 8000）不得被 B.W 兜底误解码为 bge.w
+/// （T3 路径 imm6=0x2F 参与偏移 → pc+4+0xBC000）。HINT 家族（0xF3AF 8xxx，
+/// op2 在低半字 bits[7:4]）全部为 NOP。编码 as 实测：nop.w=f3af 8000 /
+/// yield=8001 / wfe=8002 / wfi=8003 / sev=8004。
+#[test]
+fn decode_nopw_hint_family_not_bw() {
+    let mut d = Decoder::new();
+    // NOP.W 全 8 种 op2（0-7）均须 NOP，不得进 B.W 兜底
+    for op2 in 0u32..8 {
+        let bits = 0xF3AF_8000 | (op2 << 4);
+        assert_eq!(
+            d.decode_word(bits, 0),
+            Instruction::Nop,
+            "0xF3AF 8{:X}0 应为 NOP（HINT 家族）",
+            op2
+        );
+    }
+    // 对照：真正的 bge.w（0xF3AF 8000 的 imm6 变体不可达——同编码被 HINT 占用）；
+    // 验证普通 B.W 仍正常（0xF000 B802 = b.w #+4，as 实测）
+    let b = d.decode_word(0xF000_B802, 0);
+    assert!(
+        !matches!(b, Instruction::Nop),
+        "B.W 不受 HINT 处理影响：{b:?}"
+    );
+}
+
+/// P2-2（codex 检视）：VLDM/VSTM 大寄存器列表（imm8≥16）不再被拒。
+/// ARM_CM4F PendSV 上下文切换：vstmdbeq r0!,{s16-s31}=0xED20 8A10 /
+/// vldmiaeq r0!,{s16-s31}=0xECB0 8A10（as 实测，编码见 /tmp/p2_test.s）。
+#[test]
+fn decode_vldm_vstm_large_list() {
+    let mut d = Decoder::new();
+    // VSTMDB r0!, {s16-s31}：imm8=0x10=16 个单精度，Vd=16，DB+回写
+    assert_eq!(
+        d.decode_word(0xED20_8A10, 0),
+        Instruction::FpLoadStoreMulti {
+            vd: 16,
+            rn: 0,
+            count: 16,
+            load: false,
+            double: false,
+            decrement: true,
+            writeback: true,
+        }
+    );
+    // VLDMIA r0!, {s16-s31}：同样 imm8=16
+    assert_eq!(
+        d.decode_word(0xECB0_8A10, 0),
+        Instruction::FpLoadStoreMulti {
+            vd: 16,
+            rn: 0,
+            count: 16,
+            load: true,
+            double: false,
+            decrement: false,
+            writeback: true,
+        }
+    );
+    // 边界：imm8=0x20（单精度 32 个 S0-S31）合法
+    assert_eq!(
+        d.decode_word(0xECB0_0A20, 0),
+        Instruction::FpLoadStoreMulti {
+            vd: 0,
+            rn: 0,
+            count: 32,
+            load: true,
+            double: false,
+            decrement: false,
+            writeback: true,
+        }
+    );
+    // 越界防护：imm8=0x20 + Vd=16 → 16+32>32 超 S31 → Unimplemented
+    assert_eq!(
+        d.decode_word(0xECB8_8A20, 0),
+        Instruction::Unimplemented { bits: 0xECB8_8A20 }
+    );
+}
+
+/// P2-2：VLDR/VSTR 大偏移（imm8×4，0-255 合法）不再被拒。
+/// as 实测：vldr s0,[r1,#64]=0xED91 0A10 / vstr s0,[r1,#64]=0xED81 0A10。
+#[test]
+fn decode_vldr_vstr_large_offset() {
+    let mut d = Decoder::new();
+    // VLDR s0, [r1, #64]：imm8=0x10，U=1（正偏移），offset=0x40
+    assert_eq!(
+        d.decode_word(0xED91_0A10, 0),
+        Instruction::FpLoadStore {
+            rt: 0,
+            rn: 1,
+            offset: 0x40,
+            load: true,
+            double: false,
+        }
+    );
+    // VSTR s0, [r1, #64]：L=0
+    assert_eq!(
+        d.decode_word(0xED81_0A10, 0),
+        Instruction::FpLoadStore {
+            rt: 0,
+            rn: 1,
+            offset: 0x40,
+            load: false,
+            double: false,
         }
     );
 }
