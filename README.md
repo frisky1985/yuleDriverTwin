@@ -21,7 +21,7 @@
 | **内存模型** | 标准 Cortex-M 映射 + MPU + Flash 擦写行为 + watchpoint + 非对齐检测 | ✅ |
 | **外设模型** | UART（CMSDK/LPUART0 双模型，TX 输出捕获）；GPIO/SPI/I2C/ADC 等 🚧 骨架 | 🚧 |
 | **NVIC 中断** | 优先级模型、中断挂起/使能、异常返回映射；嵌套/惰性压栈 🚧 骨架 | 🚧 |
-| **GDB 集成** | GDB RSP（localhost:3333）：核心寄存器、内存读写、软/硬件断点、观察点、单步/继续、Ctrl-C、monitor 命令 ✅ | ✅ |
+| **GDB 集成** | GDB RSP（localhost:3333）：核心寄存器/xPSR、MSP/PSP/PRIMASK 等系统寄存器、FPU（D0-D15/S0-S31/FPSCR，原生 target.xml）、内存读写、软/硬件断点、观察点、单步/继续、Ctrl-C、monitor 命令 ✅ | ✅ |
 | **芯片配置** | S32K312 profile（内存映射 + 10 外设基址）；STM32F407VG 待补 | ✅（S32K312） |
 | **固件加载** | ELF32 loader（armv7e-m 段映射/SP/PC 初始化） | ✅ |
 | **CLI** | `dtwin load/run/debug/create/list-chips`，`--uart-model cmsdk\|lpuart0` | ✅ |

@@ -3,14 +3,18 @@
 //! 设计要点：
 //! - 断点/观察点由调试器侧维护，运行循环在每条指令前检查断点、每条指令后检查观察点，
 //!   因此不需要改写 Flash 中的指令（Cortex-M 的代码区通常是只读的）。
-//! - GDB 的 `cpsr` 与 Cortex-M 的 `xPSR` 位布局不同（T 位分别在 bit5 / bit24），
-//!   读写寄存器时做显式转换。
+//! - 使用自定义 [`CortexM4F`] 架构，寄存器布局对齐 GDB M-profile 标准特性：
+//!   xPSR 直接使用 M-profile 原生位布局（T 位在 bit24），无需 CPSR↔xPSR 转换。
+//! - FPU 寄存器 D0-D15 与底层 S0-S31 别名互转（Dn = S(2n+1):S(2n)）。
 //! - 单步通过 `Engine::run_until(..., 1)` 完成，保留 SysTick 递减与异常仲裁语义。
 
 use std::collections::BTreeMap;
 
 use gdbstub::arch::Arch;
 use gdbstub::common::Signal;
+use gdbstub::target::ext::base::single_register_access::{
+    SingleRegisterAccess, SingleRegisterAccessOps,
+};
 use gdbstub::target::ext::base::singlethread::{
     SingleThreadBase, SingleThreadResume, SingleThreadResumeOps, SingleThreadSingleStep,
     SingleThreadSingleStepOps,
@@ -22,13 +26,14 @@ use gdbstub::target::ext::breakpoints::{
 };
 use gdbstub::target::ext::monitor_cmd::{ConsoleOutput, MonitorCmd, MonitorCmdOps};
 use gdbstub::target::{Target, TargetError, TargetResult};
-use gdbstub_arch::arm::{ArmBreakpointKind, Armv4t};
+use gdbstub_arch::arm::ArmBreakpointKind;
 
 use dtwin_core::engine::{Engine, EngineResult, FaultReason};
 use dtwin_core::memory::{Memory, Watchpoint};
 use dtwin_core::nvic::Nvic;
 use dtwin_core::CpuState;
 
+use crate::arch::{CortexM4F, CortexM4FRegId};
 use crate::{GdbServerConfig, GdbTargetError, FPB_BREAKPOINT_MAX};
 
 /// 每次进入运行循环时连续执行的指令块大小。
@@ -231,7 +236,7 @@ impl DtwinTarget {
 }
 
 impl Target for DtwinTarget {
-    type Arch = Armv4t;
+    type Arch = CortexM4F;
     type Error = GdbTargetError;
 
     fn base_ops(&mut self) -> BaseOps<'_, Self::Arch, Self::Error> {
@@ -256,7 +261,20 @@ impl SingleThreadBase for DtwinTarget {
         regs.sp = self.cpu.regs[13];
         regs.lr = self.cpu.regs[14];
         regs.pc = self.cpu.regs[15] & !1;
-        regs.cpsr = xpsr_to_cpsr(self.cpu.xpsr);
+        regs.xpsr = self.cpu.xpsr;
+        regs.msp = self.cpu.msp;
+        regs.psp = self.cpu.psp;
+        regs.primask = self.cpu.primask as u32;
+        regs.basepri = self.cpu.basepri as u32;
+        regs.faultmask = self.cpu.faultmask as u32;
+        regs.control = self.cpu.control as u32;
+        // Dn = S(2n+1):S(2n)（高字为 S(2n+1)，低字为 S(2n)）
+        for (i, d) in regs.d.iter_mut().enumerate() {
+            let lo = self.cpu.fpu.s[2 * i];
+            let hi = self.cpu.fpu.s[2 * i + 1];
+            *d = (hi as u64) << 32 | lo as u64;
+        }
+        regs.fpscr = self.cpu.fpu.fpscr;
         Ok(())
     }
 
@@ -268,7 +286,18 @@ impl SingleThreadBase for DtwinTarget {
         self.set_current_sp(regs.sp);
         self.cpu.regs[14] = regs.lr;
         self.cpu.regs[15] = regs.pc & !1;
-        self.cpu.xpsr = cpsr_to_xpsr(regs.cpsr, self.cpu.xpsr);
+        self.cpu.xpsr = regs.xpsr;
+        self.cpu.msp = regs.msp;
+        self.cpu.psp = regs.psp;
+        self.cpu.primask = regs.primask as u8;
+        self.cpu.basepri = regs.basepri as u8;
+        self.cpu.faultmask = regs.faultmask as u8;
+        self.cpu.control = regs.control as u8;
+        for (i, d) in regs.d.iter().enumerate() {
+            self.cpu.fpu.s[2 * i] = *d as u32;
+            self.cpu.fpu.s[2 * i + 1] = (*d >> 32) as u32;
+        }
+        self.cpu.fpu.fpscr = regs.fpscr;
         Ok(())
     }
 
@@ -375,6 +404,10 @@ impl SingleThreadBase for DtwinTarget {
     fn support_resume(&mut self) -> Option<SingleThreadResumeOps<'_, Self>> {
         Some(self)
     }
+
+    fn support_single_register_access(&mut self) -> Option<SingleRegisterAccessOps<'_, (), Self>> {
+        Some(self)
+    }
 }
 
 impl SingleThreadResume for DtwinTarget {
@@ -391,6 +424,79 @@ impl SingleThreadResume for DtwinTarget {
 impl SingleThreadSingleStep for DtwinTarget {
     fn step(&mut self, _signal: Option<Signal>) -> Result<(), Self::Error> {
         self.single_step = true;
+        Ok(())
+    }
+}
+
+impl SingleRegisterAccess<()> for DtwinTarget {
+    fn read_register(
+        &mut self,
+        _tid: (),
+        reg_id: <Self::Arch as Arch>::RegId,
+        buf: &mut [u8],
+    ) -> TargetResult<usize, Self> {
+        let bytes: [u8; 8] = match reg_id {
+            CortexM4FRegId::Gpr(n) => u32_to_le8(self.cpu.regs[n as usize]),
+            CortexM4FRegId::Sp => u32_to_le8(self.cpu.regs[13]),
+            CortexM4FRegId::Lr => u32_to_le8(self.cpu.regs[14]),
+            CortexM4FRegId::Pc => u32_to_le8(self.cpu.regs[15] & !1),
+            CortexM4FRegId::Xpsr => u32_to_le8(self.cpu.xpsr),
+            CortexM4FRegId::Msp => u32_to_le8(self.cpu.msp),
+            CortexM4FRegId::Psp => u32_to_le8(self.cpu.psp),
+            CortexM4FRegId::Primask => u32_to_le8(self.cpu.primask as u32),
+            CortexM4FRegId::Basepri => u32_to_le8(self.cpu.basepri as u32),
+            CortexM4FRegId::Faultmask => u32_to_le8(self.cpu.faultmask as u32),
+            CortexM4FRegId::Control => u32_to_le8(self.cpu.control as u32),
+            CortexM4FRegId::D(n) => {
+                let lo = self.cpu.fpu.s[2 * n as usize];
+                let hi = self.cpu.fpu.s[2 * n as usize + 1];
+                ((hi as u64) << 32 | lo as u64).to_le_bytes()
+            }
+            CortexM4FRegId::Fpscr => u32_to_le8(self.cpu.fpu.fpscr),
+        };
+        let n = if matches!(reg_id, CortexM4FRegId::D(_)) {
+            8
+        } else {
+            4
+        };
+        if buf.len() < n {
+            return Err(TargetError::NonFatal);
+        }
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+
+    fn write_register(
+        &mut self,
+        _tid: (),
+        reg_id: <Self::Arch as Arch>::RegId,
+        val: &[u8],
+    ) -> TargetResult<(), Self> {
+        match reg_id {
+            CortexM4FRegId::Gpr(n) => {
+                self.cpu.regs[n as usize] = read_u32_le(val)?;
+            }
+            CortexM4FRegId::Sp => self.set_current_sp(read_u32_le(val)?),
+            CortexM4FRegId::Lr => self.cpu.regs[14] = read_u32_le(val)?,
+            CortexM4FRegId::Pc => self.cpu.regs[15] = read_u32_le(val)? & !1,
+            CortexM4FRegId::Xpsr => self.cpu.xpsr = read_u32_le(val)?,
+            CortexM4FRegId::Msp => self.cpu.msp = read_u32_le(val)?,
+            CortexM4FRegId::Psp => self.cpu.psp = read_u32_le(val)?,
+            CortexM4FRegId::Primask => self.cpu.primask = read_u32_le(val)? as u8,
+            CortexM4FRegId::Basepri => self.cpu.basepri = read_u32_le(val)? as u8,
+            CortexM4FRegId::Faultmask => self.cpu.faultmask = read_u32_le(val)? as u8,
+            CortexM4FRegId::Control => self.cpu.control = read_u32_le(val)? as u8,
+            CortexM4FRegId::D(n) => {
+                if val.len() < 8 {
+                    return Err(TargetError::NonFatal);
+                }
+                let lo = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
+                let hi = u32::from_le_bytes([val[4], val[5], val[6], val[7]]);
+                self.cpu.fpu.s[2 * n as usize] = lo;
+                self.cpu.fpu.s[2 * n as usize + 1] = hi;
+            }
+            CortexM4FRegId::Fpscr => self.cpu.fpu.fpscr = read_u32_le(val)?,
+        }
         Ok(())
     }
 }
@@ -577,22 +683,19 @@ impl MonitorCmd for DtwinTarget {
     }
 }
 
-/// GDB CPSR 与 Cortex-M xPSR 的位布局转换。
-///
-/// ARM 经典 CPSR 的 Thumb 位在 bit5，Cortex-M xPSR 在 bit24；
-/// 其余 APSR 标志位（NZCV/Q/GE/IT）布局一致。
-fn xpsr_to_cpsr(xpsr: u32) -> u32 {
-    (xpsr & !(1 << 24)) | (1 << 5)
+/// 把 u32 扩展为 8 字节小端缓冲，供单寄存器读统一返回 [u8;8]。
+fn u32_to_le8(v: u32) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    b[..4].copy_from_slice(&v.to_le_bytes());
+    b
 }
 
-/// 写回时保留当前 IPSR（异常号），把 GDB 给的 APSR/IT 位映射到 xPSR。
-fn cpsr_to_xpsr(cpsr: u32, old_xpsr: u32) -> u32 {
-    let flags = cpsr & 0xF800_0000; // N Z C V
-    let q = cpsr & (1 << 27);
-    let ge = cpsr & (0xF << 16);
-    let it = cpsr & (0x3F << 10);
-    let ipsr = old_xpsr & 0x1FF;
-    flags | q | ge | it | ipsr | (1 << 24)
+/// 从单寄存器写缓冲中解析 u32（小端）。
+fn read_u32_le(val: &[u8]) -> TargetResult<u32, DtwinTarget> {
+    if val.len() < 4 {
+        return Err(TargetError::NonFatal);
+    }
+    Ok(u32::from_le_bytes([val[0], val[1], val[2], val[3]]))
 }
 
 fn signal_for(reason: FaultReason) -> Signal {
@@ -731,20 +834,107 @@ mod tests {
     }
 
     #[test]
-    fn xpsr_cpsr_roundtrip_preserves_flags() {
+    fn cortexm4f_registers_roundtrip() {
+        use crate::arch::CortexM4FRegs;
+
         let mut target = test_target();
-        target.cpu.xpsr = (1 << 24) | 0xF000_0000 | (1 << 27);
+        target.cpu.xpsr = (1 << 24) | 0xF000_0000 | (1 << 27) | 3; // T + NZCV + Q + IPSR=3
+        target.cpu.msp = 0x2000_1000;
+        target.cpu.psp = 0x2000_2000;
+        target.cpu.primask = 1;
+        target.cpu.basepri = 0x80;
+        target.cpu.faultmask = 1;
+        target.cpu.control = 2;
+        // 让 S0/S1 组成 D0，S30/S31 组成 D15
+        target.cpu.fpu.s[0] = 0x1111_1111;
+        target.cpu.fpu.s[1] = 0x2222_2222;
+        target.cpu.fpu.s[30] = 0xAAAA_AAAA;
+        target.cpu.fpu.s[31] = 0xBBBB_BBBB;
+        target.cpu.fpu.fpscr = 0x0300_0010;
 
-        let mut regs = <<Armv4t as Arch>::Registers>::default();
+        let mut regs = CortexM4FRegs::default();
         assert!(target.read_registers(&mut regs).is_ok());
-        assert_eq!(regs.cpsr & (1 << 5), 1 << 5, "Thumb 位应在 CPSR bit5");
-        assert_eq!(regs.cpsr & 0xF000_0000, 0xF000_0000);
-        assert_eq!(regs.cpsr & (1 << 27), 1 << 27);
 
+        // xPSR 原生布局：T 位在 bit24，标志位不变
+        assert_eq!(regs.xpsr & (1 << 24), 1 << 24, "T 位应在 xPSR bit24");
+        assert_eq!(regs.xpsr & 0xF000_0000, 0xF000_0000);
+        assert_eq!(regs.xpsr & (1 << 27), 1 << 27);
+        assert_eq!(regs.xpsr & 0x1FF, 3, "IPSR 应保留");
+
+        assert_eq!(regs.msp, 0x2000_1000);
+        assert_eq!(regs.psp, 0x2000_2000);
+        assert_eq!(regs.primask, 1);
+        assert_eq!(regs.basepri, 0x80);
+        assert_eq!(regs.faultmask, 1);
+        assert_eq!(regs.control, 2);
+
+        // D0 = S1:S0，D15 = S31:S30
+        assert_eq!(regs.d[0], 0x2222_2222_1111_1111);
+        assert_eq!(regs.d[15], 0xBBBB_BBBB_AAAA_AAAA);
+        assert_eq!(regs.fpscr, 0x0300_0010);
+
+        // 写回应保持一致
         assert!(target.write_registers(&regs).is_ok());
-        assert_eq!(target.cpu.xpsr & (1 << 24), 1 << 24);
-        assert_eq!(target.cpu.xpsr & 0xF000_0000, 0xF000_0000);
-        assert_eq!(target.cpu.xpsr & (1 << 27), 1 << 27);
+        assert_eq!(target.cpu.xpsr, (1 << 24) | 0xF000_0000 | (1 << 27) | 3);
+        assert_eq!(target.cpu.fpu.s[0], 0x1111_1111);
+        assert_eq!(target.cpu.fpu.s[1], 0x2222_2222);
+        assert_eq!(target.cpu.fpu.s[30], 0xAAAA_AAAA);
+        assert_eq!(target.cpu.fpu.s[31], 0xBBBB_BBBB);
+        assert_eq!(target.cpu.fpu.fpscr, 0x0300_0010);
+    }
+
+    #[test]
+    fn single_register_access_rw() {
+        let mut target = test_target();
+        target.cpu.regs[5] = 0xDEAD_BEEF;
+        target.cpu.xpsr = 0x0100_0000;
+        target.cpu.fpu.s[0] = 0x1234_5678;
+        target.cpu.fpu.s[1] = 0x9ABC_DEF0;
+        target.cpu.fpu.fpscr = 0x0100_0000;
+
+        // 读 R5
+        let mut buf = [0u8; 8];
+        let n = target
+            .read_register((), CortexM4FRegId::Gpr(5), &mut buf)
+            .ok()
+            .expect("读 R5 应成功");
+        assert_eq!(n, 4);
+        assert_eq!(
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            0xDEAD_BEEF
+        );
+
+        // 读 xpsr
+        let n = target
+            .read_register((), CortexM4FRegId::Xpsr, &mut buf)
+            .ok()
+            .expect("读 xpsr 应成功");
+        assert_eq!(n, 4);
+        assert_eq!(
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            0x0100_0000
+        );
+
+        // 读 D0（8 字节）
+        let mut buf8 = [0u8; 8];
+        let n = target
+            .read_register((), CortexM4FRegId::D(0), &mut buf8)
+            .ok()
+            .expect("读 D0 应成功");
+        assert_eq!(n, 8);
+        assert_eq!(u64::from_le_bytes(buf8), 0x9ABC_DEF0_1234_5678);
+
+        // 写 R5
+        assert!(target
+            .write_register((), CortexM4FRegId::Gpr(5), &0xCAFE_BABE_u32.to_le_bytes())
+            .is_ok());
+        assert_eq!(target.cpu.regs[5], 0xCAFE_BABE);
+
+        // 写 D1（S2/S3）
+        let d1 = 0x1111_1111_2222_2222_u64.to_le_bytes();
+        assert!(target.write_register((), CortexM4FRegId::D(1), &d1).is_ok());
+        assert_eq!(target.cpu.fpu.s[2], 0x2222_2222);
+        assert_eq!(target.cpu.fpu.s[3], 0x1111_1111);
     }
 
     #[test]

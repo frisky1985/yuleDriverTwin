@@ -119,8 +119,8 @@ fn rsp_breakpoint_continue_and_detach() {
     let regs = recv_packet(&mut stream);
     assert_eq!(
         regs.len(),
-        42 * 4 * 2,
-        "ArmCoreRegs 寄存器包长度不符: {regs}"
+        224 * 2,
+        "CortexM4F 寄存器包长度不符（224 字节）: {regs}"
     );
 
     send_packet(&mut stream, "m20000000,4");
@@ -160,4 +160,67 @@ fn rsp_breakpoint_continue_and_detach() {
         "会话应正常断开: {reason:?}"
     );
     assert_eq!(instructions, 2, "命中断点前应执行 2 条指令");
+}
+
+#[test]
+fn rsp_target_xml_and_single_register_access() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || {
+        let mut target = build_target();
+        // 预置 FPU / 系统寄存器，便于单寄存器读校验
+        target.cpu.fpu.s[0] = 0x1234_5678;
+        target.cpu.fpu.s[1] = 0x9ABC_DEF0;
+        target.cpu.xpsr = 1 << 24;
+        let _ = serve_listener(&mut target, listener);
+    });
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    send_packet(&mut stream, "qSupported:xmlRegisters=arm");
+    let _ = recv_packet(&mut stream);
+    send_packet(&mut stream, "?");
+    let _ = recv_packet(&mut stream);
+
+    // 拉取 target.xml，校验三个 M-profile 特性与关键寄存器编号
+    send_packet(&mut stream, "qXfer:features:read:target.xml:0,fff");
+    let xml = recv_packet(&mut stream);
+    assert!(xml.contains("<architecture>arm</architecture>"));
+    assert!(xml.contains("org.gnu.gdb.arm.m-profile"));
+    assert!(xml.contains("org.gnu.gdb.arm.m-system"));
+    assert!(xml.contains("org.gnu.gdb.arm.vfp"));
+    assert!(xml.contains(r#"name="xpsr" bitsize="32" regnum="25""#));
+    assert!(xml.contains(r#"name="d0" bitsize="64" regnum="32""#));
+    assert!(xml.contains(r#"name="fpscr" bitsize="32" regnum="48""#));
+
+    // 单寄存器读：xpsr (25) / msp (26) / d0 (32)
+    send_packet(&mut stream, "p19");
+    let xpsr = recv_packet(&mut stream);
+    let xpsr_val = u32::from_le_bytes([
+        u8::from_str_radix(&xpsr[0..2], 16).unwrap(),
+        u8::from_str_radix(&xpsr[2..4], 16).unwrap(),
+        u8::from_str_radix(&xpsr[4..6], 16).unwrap(),
+        u8::from_str_radix(&xpsr[6..8], 16).unwrap(),
+    ]);
+    assert_eq!(xpsr_val, 1 << 24, "xpsr 应为 T 位置位");
+
+    send_packet(&mut stream, "p20");
+    let d0 = recv_packet(&mut stream);
+    assert_eq!(d0.len(), 16, "D0 应为 8 字节 = 16 hex");
+    let mut d0_bytes = [0u8; 8];
+    for i in 0..8 {
+        d0_bytes[i] = u8::from_str_radix(&d0[i * 2..i * 2 + 2], 16).unwrap();
+    }
+    let d0_val = u64::from_le_bytes(d0_bytes);
+    assert_eq!(d0_val, 0x9ABC_DEF0_1234_5678, "D0 应由 S1:S0 组成");
+
+    drop(stream);
+    server.join().unwrap();
 }

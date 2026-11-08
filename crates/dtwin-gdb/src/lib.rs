@@ -4,16 +4,20 @@
 //! 默认监听 localhost:3333（端口可配置）。
 //!
 //! 已支持：
-//! - 核心寄存器 R0-R15 / CPSR（映射 Cortex-M xPSR）
+//! - 核心寄存器 R0-R15 / xPSR（Cortex-M 原生布局）
+//! - 系统寄存器 MSP/PSP/PRIMASK/BASEPRI/FAULTMASK/CONTROL
+//! - FPU 寄存器 D0-D15 / FPSCR（GDB 自动合成 S0-S31）
 //! - 内存读写、软/硬件断点、硬件观察点
 //! - continue / step / Ctrl-C 中断
 //! - `monitor` 命令：reset / regs / fpu / stats
 
 #![deny(unsafe_code)]
 
+mod arch;
 mod server;
 mod target;
 
+pub use arch::{CortexM4F, CortexM4FRegId, CortexM4FRegs};
 pub use server::{serve, serve_listener};
 pub use target::{describe_listener, DtwinTarget, RunEvent};
 
