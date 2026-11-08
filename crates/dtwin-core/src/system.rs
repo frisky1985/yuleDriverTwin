@@ -221,6 +221,11 @@ impl SystemBlock {
         self.ccr & (1 << 9) != 0
     }
 
+    /// CCR.UNALIGN_TRP（非对齐访问陷阱开关；复位=0）
+    pub fn ccr_unalign_trap(&self) -> bool {
+        self.ccr & (1 << 3) != 0
+    }
+
     /// 挂起位图全量（bit n = 异常 n 挂起；供引擎优先级仲裁扫描）
     pub fn pended_bits(&self) -> u16 {
         self.pended

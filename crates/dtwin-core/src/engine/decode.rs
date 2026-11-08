@@ -89,18 +89,28 @@ pub enum Instruction {
         imm: Option<u32>,
         flags: bool,
     },
-    /// 带进位加法: ADC Rd, Rn, Rm（Rd = Rn + Rm + C）
+    /// 带进位加法: ADC Rd, Rn, Rm/#imm（Rd = Rn + Rm + C）
     Adc {
         rd: u8,
         rn: u8,
-        rm: u8,
+        rm: Option<u8>,
         flags: bool,
+        imm: Option<u32>,
     },
-    /// 带借位减法: SBC Rd, Rn, Rm（Rd = Rn - Rm - NOT(C)）
+    /// 带借位减法: SBC Rd, Rn, Rm/#imm（Rd = Rn - Rm - NOT(C)）
     Sbc {
         rd: u8,
         rn: u8,
-        rm: u8,
+        rm: Option<u8>,
+        flags: bool,
+        imm: Option<u32>,
+    },
+    /// 按位或取反: ORN Rd, Rn, Rm/imm（Rd = Rn | ~Rm）
+    Orn {
+        rd: u8,
+        rn: u8,
+        rm: Option<u8>,
+        imm: Option<u32>,
         flags: bool,
     },
     /// 取负: NEG Rd, Rm（= RSB Rd, Rm, #0，Rd = 0 - Rm）
@@ -217,7 +227,7 @@ pub enum Instruction {
     /// 1011 0010 op[1:0] Rm Rd（as 实测：sxth=0xB21A/sxtb=0xB25A/uxth=0xB29A/uxtb=0xB2DA）
     /// op[1:0] = bits[7:6]：00=SXTH、01=SXTB、10=UXTH、11=UXTB；T1 无旋转
     /// （32 位带旋转形式 sxth.w ror#n 为 0xFA0F/0xFA5F 族，固件未暴露，后续按需补）
-    Extend { rd: u8, rm: u8, kind: ExtendKind },
+    Extend { rd: u8, rm: u8, kind: ExtendKind, rotate: u8 },
     /// 位域操作: UBFX/SBFX/BFI/BFC
     BitField {
         rd: u8,
@@ -300,6 +310,14 @@ pub enum Instruction {
     ExceptionReturn,
 
     // ================= Phase 3: DSP (ARMv7E-M 饱和运算/SIMD) =================
+    /// 半字 SIMD 饱和: SSAT16/USAT16 Rd, #sat, Rn（0xF320/0xF3A0，无移位）
+    Sat16 {
+        rd: u8,
+        rn: u8,
+        /// 原始位宽字段 0-63（bits[5:0]；SSAT16 → ±2^n，USAT16 → [0, 2^n)）
+        sat_imm: u8,
+        signed: bool,
+    },
     /// 饱和指令: SSAT/USAT Rd, #sat, Rn {, shift}
     Sat {
         rd: u8,
@@ -711,6 +729,9 @@ pub enum SpecialReg {
 pub struct Decoder {
     /// 指令计数（统计用）
     pub decoded_count: u64,
+    /// 上一条解码的 32 位修改立即数指令的移位器进位（ThumbExpandImm_C）：
+    /// Some = 逻辑指令应据此更新 C 标志，None = C 保持。引擎在执行前传给执行器。
+    pub expand_carry: Option<bool>,
 }
 
 impl Decoder {
@@ -721,6 +742,7 @@ impl Decoder {
     /// 解码 16-bit Thumb 指令
     pub fn decode_halfword(&mut self, bits: u16, pc: u32) -> Instruction {
         self.decoded_count += 1;
+        self.expand_carry = None;
         let op5 = bits >> 11; // bits[15:11]
         match op5 {
             // 00000-00010: 移位立即数 LSL/LSR/ASR（00011 是 ADD/SUB #imm3，见下）
@@ -762,6 +784,7 @@ impl Decoder {
     /// 解码 32-bit Thumb-2 指令
     pub fn decode_word(&mut self, bits: u32, pc: u32) -> Instruction {
         self.decoded_count += 1;
+        self.expand_carry = None;
         let top = (bits >> 16) as u16;
         // MOVW/MOVT (11110 i 100100/101100 imm4 0 imm3 Rd imm8)
         // A9 实测修正：imm4 = top[3:0]（原 (top>>4)&0xF 取错位）、
@@ -779,6 +802,33 @@ impl Decoder {
                 rd,
                 imm16,
                 top: top_half,
+            };
+        }
+        // ADDW/SUBW（11110 i 10000 0 / 11110 i 10101 0 Rn / 0 imm3 Rd imm8，as 实测
+        // addw r5,r5,#0x360=0xF205 3560、subw r7,lr,#0xea4=0xF6AE 67A4）：
+        // 普通 12 位立即数（i:imm3:imm8，非 ThumbExpandImm），不更新标志。
+        // 低半字 bit15=0 与 B.W/BL（bit15=1）互斥；rn=15 即 ADR 形式（走 regs[15]）。
+        if matches!(top & 0xFBF0, 0xF200 | 0xF2A0) && (bits & 0x8000) == 0 {
+            let i = ((top >> 10) & 1) as u32;
+            let imm12 = (i << 11) | (((bits >> 12) & 0x7) << 8) | (bits & 0xFF);
+            let rd = ((bits >> 8) & 0xF) as u8;
+            let rn = (top & 0xF) as u8;
+            return if (top & 0xFBF0) == 0xF200 {
+                Instruction::Add {
+                    rd,
+                    rn,
+                    rm: None,
+                    imm: Some(imm12),
+                    flags: false,
+                }
+            } else {
+                Instruction::Sub {
+                    rd,
+                    rn,
+                    rm: None,
+                    imm: Some(imm12),
+                    flags: false,
+                }
             };
         }
         // SVC (11101 111 ...)
@@ -810,7 +860,19 @@ impl Decoder {
         if (top & 0xFFF0) == 0xF380 && (bits & 0x8000) != 0 {
             return self.decode_msr(bits);
         }
-        // SSAT (0xF30x/0xF32x) / USAT (0xF38x/0xF3Ax，low bit15=0)
+        // SSAT16/USAT16（0xF320/0xF3A0 + Rn，低半字 bits[15:12]=0000；sat 位宽字段 =
+        // bits[5:0] 共 6 位——QEMU 实测 bits[7:6] 参与位宽，不要求为 0；bits[15:12]≠0 时
+        // 落入下方 SSAT/USAT 的 ASR 移位形式）
+        if matches!(top & 0xFFF0, 0xF320 | 0xF3A0) && (bits & 0xF000) == 0 {
+            return Instruction::Sat16 {
+                rd: ((bits >> 8) & 0xF) as u8,
+                rn: (top & 0xF) as u8,
+                sat_imm: (bits & 0x3F) as u8,
+                signed: (top & 0x80) == 0,
+            };
+        }
+        // SSAT (0xF30x LSL / 0xF32x ASR) / USAT (0xF38x/0xF3Ax，low bit15=0 排除 MSR)：
+        // sh = top bit5；bit6/bit4 须为 0（0xF340/0xF360/0xF3C0 为 SBFX/BFI/UBFX 空间）
         if (top & 0xFFD0) == 0xF300 || ((top & 0xFFD0) == 0xF380 && (bits & 0x8000) == 0) {
             return self.decode_sat(bits);
         }
@@ -834,7 +896,7 @@ impl Decoder {
             || (top & 0xFFF0) == 0xF340
             || (top & 0xFFF0) == 0xF360
         {
-            return self.decode_bitfield(bits);
+            return self.decode_bitfield(bits, pc);
         }
         // QADD/QSUB/QDADD/QDSUB (0xFA80-0xFA8F，低半字 op=1000-1011)
         if (top & 0xFFF8) == 0xFA80 && (bits & 0xF000) == 0xF000 && ((bits >> 4) & 0xC) == 0x8 {
@@ -863,21 +925,37 @@ impl Decoder {
         if matches!(top & 0xFFF8, 0xFBC0 | 0xFBD0) && (bits & 0x00C0) == 0x00C0 {
             return self.decode_dual_half_mul_long(bits);
         }
-        // MLA/MLS（0xFB00，低半字 bits[7:5]=000）
+        // MLA/MLS/MUL（0xFB00，低半字 bits[7:5]=000：bit4=0 → MLA、bit4=1 → MLS；
+        // Ra=1111 且 bit4=0 时退化为 MUL。0xFB10 为 SMLABB 家族，属 DSP 缺口）
         if (top & 0xFFF0) == 0xFB00 && (bits & 0x00E0) == 0 {
-            return self.decode_mla(bits);
+            return self.decode_mla(bits, pc);
         }
-        // UMULL/SMULL/SMLAL（FRT-INS-05 SHOULD，-O2 固件 64 位乘加）：
+        // SDIV/UDIV（0xFB90/0xFBB0，低半字 1111 Rd 1111 Rm）
+        if matches!(top & 0xFFF0, 0xFB90 | 0xFBB0) && (bits & 0xF0F0) == 0xF0F0 {
+            let rd = ((bits >> 8) & 0xF) as u8;
+            let rn = (top & 0xF) as u8;
+            let rm = (bits & 0xF) as u8;
+            return if (top & 0xFFF0) == 0xFB90 {
+                Instruction::Sdiv { rd, rn, rm }
+            } else {
+                Instruction::Udiv { rd, rn, rm }
+            };
+        }
+        // UMULL/SMULL/SMLAL/UMLAL（FRT-INS-05 SHOULD，-O2 固件 64 位乘加）：
         // 编码（as 实测）：umull r0,r1,r2,r3=0xFBA2 0103 / smull=0xFB86 4507 /
-        // smlal=0xFBC2 0103——top 0xFBA0/0xFB80/0xFBC0 家族，低半字 bits[7:4]=0000。
+        // smlal=0xFBC2 0103 / umlal=0xFBE2 0103——top 0xFB80/0xFBA0/0xFBC0/0xFBE0
+        // 家族，低半字 bits[7:4]=0000。
         // 与 SMLALD/SMLSLD（低半字 bits[7:6]=11）及 SMUAD（0xFB20/0xFB40）互斥。
-        if matches!(top & 0xFFF0, 0xFBA0 | 0xFB80 | 0xFBC0) && (bits & 0x00F0) == 0 {
+        // signed：SMULL/SMLAL（bit5=0）；accumulate：SMLAL/UMLAL（bit6=1）。
+        // 家族判别：bit5 定符号、bit6 定累加；SDIV/UDIV（0xFB90/0xFBB0，bit4=1）
+        // 与 SMLALD 族（低半字 bits[7:4]≠0）均被排除。
+        if (top & 0xFF90) == 0xFB80 && (bits & 0x00F0) == 0 {
             let rdlo = ((bits >> 12) & 0xF) as u8;
             let rdhi = ((bits >> 8) & 0xF) as u8;
             let rn = (top & 0xF) as u8;
             let rm = (bits & 0xF) as u8;
-            let signed = (top & 0xFFF0) == 0xFB80;
-            let accumulate = (top & 0xFFF0) == 0xFBC0;
+            let signed = (top & 0x0020) == 0;
+            let accumulate = (top & 0x0040) != 0;
             return Instruction::MullLong {
                 rdlo,
                 rdhi,
@@ -915,7 +993,8 @@ impl Decoder {
                 rm,
                 kind,
                 amount: ShiftAmount::Register(rs),
-                flags: false,
+                // S 位 = top bit4：LSLS.W 等须更新 N/Z/C（对拍 unicorn 发现旧实现恒 false）
+                flags: (top >> 4) & 1 == 1,
             };
         }
         // CLZ（0xFAB0，FRT-INS-04）：编码（as 实测）clz r0,r1=0xFAB1 F081——
@@ -932,6 +1011,42 @@ impl Decoder {
             return Instruction::Rbit {
                 rd: ((bits >> 8) & 0xF) as u8,
                 rm: (bits & 0xF) as u8,
+            };
+        }
+        // REV/REV16/REVSH 32 位（0xFA90，QEMU/capstone 实测 op 映射：
+        // 低半字 1111 Rd 10 op Rm，op: 00=REV、01=REV16、11=REVSH；op=10 为 RBIT 见上）
+        if (top & 0xFFF0) == 0xFA90 && (bits & 0xF0C0) == 0xF080 {
+            let kind = match (bits >> 4) & 0x3 {
+                0 => RevKind::Rev,
+                1 => RevKind::Rev16,
+                2 => return Instruction::Rbit {
+                    rd: ((bits >> 8) & 0xF) as u8,
+                    rm: (bits & 0xF) as u8,
+                },
+                _ => RevKind::RevSh,
+            };
+            return Instruction::Rev {
+                rd: ((bits >> 8) & 0xF) as u8,
+                rm: (bits & 0xF) as u8,
+                kind,
+            };
+        }
+
+        // SXTH/SXTB/UXTH/UXTB.W 带旋转（0xFA0F/0xFA1F/0xFA4F/0xFA5F，QEMU/capstone 实测）：
+        // 1111 1010 0 b s 1111 / 1111 Rd 10 rot Rm——b=字节(1)/半字(0)、s=无符号(1)/有符号(0)、
+        // rot = Rm 先右旋的字节数（0-3）。与寄存器移位块由低半字 bits[7:6]=10 互斥。
+        if (top & 0xFFAF) == 0xFA0F && (bits & 0xF0C0) == 0xF080 {
+            let kind = match ((top >> 6) & 1, (top >> 4) & 1) {
+                (0, 0) => ExtendKind::Sxth,
+                (0, _) => ExtendKind::Uxth,
+                (_, 0) => ExtendKind::Sxtb,
+                _ => ExtendKind::Uxtb,
+            };
+            return Instruction::Extend {
+                rd: ((bits >> 8) & 0xF) as u8,
+                rm: (bits & 0xF) as u8,
+                kind,
+                rotate: ((bits >> 4) & 0x3) as u8,
             };
         }
 
@@ -1004,6 +1119,43 @@ impl Decoder {
         // 3=ORN/MVN(rn=15)、4=EOR/TEQ(rd=15)、8=ADD/CMN(rd=15)、A=ADC、B=SBC、
         // D=SUB/CMP(rd=15)、E=RSB。仅 EOR/TEQ 等 rd=15 与 S 语义按 M-profile 区分。
         // 位布局：11101 0 1 op4 S Rn | 0 imm3 Rd imm2 Rm（arm-none-eabi-as 实测）。
+        // 32 位移位立即数（MOV.W/LSL/LSR/ASR/ROR/RRX，0xEA4F/0xEA5F）：
+        // 1110101001 0 S 1111 | 0 imm3 Rd imm2 typ Rm（typ: 00=LSL、01=LSR、10=ASR、
+        // 11=ROR；LSL imm5=0 为 MOV.W 别名，LSR/ASR imm5=0 表示 #32，ROR imm5=0 为 RRX）。
+        // 须先于 0xEA00 通用数据处理块（该块按 op4/rn 查表，不认 typ 字段）
+        if (top & 0xFFEF) == 0xEA4F && (bits & 0x8000) == 0 {
+            let s = (top >> 4) & 1 == 1;
+            let rd = ((bits >> 8) & 0xF) as u8;
+            let rm = (bits & 0xF) as u8;
+            let imm5 = ((((bits >> 12) & 0x7) << 2) | ((bits >> 6) & 0x3)) as u8;
+            let typ = ((bits >> 4) & 0x3) as u8;
+            if rd == 0xF {
+                // 移位写 PC（MOVS.W pc 等）为 UNPREDICTABLE → 诚实 Unimplemented
+                return Instruction::Unimplemented { bits };
+            }
+            let shift = |kind, n| Instruction::Shift {
+                rd,
+                rm,
+                kind,
+                amount: ShiftAmount::Immediate(n),
+                flags: s,
+            };
+            return match (typ, imm5) {
+                (0, 0) => Instruction::Mov {
+                    rd,
+                    rm,
+                    imm: None,
+                    flags: s,
+                },
+                (0, n) => shift(ShiftKind::Lsl, n),
+                (1, 0) => shift(ShiftKind::Lsr, 32),
+                (1, n) => shift(ShiftKind::Lsr, n),
+                (2, 0) => shift(ShiftKind::Asr, 32),
+                (2, n) => shift(ShiftKind::Asr, n),
+                (3, 0) => shift(ShiftKind::Rrx, 0),
+                (_, n) => shift(ShiftKind::Ror, n),
+            };
+        }
         // 覆盖 FreeRTOS 固件刚需：add.w/sub.w/orr.w/bic.w/tst.w/adc.w/mvn.w（寄存器形式）。
         if (top & 0xFE00) == 0xEA00 && (bits & 0x8000) == 0 {
             return self.decode_data_proc_reg(bits);
@@ -1212,8 +1364,12 @@ impl Decoder {
                 });
             }
             // 寄存器偏移：rm = bits[3:0]，bits[5:4] 为 LSL#n 移位量（as 实测：
-            // ldr.w r3,[r1,r0,lsl #2]=0xF851 3020，imm2=bits[5:4]=0b10）
+            // ldr.w r3,[r1,r0,lsl #2]=0xF851 3020，imm2=bits[5:4]=0b10）。
+            // T2 形式要求 bits[11:6]=0，否则 QEMU 判非法 → 同步拒绝（双方拒绝=一致）
             0 => {
+                if (bits & 0x0FC0) != 0 {
+                    return None;
+                }
                 let rm = (bits & 0xF) as u8;
                 let lsl = (bits >> 4) & 0x3; // bits[5:4] 移位量 0-3
                 let offset = if lsl == 0 {
@@ -1347,11 +1503,11 @@ impl Decoder {
         Instruction::MsrMrs { rt: rn, reg, read: false }
     }
 
-    /// 解码 SSAT/USAT（0xF30x 有符号 / 0xF38x 无符号）
+    /// 解码 SSAT/USAT（0xF30x/0xF32x 有符号 / 0xF38x/0xF3Ax 无符号）
     fn decode_sat(&self, bits: u32) -> Instruction {
         let top = (bits >> 16) as u16;
         let signed = (top & 0x80) == 0; // bit23: 0=SSAT, 1=USAT
-        let sh = (top & 0x20) != 0; // bit21: 0=LSL, 1=ASR(SSAT)/LSR(USAT)
+        let sh = (top & 0x20) != 0; // bit21: 0=LSL, 1=ASR(SSAT/USAT 均算术右移，QEMU 实测)
         let rn = (top & 0xF) as u8;
         let rd = ((bits >> 8) & 0xF) as u8;
         // imm5: bits{14,13,12} = imm5[4:2]，bits{7,6} = imm5[1:0]
@@ -1480,13 +1636,28 @@ impl Decoder {
         }
     }
 
-    /// 解码 MLA/MLS
-    fn decode_mla(&self, bits: u32) -> Instruction {
+    /// 解码 MLA/MLS/MUL（0xFB00/0xFB10 家族）
+    fn decode_mla(&self, bits: u32, pc: u32) -> Instruction {
         let rn = (bits >> 16) & 0xF;
         let ra = ((bits >> 12) & 0xF) as u8;
         let rd = ((bits >> 8) & 0xF) as u8;
         let rm = (bits & 0xF) as u8;
+        // 低半字 bit4 区分 MLA（0）/MLS（1）（QEMU/capstone 实测编码布局）
         let sub = (bits & 0x10) != 0;
+        if ra == 0xF {
+            // Ra=1111：MLA 退化为 MUL（32 位 MUL 不更新标志）；
+            // MLS 无此形式（ARMv7-M UNPREDICTABLE），拒绝解码
+            return if sub {
+                Instruction::Invalid { address: pc }
+            } else {
+                Instruction::Mul {
+                    rd,
+                    rn: rn as u8,
+                    rm,
+                    flags: false,
+                }
+            };
+        }
         Instruction::Mla {
             rd: rd as u8,
             rn: rn as u8,
@@ -1517,7 +1688,8 @@ impl Decoder {
     ///   ubfx r0,r1,#3,#5 = 0xF3C1 00C4；sbfx = 0xF341 00C4；bfi = 0xF361 00C7；bfc = 0xF36F 00C7
     /// UBFX/SBFX：lsb = imm3:imm2（bits[14:12]:bits[7:6]），width = widthm1(bits[4:0])+1
     /// BFI/BFC：bits[4:0] = msb，lsb = imm3:imm2，width = msb-lsb+1；BFC 的 Rn=1111
-    fn decode_bitfield(&self, bits: u32) -> Instruction {
+    /// （msb < lsb 为 UNPREDICTABLE；QEMU 拒绝执行 → 同步返回 Invalid，与参考一致）
+    fn decode_bitfield(&self, bits: u32, pc: u32) -> Instruction {
         let top = (bits >> 16) as u16;
         let imm3 = ((bits >> 12) & 0x7) as u8;
         let rd = ((bits >> 8) & 0xF) as u8;
@@ -1552,6 +1724,10 @@ impl Decoder {
             _ => {
                 let msb = (bits & 0x1F) as u8;
                 let lsb = (imm3 << 2) | imm2;
+                if msb < lsb {
+                    // UNPREDICTABLE 编码（QEMU 同样拒绝）；不得减法下溢
+                    return Instruction::Invalid { address: pc };
+                }
                 let width = msb - lsb + 1;
                 let kind = if rn == 0xF {
                     BitFieldKind::Bfc
@@ -2125,8 +2301,13 @@ impl Decoder {
                 offset,
                 width: AccessWidth::Byte,
             },
-            // 111: 保留（UNDEF）→ 诚实 Invalid
-            _ => Instruction::Invalid { address: 0 },
+            // 111: LDRSH（有符号半字加载）
+            _ => Instruction::LdrSignExtend {
+                rt,
+                rn,
+                offset,
+                width: AccessWidth::HalfWord,
+            },
         }
     }
 
@@ -2302,15 +2483,17 @@ impl Decoder {
                 0x5 => Instruction::Adc {
                     rd,
                     rn: rd,
-                    rm,
+                    rm: Some(rm),
                     flags: true,
+                    imm: None,
                 },
                 // 0110 SBCS Rd, Rd, Rm
                 0x6 => Instruction::Sbc {
                     rd,
                     rn: rd,
-                    rm,
+                    rm: Some(rm),
                     flags: true,
+                    imm: None,
                 },
                 // 0111 RORS Rd, Rd, Rs
                 0x7 => Instruction::Shift {
@@ -2352,12 +2535,12 @@ impl Decoder {
                     imm: None,
                     flags: true,
                 },
-                // 1101 MULS Rd, Rm, Rd（ARMv7E-M：不更新 flags）
+                // 1101 MULS Rd, Rm, Rd（IT 块外更新 N/Z；C/V 保持）
                 0xD => Instruction::Mul {
                     rd,
                     rn: rd,
                     rm,
-                    flags: false,
+                    flags: true,
                 },
                 // 1110 BICS Rd, Rd, Rm
                 0xE => Instruction::Bic {
@@ -2493,7 +2676,12 @@ impl Decoder {
                     2 => ExtendKind::Uxth,
                     _ => ExtendKind::Uxtb,
                 };
-                Instruction::Extend { rd, rm, kind }
+                Instruction::Extend {
+                    rd,
+                    rm,
+                    kind,
+                    rotate: 0,
+                }
             }
             // PUSH {regs}（bit8=0）/ PUSH {regs, lr}（bit8=1）
             4 => Instruction::Push {
@@ -2792,7 +2980,7 @@ impl Decoder {
     ///
     /// op4：0=AND、1=BIC、2=ORR（Rn=1111 → MOV）、3=ORN（Rn=1111 → MVN）、
     /// 4=EOR、8=ADD、B=SUB、D=CMP、E=CMN；其余（ADC/SBC/TEQ/RSB 等）未建模。
-    fn decode_data_proc_imm(&self, bits: u32) -> Instruction {
+    fn decode_data_proc_imm(&mut self, bits: u32) -> Instruction {
         let top = (bits >> 16) as u16;
         let i = ((top >> 10) & 1) as u32;
         let op4 = ((top >> 5) & 0xF) as u8;
@@ -2802,7 +2990,8 @@ impl Decoder {
         let rd = ((bits >> 8) & 0xF) as u8;
         let imm8 = bits & 0xFF;
         let imm12 = (i << 11) | (imm3 << 8) | imm8;
-        let imm = Self::thumb_expand_imm(imm12);
+        let (imm, carry) = Self::thumb_expand_imm(imm12);
+        self.expand_carry = carry;
         match op4 {
             // AND/ANDS；Rd=1111 → TST（只更新标志，不写 PC）
             0x0 if rd == 0xF => Instruction::Tst {
@@ -2854,8 +3043,14 @@ impl Decoder {
                 imm: Some(imm),
                 flags: s,
             },
-            // ORN imm 无指令变体 → 诚实 Unimplemented（固件暴露后补）
-            0x3 => Instruction::Unimplemented { bits },
+            // ORN imm：Rd = Rn | ~imm
+            0x3 => Instruction::Orn {
+                rd,
+                rn,
+                rm: None,
+                imm: Some(imm),
+                flags: s,
+            },
             // EOR/EORS；Rd=1111 → TEQ（只更新标志，不写 PC）
             0x4 if rd == 0xF => Instruction::Teq {
                 rn,
@@ -2907,8 +3102,21 @@ impl Decoder {
                 imm: Some(imm),
                 flags: s,
             },
-            // 其余（ADC/SBC/ORN/MVN 等）无 imm 变体 → 诚实 Unimplemented
-            // 0xA=ADC、0xB=SBC（汇编实测 0xF143/0xF163）
+            // ADC/SBC imm（0xA/0xB，汇编实测 0xF143/0xF163）
+            0xA => Instruction::Adc {
+                rd,
+                rn,
+                rm: None,
+                flags: s,
+                imm: Some(imm),
+            },
+            0xB => Instruction::Sbc {
+                rd,
+                rn,
+                rm: None,
+                flags: s,
+                imm: Some(imm),
+            },
             _ => Instruction::Unimplemented { bits },
         }
     }
@@ -3005,8 +3213,14 @@ impl Decoder {
             // MVN.W r15,Rm（Rd=1111）为 UNPREDICTABLE → 诚实 Unimplemented（不静默写 PC）
             0x3 if rn == 0xF && rd == 0xF => Instruction::Unimplemented { bits },
             0x3 if rn == 0xF => Instruction::Mvn { rd, rm, imm: None, flags: s },
-            // ORN 无指令变体 → 诚实 Unimplemented（固件暴露后补）
-            0x3 => Instruction::Unimplemented { bits },
+            // ORN：Rd = Rn | ~Rm
+            0x3 => Instruction::Orn {
+                rd,
+                rn,
+                rm: Some(rm),
+                imm: None,
+                flags: s,
+            },
             // EOR/EORS；Rd=1111 → TEQ
             0x4 if rd == 0xF => Instruction::Teq {
                 rn,
@@ -3039,15 +3253,17 @@ impl Decoder {
             0xA => Instruction::Adc {
                 rd,
                 rn,
-                rm,
+                rm: Some(rm),
                 flags: s,
+                imm: None,
             },
             // SBC/SBCS
             0xB => Instruction::Sbc {
                 rd,
                 rn,
-                rm,
+                rm: Some(rm),
                 flags: s,
+                imm: None,
             },
             // SUB/SUBS；Rd=1111 → CMP
             0xD if rd == 0xF => Instruction::Cmp {
@@ -3083,7 +3299,8 @@ impl Decoder {
     /// - bits[11:8]=2: 0xXX00XX00
     /// - bits[11:8]=3: 0xXXXXXXXX
     /// - 其余: ROR(imm8|0x80, bits[11:7])
-    fn thumb_expand_imm(imm12: u32) -> u32 {
+    /// 返回 (展开值, 移位器进位)：仅旋转形式（rot≠0）产生 Some(bit31)，其余 C 保持
+    fn thumb_expand_imm(imm12: u32) -> (u32, Option<bool>) {
         let imm8 = imm12 & 0xFF;
         let mode = (imm12 >> 8) & 0xF;
         let rot = if imm12 & 0xC00 != 0 {
@@ -3099,9 +3316,10 @@ impl Decoder {
             _ => imm8 | 0x80,
         };
         if rot != 0 {
-            imm.rotate_right(rot)
+            let v = imm.rotate_right(rot);
+            (v, Some(v >> 31 != 0))
         } else {
-            imm
+            (imm, None)
         }
     }
 }
@@ -3922,14 +4140,14 @@ fn decode_bl_targets() {
 #[test]
 fn thumb_expand_imm_verified() {
     // mov.w r2, #115200 = f44f 32e1 → imm12 = 0xBE1
-    assert_eq!(Decoder::thumb_expand_imm(0xBE1), 115200);
+    assert_eq!(Decoder::thumb_expand_imm(0xBE1).0, 115200);
     // mov.w r0, #0xA5A5A5A5 = f04f 30a5 → imm12 = 0x3A5
-    assert_eq!(Decoder::thumb_expand_imm(0x3A5), 0xA5A5_A5A5);
+    assert_eq!(Decoder::thumb_expand_imm(0x3A5).0, 0xA5A5_A5A5);
     // mov.w r0, #0xFF00FF00 = f04f 20ff → imm12 = 0x2FF
-    assert_eq!(Decoder::thumb_expand_imm(0x2FF), 0xFF00_FF00);
+    assert_eq!(Decoder::thumb_expand_imm(0x2FF).0, 0xFF00_FF00);
     // mov.w r0, #1 = f04f 0001 → imm12 = 0x001
-    assert_eq!(Decoder::thumb_expand_imm(0x001), 1);
-    assert_eq!(Decoder::thumb_expand_imm(0x000), 0);
+    assert_eq!(Decoder::thumb_expand_imm(0x001).0, 1);
+    assert_eq!(Decoder::thumb_expand_imm(0x000).0, 0);
 }
 
 /// 32-bit 数据处理（修改立即数）：MOV.W / AND.W / CMP.W
@@ -4072,8 +4290,9 @@ fn decode_data_proc_reg_16ops() {
         Instruction::Adc {
             rd: 2,
             rn: 2,
-            rm: 3,
+            rm: Some(3),
             flags: true,
+            imm: None,
         }
     );
     // 0110 SBCS r2, r3（0x419A）
@@ -4082,8 +4301,9 @@ fn decode_data_proc_reg_16ops() {
         Instruction::Sbc {
             rd: 2,
             rn: 2,
-            rm: 3,
+            rm: Some(3),
             flags: true,
+            imm: None,
         }
     );
     // 0111 RORS r2, r5（0x41EA）
@@ -4144,14 +4364,14 @@ fn decode_data_proc_reg_16ops() {
             flags: true,
         }
     );
-    // 1101 MULS r2, r3（0x435A：ARMv7E-M 不更新 flags）
+    // 1101 MULS r2, r3（0x435A：IT 块外更新 N/Z，C/V 保持）
     assert_eq!(
         d.decode_halfword(0x435A, 0),
         Instruction::Mul {
             rd: 2,
             rn: 2,
             rm: 3,
-            flags: false,
+            flags: true,
         }
     );
     // 1110 BICS r2, r3（0x439A）
@@ -4739,8 +4959,9 @@ fn decode_data_proc_reg_32bit_wip() {
         Instruction::Adc {
             rd: 6,
             rn: 7,
-            rm: 8,
+            rm: Some(8),
             flags: false,
+            imm: None,
         }
     );
     // sbc.w r9, r10, r11（sl/fp 即 r10/r11）
@@ -4749,8 +4970,9 @@ fn decode_data_proc_reg_32bit_wip() {
         Instruction::Sbc {
             rd: 9,
             rn: 10,
-            rm: 11,
+            rm: Some(11),
             flags: false,
+            imm: None,
         }
     );
     // mvn.w r0, r1（rn=15 → MVN）
@@ -4807,11 +5029,17 @@ fn decode_data_proc_reg_32bit_wip() {
             flags: false,
         }
     );
-    // orn r0, r1, r2（无指令变体 → 诚实 Unimplemented）
-    assert!(matches!(
+    // orn r0, r1, r2（op4=0x3 且 rn≠15 → ORN；rn=15 才是 MVN）
+    assert_eq!(
         d.decode_word(0xEA61_0002, 0),
-        Instruction::Unimplemented { .. }
-    ));
+        Instruction::Orn {
+            rd: 0,
+            rn: 1,
+            rm: Some(2),
+            imm: None,
+            flags: false,
+        }
+    );
 }
 
 /// RSB 立即数形式：rsb r3, r0, #1 = 0xF1C0 0301（op4=0xE）
@@ -4968,6 +5196,7 @@ fn decode_extend_16bit() {
             rd: 2,
             rm: 3,
             kind: ExtendKind::Sxth,
+            rotate: 0,
         }
     );
     assert_eq!(
@@ -4976,6 +5205,7 @@ fn decode_extend_16bit() {
             rd: 2,
             rm: 3,
             kind: ExtendKind::Sxtb,
+            rotate: 0,
         }
     );
     assert_eq!(
@@ -4984,6 +5214,7 @@ fn decode_extend_16bit() {
             rd: 2,
             rm: 3,
             kind: ExtendKind::Uxth,
+            rotate: 0,
         }
     );
     assert_eq!(
@@ -4992,6 +5223,7 @@ fn decode_extend_16bit() {
             rd: 2,
             rm: 3,
             kind: ExtendKind::Uxtb,
+            rotate: 0,
         }
     );
 }
@@ -5203,4 +5435,5 @@ fn decode_vldr_vstr_large_offset() {
     );
 }
 }
+
 

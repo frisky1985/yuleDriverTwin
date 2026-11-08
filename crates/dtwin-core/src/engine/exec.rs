@@ -52,6 +52,9 @@ pub struct Executor {
     pub cur_is_16bit: bool,
     /// 本指令是否应抑制标志更新（IT 块内 16 位隐式 S 指令）
     it_suppress_flags: bool,
+    /// 本指令的修改立即数移位器进位（32 位 ThumbExpandImm_C；None = C 保持，
+    /// 由引擎在解码后、执行前写入）
+    pub cur_expand_carry: Option<bool>,
 }
 
 impl Default for Executor {
@@ -66,6 +69,7 @@ impl Default for Executor {
             it_was_active: false,
             cur_is_16bit: false,
             it_suppress_flags: false,
+            cur_expand_carry: None,
         }
     }
 }
@@ -176,6 +180,8 @@ impl Executor {
                 if *flags {
                     // 16 位 MOVS 形式：更新 N/Z
                     self.update_flags_logical(cpu, val);
+                    // 32 位 MOVS.W 修改立即数形式：C = 移位器进位
+                    self.apply_expand_carry(cpu);
                 }
                 cpu.regs[*rd as usize] = val;
                 ExecOutcome::Continue
@@ -301,6 +307,7 @@ impl Executor {
                 let result = cpu.regs[*rn as usize] & b;
                 if *flags {
                     self.update_flags_logical(cpu, result);
+                    self.apply_expand_carry(cpu);
                 }
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
@@ -320,6 +327,7 @@ impl Executor {
                 let result = cpu.regs[*rn as usize] | b;
                 if *flags {
                     self.update_flags_logical(cpu, result);
+                    self.apply_expand_carry(cpu);
                 }
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
@@ -339,6 +347,7 @@ impl Executor {
                 let result = cpu.regs[*rn as usize] ^ b;
                 if *flags {
                     self.update_flags_logical(cpu, result);
+                    self.apply_expand_carry(cpu);
                 }
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
@@ -358,6 +367,27 @@ impl Executor {
                 let result = cpu.regs[*rn as usize] & !b;
                 if *flags {
                     self.update_flags_logical(cpu, result);
+                    self.apply_expand_carry(cpu);
+                }
+                cpu.regs[*rd as usize] = result;
+                ExecOutcome::Continue
+            }
+            Instruction::Orn {
+                rd,
+                rn,
+                rm,
+                imm,
+                flags,
+            } => {
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
+                let result = cpu.regs[*rn as usize] | !b;
+                if *flags {
+                    self.update_flags_logical(cpu, result);
+                    self.apply_expand_carry(cpu);
                 }
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
@@ -367,9 +397,14 @@ impl Executor {
                 rn,
                 rm,
                 flags,
+                imm,
             } => {
                 let a = cpu.regs[*rn as usize];
-                let b = cpu.regs[*rm as usize];
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
                 let cin = (cpu.xpsr >> 29) & 1; // APSR.C
                 // 33 位扩展精度：ext = a + b + C（精确值 0..2^33）
                 let ext = (a as u64) + (b as u64) + (cin as u64);
@@ -386,9 +421,14 @@ impl Executor {
                 rn,
                 rm,
                 flags,
+                imm,
             } => {
                 let a = cpu.regs[*rn as usize];
-                let b = cpu.regs[*rm as usize];
+                let b = match (rm, imm) {
+                    (Some(r), _) => cpu.regs[*r as usize],
+                    (_, Some(v)) => *v,
+                    _ => 0,
+                };
                 let cin = (cpu.xpsr >> 29) & 1; // APSR.C
                 let notc = 1 - cin; // SBC = a - b - NOT(C)
                 // 扩展精度有符号结果（a/b 符号扩展到 i64，V 判定需符号语义）
@@ -460,6 +500,7 @@ impl Executor {
                 let result = !src;
                 if *flags {
                     self.update_flags_logical(cpu, result);
+                    self.apply_expand_carry(cpu);
                 }
                 cpu.regs[*rd as usize] = result;
                 ExecOutcome::Continue
@@ -514,7 +555,8 @@ impl Executor {
                 cpu.regs[*rd as usize] = if divisor == 0 {
                     0
                 } else {
-                    (cpu.regs[*rn as usize] as i32 / divisor) as u32
+                    // i32::MIN / -1 在 ARM 上回绕为 0x80000000，Rust 原生 `/` 会 panic
+                    (cpu.regs[*rn as usize] as i32).wrapping_div(divisor) as u32
                 };
                 ExecOutcome::Continue
             }
@@ -537,17 +579,19 @@ impl Executor {
                     // P3-1（codex 检视）：IT 块内 16 位隐式 S 移位指令不更新任何标志（ARMv7-M
                     // B1.5.10）——C 更新同样须入守卫，否则 C 标志泄漏（旧实现只抑制 N/Z）。
                     if !self.it_suppress_flags {
-                        // 移位指令更新 C 标志 = 最后移出位（P1-6 修复）
+                        // 移位指令更新 C 标志 = 最后移出位；移位量为 0 时 C 保持（None）
                         let c = match amount {
                             ShiftAmount::Immediate(n) => self.shift_carry(val, *kind, *n),
                             ShiftAmount::Register(r) => {
                                 self.shift_carry(val, *kind, (cpu.regs[*r as usize] & 0xFF) as u8)
                             }
                         };
-                        if c {
-                            cpu.xpsr |= 1 << 29;
-                        } else {
-                            cpu.xpsr &= !(1 << 29);
+                        if let Some(c) = c {
+                            if c {
+                                cpu.xpsr |= 1 << 29;
+                            } else {
+                                cpu.xpsr &= !(1 << 29);
+                            }
                         }
                     }
                 }
@@ -585,6 +629,7 @@ impl Executor {
                 };
                 let result = a & b;
                 self.update_flags_logical(cpu, result);
+                self.apply_expand_carry(cpu);
                 ExecOutcome::Continue
             }
             Instruction::Teq { rn, rm, imm } => {
@@ -596,6 +641,7 @@ impl Executor {
                 };
                 let result = a ^ b;
                 self.update_flags_logical(cpu, result);
+                self.apply_expand_carry(cpu);
                 ExecOutcome::Continue
             }
             Instruction::Branch { cond, target } => {
@@ -1124,8 +1170,14 @@ impl Executor {
                 ExecOutcome::Continue
             }
             // SXTH/SXTB/UXTH/UXTB（16 位 T1，FRT-INS-05）：符号/零扩展
-            Instruction::Extend { rd, rm, kind } => {
-                let v = cpu.regs[*rm as usize];
+            Instruction::Extend {
+                rd,
+                rm,
+                kind,
+                rotate,
+            } => {
+                // 32 位带旋转形式先对 Rm 右旋 rotate*8 位（16 位 T1 rotate 恒 0）
+                let v = cpu.regs[*rm as usize].rotate_right((*rotate as u32) * 8);
                 let r = match kind {
                     // SXTH：低半字符号扩展到 32 位
                     ExtendKind::Sxth => (v & 0xFFFF) as u16 as i16 as i32 as u32,
@@ -1251,6 +1303,36 @@ impl Executor {
             }
 
             // ================= Phase 3: DSP =================
+            Instruction::Sat16 {
+                rd,
+                rn,
+                sat_imm,
+                signed,
+            } => {
+                // 两个半字独立饱和（QEMU 实测：位宽字段 bits[5:0]，0-63；
+                // n≥16 时有符号恒等 / 无符号仅负数钳 0）
+                let v = cpu.regs[*rn as usize];
+                let n = *sat_imm as i64;
+                let (min, max) = if *signed {
+                    (-(1i64 << n.min(16)), (1i64 << n.min(16)) - 1)
+                } else {
+                    (0, (1i64 << n.min(16)) - 1)
+                };
+                let mut result = 0u32;
+                let mut sat = false;
+                for i in 0..2 {
+                    let h = ((v >> (i * 16)) & 0xFFFF) as u16 as i16 as i64;
+                    let c = h.clamp(min, max);
+                    sat |= c != h;
+                    result |= ((c as u64 as u32) & 0xFFFF) << (i * 16);
+                }
+                if sat {
+                    self.set_q(cpu);
+                }
+                cpu.regs[*rd as usize] = result;
+                ExecOutcome::Continue
+            }
+
             Instruction::Sat {
                 rd,
                 rn,
@@ -2038,43 +2120,55 @@ impl Executor {
         }
     }
 
-    /// 移位计算 C 标志（最后移出位）
-    /// 与 shift_val 同语义约定：立即数 LSR/ASR #0 → #32；n>=32 按移满处理。
-    fn shift_carry(&self, val: u32, kind: ShiftKind, n: u8) -> bool {
+    /// 移位计算 C 标志（最后移出位）；返回 `None` 表示本条移位不改变 C
+    /// （ARMv7-M：寄存器移位量低字节为 0 时 C 保持，含 LSL/LSR/ASR/ROR）；
+    /// 与 shift_val 同语义约定：立即数 LSR/ASR #0 → #32；n>32 按移满处理。
+    fn shift_carry(&self, val: u32, kind: ShiftKind, n: u8) -> Option<bool> {
         match kind {
             ShiftKind::Lsl => {
-                if n >= 32 || n == 0 {
-                    false
+                if n == 0 {
+                    None
+                } else if n <= 32 {
+                    // n=32 时移出 bit0
+                    Some((val >> (32 - n)) & 1 != 0)
                 } else {
-                    (val >> (32 - n)) & 1 != 0
+                    Some(false)
                 }
             }
             ShiftKind::Lsr => {
-                if n >= 32 {
-                    (val >> 31) & 1 != 0
-                } else if n == 0 {
-                    false
+                if n == 0 {
+                    None
+                } else if n < 32 {
+                    Some((val >> (n - 1)) & 1 != 0)
+                } else if n == 32 {
+                    Some((val >> 31) & 1 != 0)
                 } else {
-                    (val >> (n - 1)) & 1 != 0
+                    Some(false)
                 }
             }
             ShiftKind::Asr => {
-                if n >= 32 {
-                    (val >> 31) & 1 != 0
-                } else if n == 0 {
-                    false
+                if n == 0 {
+                    None
+                } else if n < 32 {
+                    Some((val >> (n - 1)) & 1 != 0)
                 } else {
-                    (val >> (n - 1)) & 1 != 0
+                    Some((val >> 31) & 1 != 0)
                 }
             }
             ShiftKind::Ror => {
                 if n == 0 {
-                    false
+                    None
                 } else {
-                    (val >> ((n & 0x1F) - 1)) & 1 != 0
+                    let rot = n & 0x1F;
+                    if rot == 0 {
+                        // n 为 32 的倍数：结果不变，C = bit31
+                        Some((val >> 31) & 1 != 0)
+                    } else {
+                        Some((val >> (rot - 1)) & 1 != 0)
+                    }
                 }
             }
-            ShiftKind::Rrx => val & 1 != 0,
+            ShiftKind::Rrx => Some(val & 1 != 0),
         }
     }
 
@@ -2109,6 +2203,7 @@ impl Executor {
                 | Instruction::Bic { flags: true, .. }
                 | Instruction::Mvn { flags: true, .. }
                 | Instruction::Neg { flags: true, .. }
+                | Instruction::Mul { flags: true, .. }
                 | Instruction::Shift { flags: true, .. }
                 | Instruction::Rsb { flags: true, .. }
                 | Instruction::Adc { flags: true, .. }
@@ -2130,6 +2225,17 @@ impl Executor {
             cpu.xpsr |= 1 << 30; // Z
         } else {
             cpu.xpsr &= !(1 << 30);
+        }
+    }
+
+    /// 32 位修改立即数逻辑指令的 C 标志（ThumbExpandImm 移位器进位；None = C 保持）
+    fn apply_expand_carry(&self, cpu: &mut CpuState) {
+        if let Some(c) = self.cur_expand_carry {
+            if c {
+                cpu.xpsr |= 1 << 29;
+            } else {
+                cpu.xpsr &= !(1 << 29);
+            }
         }
     }
 
@@ -2497,17 +2603,23 @@ mod tests {
         // MULS r2, r3 = 0x435A：0x12345678 * 0x10000 = 0x56780000（低 32 位）
         h.cpu.regs[2] = 0x1234_5678;
         h.cpu.regs[3] = 0x0001_0000;
-        h.cpu.xpsr = 0;
+        h.cpu.xpsr = 0b0011 << 28; // C=1 V=1：验证 MULS 保持 C/V
         h.exec_halfword(0x435A);
         assert_eq!(h.cpu.regs[2], 0x5678_0000);
-        assert_eq!(h.nzcv(), 0, "ARMv7E-M：MUL 不更新 flags");
-        // MUL 结果全 0 时 flags 仍不动
+        assert_eq!(h.nzcv(), 0b0011, "MULS：N=0 Z=0，C/V 保持");
+        // MUL 结果全 0 → Z=1；bit31=1 → N=1
         h.cpu.regs[2] = 0;
         h.cpu.regs[3] = 0xFFFF_FFFF;
         h.cpu.xpsr = 0;
         h.exec_halfword(0x435A);
         assert_eq!(h.cpu.regs[2], 0);
-        assert_eq!(h.nzcv(), 0, "MUL 0 结果也不写 flags");
+        assert_eq!(h.nzcv(), 0b0100, "MULS 0 结果 → Z=1");
+        h.cpu.regs[2] = 0x8000_0000;
+        h.cpu.regs[3] = 1;
+        h.cpu.xpsr = 0;
+        h.exec_halfword(0x435A);
+        assert_eq!(h.cpu.regs[2], 0x8000_0000);
+        assert_eq!(h.nzcv(), 0b1000, "MULS 负结果 → N=1");
     }
 
     #[test]

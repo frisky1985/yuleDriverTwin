@@ -30,12 +30,14 @@ impl Harness {
     /// 执行一条 32 位 Thumb-2 指令（编码已由汇编器验证）
     pub fn exec_word(&mut self, word: u32) -> ExecOutcome {
         let instr = self.decoder.decode_word(word, self.cpu.regs[15]);
+        self.executor.cur_expand_carry = self.decoder.expand_carry;
         self.executor.execute(&mut self.cpu, &mut self.mem, &instr)
     }
 
     /// 执行一条 16 位 Thumb 指令（编码已由汇编器验证）
     pub fn exec_halfword(&mut self, half: u16) -> ExecOutcome {
         let instr = self.decoder.decode_halfword(half, self.cpu.regs[15]);
+        self.executor.cur_expand_carry = self.decoder.expand_carry;
         self.executor.execute(&mut self.cpu, &mut self.mem, &instr)
     }
 
@@ -54,3 +56,4 @@ impl Harness {
         (self.cpu.xpsr >> 16) & 0xF
     }
 }
+

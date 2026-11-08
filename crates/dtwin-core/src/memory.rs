@@ -149,7 +149,9 @@ impl Memory {
             ccm: vec![0; 0x0001_0000],
             mpu_regions: Vec::new(),
             mpu_enabled: false,
-            unalign_trap: true,
+            // 对齐硬件复位默认（CCR.UNALIGN_TRP=0）：非对齐字/半字访问允许；
+            // 固件写 CCR.UNALIGN_TRP=1 后由 peripheral_write 直通置位
+            unalign_trap: false,
             watchpoints: Vec::new(),
             watchpoint_hit: None,
             flash_erase_required: true,
@@ -171,7 +173,7 @@ impl Memory {
             ccm: Vec::new(),
             mpu_regions: Vec::new(),
             mpu_enabled: false,
-            unalign_trap: true,
+            unalign_trap: false, // 同硬件复位默认（CCR.UNALIGN_TRP=0）
             watchpoints: Vec::new(),
             watchpoint_hit: None,
             flash_erase_required: true,
@@ -494,6 +496,12 @@ impl Memory {
             addr >= d.base_address() && addr < d.base_address().wrapping_add(d.window_size())
         }) {
             dev.write(addr, width, val);
+            // CCR.UNALIGN_TRP（bit3）直通 Memory 非对齐陷阱开关
+            if addr == 0xE000_ED14 {
+                if let Some(sb) = self.system_block_mut() {
+                    self.unalign_trap = sb.ccr_unalign_trap();
+                }
+            }
             true
         } else {
             false
@@ -556,14 +564,16 @@ mod tests {
     #[test]
     fn unaligned_detection() {
         let mut m = Memory::test_ram();
-        // word 非对齐 → UsageFault（UnalignedAccess）
+        // 复位默认（CCR.UNALIGN_TRP=0）：非对齐访问允许（Cortex-M 行为）
+        m.write_u32(0x2000_0002, 0x1122_3344).unwrap();
+        assert_eq!(m.read_u32(0x2000_0002).unwrap(), 0x1122_3344);
+        // 置位 UNALIGN_TRP 后：word/halfword 非对齐 → UnalignedAccess
+        m.unalign_trap = true;
         assert_eq!(m.read_u32(0x2000_0002), Err(MemoryFault::UnalignedAccess { address: 0x2000_0002 }));
         assert_eq!(m.write_u32(0x2000_0001, 0), Err(MemoryFault::UnalignedAccess { address: 0x2000_0001 }));
-        // halfword 非对齐 → 触发
         assert_eq!(m.read_u16(0x2000_0003), Err(MemoryFault::UnalignedAccess { address: 0x2000_0003 }));
-        // 关闭 UNALIGN_TRP 后允许（Cortex-M 行为）
+        // 再次关闭后恢复允许
         m.unalign_trap = false;
-        m.write_u32(0x2000_0002, 0x1122_3344).unwrap();
         assert_eq!(m.read_u32(0x2000_0002).unwrap(), 0x1122_3344);
     }
 

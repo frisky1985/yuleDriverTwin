@@ -408,6 +408,62 @@ mod tests {
     }
 
     #[test]
+    fn golden_ssat16_both_halfwords() {
+        // GIVEN: R1 = 0x7FFF_8001（hi=+32767，lo=-32767）
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x7FFF_8001;
+        // WHEN: SSAT16 R0, #12, R1（0xF321 000C，sat 字段 12 → ±4096）
+        assert_eq!(h.exec_word(0xF321_000C), ExecOutcome::Continue);
+        // THEN: hi 钳到 4095（0x0FFF），lo 钳到 -4096（0xF000），Q 置位（QEMU 实测）
+        assert_eq!(h.cpu.regs[0], 0x0FFF_F000);
+        assert!(h.q_flag());
+    }
+
+    #[test]
+    fn golden_usat16_negative_halfword_clamps() {
+        // GIVEN: R1 = 0x7FFF_8001
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x7FFF_8001;
+        // WHEN: USAT16 R0, #6, R1（0xF3A1 0006，sat 字段 6 → [0, 63]）
+        assert_eq!(h.exec_word(0xF3A1_0006), ExecOutcome::Continue);
+        // THEN: hi=+32767 钳到 63（0x003F_0000），lo 负值钳到 0（QEMU 实测）
+        assert_eq!(h.cpu.regs[0], 0x003F_0000);
+        assert!(h.q_flag());
+    }
+
+    #[test]
+    fn golden_smlal_signed_and_umlal_decode() {
+        // GIVEN: R1 = 0x85041C00（负）、R10 = 0x4962DDC8、[R2:R10] 累加初值
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x8504_1C00;
+        h.cpu.regs[10] = 0x4962_DDC8;
+        h.cpu.regs[2] = 0xF058_A28B;
+        // WHEN: SMLAL sl, r2, r1, sl（0xFBC1 A20A）——回归：SMLAL 必须按有符号乘
+        assert_eq!(h.exec_word(0xFBC1_A20A), ExecOutcome::Continue);
+        // THEN: [R2:R10] = 0xCD174F8E_78C4BDC8（unicorn 实测值）
+        assert_eq!(h.cpu.regs[10], 0x78C4_BDC8);
+        assert_eq!(h.cpu.regs[2], 0xCD17_4F8E);
+        // WHEN: UMLAL sl, r2, r1, sl（0xFBE1 A20A）——回归：0xFBE0 空间不得漏解码
+        h.cpu.regs[10] = 0x4962_DDC8;
+        h.cpu.regs[2] = 0xF058_A28B;
+        assert_eq!(h.exec_word(0xFBE1_A20A), ExecOutcome::Continue);
+        // THEN: 无符号乘 0x85041C00 × 0x4962DDC8 累加（unicorn 语义复核值）
+        assert_eq!(h.cpu.regs[10], 0x78C4_BDC8);
+        assert_eq!(h.cpu.regs[2], 0x167A_2D56);
+    }
+
+    #[test]
+    fn golden_orn_imm_and_adc_sbc_imm() {
+        // GIVEN: R1 = 0x0F0F_0F0F
+        let mut h = Harness::new();
+        h.cpu.regs[1] = 0x0F0F_0F0F;
+        // WHEN: ORN.W R0, R1, #0xFF（0xF061 00FF）→ R1 | ~0xFF
+        assert_eq!(h.exec_word(0xF061_00FF), ExecOutcome::Continue);
+        // THEN: 0x0F0F0F0F | ~0xFF = 0xFFFFFF0F
+        assert_eq!(h.cpu.regs[0], 0xFFFF_FF0F);
+    }
+
+    #[test]
     fn golden_usat_saturates() {
         // GIVEN: R1 = 600（超出 8 位无符号范围）
         let mut h = Harness::new();
@@ -718,6 +774,12 @@ mod tests {
         // WHEN: MLS R0, R1, R2, R3（0xFB01 3012）→ 100 − 42 = 58
         assert_eq!(h.exec_word(0xFB01_3012), ExecOutcome::Continue);
         assert_eq!(h.cpu.regs[0], 58);
+        // WHEN: MUL R0, R1, R2（0xFB01 F002，Ra=1111 退化形式）→ 42；
+        // 回归：不得按 MLA 读 Ra=PC 累加，且不更新标志
+        let xpsr_before = h.cpu.xpsr;
+        assert_eq!(h.exec_word(0xFB01_F002), ExecOutcome::Continue);
+        assert_eq!(h.cpu.regs[0], 42);
+        assert_eq!(h.cpu.xpsr, xpsr_before);
     }
 
     #[test]

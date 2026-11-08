@@ -94,6 +94,8 @@ impl Engine {
             self.executor.cur_is_16bit = true;
             self.decoder.decode_halfword(raw, pc)
         };
+        // 同步 32 位修改立即数的移位器进位（16 位解码恒为 None）
+        self.executor.cur_expand_carry = self.decoder.expand_carry;
 
         // 执行
         let outcome = self.executor.execute(cpu, mem, &instr);
