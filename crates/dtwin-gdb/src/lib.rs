@@ -2,8 +2,20 @@
 //!
 //! 兼容 arm-none-eabi-gdb 和 VS Code Cortex-Debug 插件。
 //! 默认监听 localhost:3333（端口可配置）。
+//!
+//! 已支持：
+//! - 核心寄存器 R0-R15 / CPSR（映射 Cortex-M xPSR）
+//! - 内存读写、软/硬件断点、硬件观察点
+//! - continue / step / Ctrl-C 中断
+//! - `monitor` 命令：reset / regs / fpu / stats
 
 #![deny(unsafe_code)]
+
+mod server;
+mod target;
+
+pub use server::{serve, serve_listener};
+pub use target::{describe_listener, DtwinTarget, RunEvent};
 
 /// GDB Server 配置
 #[derive(Debug, Clone)]
@@ -36,3 +48,19 @@ pub enum GdbServerState {
 
 /// 硬件断点（FPB 限制 6 个）
 pub const FPB_BREAKPOINT_MAX: usize = 6;
+
+/// 调试目标内部错误
+#[derive(Debug, thiserror::Error)]
+pub enum GdbTargetError {
+    #[error("调试目标内部错误: {0}")]
+    Internal(String),
+}
+
+/// GDB 会话错误
+#[derive(Debug, thiserror::Error)]
+pub enum GdbServerError {
+    #[error("GDB 监听/连接失败: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("GDB 会话失败: {0}")]
+    Stub(String),
+}

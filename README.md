@@ -21,10 +21,10 @@
 | **内存模型** | 标准 Cortex-M 映射 + MPU + Flash 擦写行为 + watchpoint + 非对齐检测 | ✅ |
 | **外设模型** | UART（CMSDK/LPUART0 双模型，TX 输出捕获）；GPIO/SPI/I2C/ADC 等 🚧 骨架 | 🚧 |
 | **NVIC 中断** | 优先级模型、中断挂起/使能、异常返回映射；嵌套/惰性压栈 🚧 骨架 | 🚧 |
-| **GDB 集成** | GDB RSP（localhost:3333）⬜ 未实现（dtwin-gdb crate 骨架） | ⬜ |
+| **GDB 集成** | GDB RSP（localhost:3333）：核心寄存器、内存读写、软/硬件断点、观察点、单步/继续、Ctrl-C、monitor 命令 ✅ | ✅ |
 | **芯片配置** | S32K312 profile（内存映射 + 10 外设基址）；STM32F407VG 待补 | ✅（S32K312） |
 | **固件加载** | ELF32 loader（armv7e-m 段映射/SP/PC 初始化） | ✅ |
-| **CLI** | `dtwin load/run/create/list-chips`，`--uart-model cmsdk\|lpuart0` | ✅ |
+| **CLI** | `dtwin load/run/debug/create/list-chips`，`--uart-model cmsdk\|lpuart0` | ✅ |
 | **E2E 验证** | 跑 yuleASR QEMU 固件，输出与 QEMU 黄金逐行一致（27/27 检查行） | ✅ |
 | **Web 界面 / CI/CD** | ⬜ 规划中 | ⬜ |
 | **测试框架** | Rust 单测（指令级 golden + 芯片级 E2E）；C 测试 API 🚧 未实现 | 🚧 |
@@ -39,8 +39,11 @@ dtwin create --chip STM32F407VG
 dtwin load firmware.elf
 dtwin run
 
-# 调试
-dtwin debug --gdb        # 或 arm-none-eabi-gdb → target remote localhost:3333
+# 调试（启动 GDB RSP 服务器，默认 127.0.0.1:3333）
+dtwin debug firmware.elf --chip S32K312 --port 3333
+# 另一个终端：
+arm-none-eabi-gdb firmware.elf -ex 'target remote 127.0.0.1:3333'
+# 支持 break / watch / step / continue / Ctrl-C，以及 monitor help|reset|regs|fpu|stats
 
 # 寄存器/内存操作
 dtwin reg read GPIOA MODER

@@ -33,6 +33,10 @@ pub enum EngineResult {
     DebugEvent,
     /// 达到指令数上限
     LimitReached,
+    /// 命中断点（执行前停止，PC 指向断点指令）
+    Breakpoint { pc: u32 },
+    /// 命中观察点（内存访问后停止）
+    Watchpoint { address: u32 },
 }
 
 /// 内核引擎
@@ -151,10 +155,40 @@ impl Engine {
 
     /// 全速运行直到达到指令上限或触发异常
     pub fn run(&mut self, cpu: &mut CpuState, mem: &mut Memory, nvic: &mut Nvic) -> EngineResult {
+        let max = self.max_instructions;
+        self.run_until(cpu, mem, nvic, &[], max)
+    }
+
+    /// 带断点/观察点与指令上限的运行循环。
+    ///
+    /// - `breakpoints`：命中断点时在**执行前**返回 `Breakpoint`，PC 保持指向断点指令；
+    /// - 观察点：命中 `Memory::watchpoints` 后在**执行后**返回 `Watchpoint`；
+    /// - `max_instructions`：本次调用的最大执行指令数，达到后返回 `LimitReached`。
+    ///
+    /// 调试器可按小块（如 256 条）反复调用，以便在块间处理 Ctrl-C / 异步输入。
+    pub fn run_until(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut Memory,
+        nvic: &mut Nvic,
+        breakpoints: &[u32],
+        max_instructions: u64,
+    ) -> EngineResult {
         let start = self.stats.instructions;
         loop {
-            if self.stats.instructions - start >= self.max_instructions {
+            if self.stats.instructions.saturating_sub(start) >= max_instructions {
                 return EngineResult::LimitReached;
+            }
+            if !breakpoints.is_empty() {
+                let pc = cpu.regs[15] & !1;
+                if breakpoints.contains(&pc) {
+                    return EngineResult::Breakpoint { pc };
+                }
+            }
+            if !mem.watchpoints.is_empty() {
+                if let Some(address) = mem.watchpoint_hit.take() {
+                    return EngineResult::Watchpoint { address };
+                }
             }
             // 异常仲裁（FRT-EXC-05/06）：存在可接受（未屏蔽 + 可抢占）的挂起异常 → 入口
             if let Some(number) = self.pending_exception_to_take(cpu, mem, nvic) {

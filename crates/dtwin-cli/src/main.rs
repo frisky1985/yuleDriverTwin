@@ -24,7 +24,11 @@ use dtwin_core::CpuState;
 
 /// Driver Twin — 芯片级精度 ARM Cortex-M 行为模拟器
 #[derive(Parser)]
-#[command(name = "dtwin", version, about = "Driver Twin: ARM Cortex-M behavior simulator")]
+#[command(
+    name = "dtwin",
+    version,
+    about = "Driver Twin: ARM Cortex-M behavior simulator"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -55,6 +59,26 @@ enum Commands {
         #[arg(long, value_parser = parse_hex_u32)]
         uart_base: Option<u32>,
         /// UART 行为模型：cmsdk（默认，E2E 兼容）/ lpuart0（真实 S32K312 LPUART0）
+        #[arg(long, value_parser = clap::value_parser!(UartModel), default_value_t = UartModel::Cmsdk)]
+        uart_model: UartModel,
+    },
+    /// 启动 GDB RSP 服务器（默认 127.0.0.1:3333），等待 GDB 连接
+    Debug {
+        /// 固件 ELF 路径（ELF32 little-endian ARM EXEC）
+        elf: PathBuf,
+        /// 芯片型号（如 S32K312）
+        #[arg(long, default_value = "S32K312")]
+        chip: String,
+        /// 监听地址
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// 监听端口
+        #[arg(long, default_value_t = 3333)]
+        port: u16,
+        /// UART 基地址（默认 S32K312 LPUART0 0x40180000）
+        #[arg(long, value_parser = parse_hex_u32)]
+        uart_base: Option<u32>,
+        /// UART 行为模型：cmsdk / lpuart0
         #[arg(long, value_parser = clap::value_parser!(UartModel), default_value_t = UartModel::Cmsdk)]
         uart_model: UartModel,
     },
@@ -101,6 +125,20 @@ fn main() -> ExitCode {
             Ok(rc) => ExitCode::from(rc),
             Err(e) => {
                 eprintln!("[run] 错误: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
+        Commands::Debug {
+            elf,
+            chip,
+            host,
+            port,
+            uart_base,
+            uart_model,
+        } => match cmd_debug(&elf, &chip, &host, port, uart_base, uart_model) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("[debug] 错误: {e:#}");
                 ExitCode::FAILURE
             }
         },
@@ -190,7 +228,12 @@ fn cmd_load(elf: &PathBuf, chip: &str) -> anyhow::Result<()> {
     let summary = Loader::load_elf(elf, &mut mem, &mut cpu)
         .with_context(|| format!("加载固件 {}", elf.display()))?;
 
-    println!("[load] {} -> SP={:#010x} PC={:#010x}", elf.display(), summary.initial_sp, summary.entry_pc);
+    println!(
+        "[load] {} -> SP={:#010x} PC={:#010x}",
+        elf.display(),
+        summary.initial_sp,
+        summary.entry_pc
+    );
     println!("[load] 段摘要 ({} 个 PT_LOAD):", summary.segments.len());
     for (i, seg) in summary.segments.iter().enumerate() {
         println!(
@@ -263,4 +306,56 @@ fn cmd_run(
         _ => 0,
     };
     Ok(code)
+}
+
+/// `dtwin debug <elf> --chip S32K312 [--host 127.0.0.1] [--port 3333]`
+fn cmd_debug(
+    elf: &PathBuf,
+    chip: &str,
+    host: &str,
+    port: u16,
+    uart_base: Option<u32>,
+    uart_model: UartModel,
+) -> anyhow::Result<()> {
+    let profile = chip_profile(chip)?;
+    let base = uart_base.unwrap_or(0x4018_0000);
+    let mut mem = memory_with_uart(&profile, base, uart_model);
+    let mut cpu = CpuState::default();
+
+    let summary = Loader::load_elf(elf, &mut mem, &mut cpu)
+        .with_context(|| format!("加载固件 {}", elf.display()))?;
+
+    println!(
+        "[debug] 加载 {} -> SP={:#010x} PC={:#010x} (chip={}, uart={:#x}, uart_model={})",
+        elf.display(),
+        summary.initial_sp,
+        summary.entry_pc,
+        chip,
+        base,
+        uart_model
+    );
+
+    let config = dtwin_gdb::GdbServerConfig {
+        host: host.to_string(),
+        port,
+        ..Default::default()
+    };
+    let mut target = dtwin_gdb::DtwinTarget::new(cpu, mem, Nvic::new());
+
+    println!("[debug] GDB 监听 {}:{}，请连接：", host, port);
+    println!(
+        "        arm-none-eabi-gdb {} -ex 'target remote {}:{}'",
+        elf.display(),
+        host,
+        port
+    );
+
+    let reason = dtwin_gdb::serve(&mut target, &config)?;
+
+    let stats = target.stats();
+    println!(
+        "[debug] 会话结束: {:?} | instructions={} cycles={} faults={} exceptions={}",
+        reason, stats.instructions, stats.cycles, stats.faults, stats.exceptions
+    );
+    Ok(())
 }

@@ -44,7 +44,7 @@ impl CoreType {
 }
 
 /// 模拟实例核心状态
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CpuState {
     /// 通用寄存器 R0-R15
     pub regs: [u32; 16],
